@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.auto_trader_blacklist.json
+.tracked_symbols.json
+.trading_archive.db
+*.log
