@@ -31,7 +31,7 @@ RISK_CONFIG = {
     "max_consecutive_losses": 3,
     "max_trades_per_day": 20,
     "risk_per_trade_pct": 0.01,
-    "risk_guards_enabled": False,
+    "risk_guards_enabled": True,
     "min_notional": 5.5,
     "max_notional": 25.0,
     # ATR-bazlı dinamik SL/TP
