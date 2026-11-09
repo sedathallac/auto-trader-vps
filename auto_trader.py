@@ -31,6 +31,7 @@ RISK_CONFIG = {
     "max_consecutive_losses": 3,
     "max_trades_per_day": 20,
     "risk_per_trade_pct": 0.01,
+    "risk_guards_enabled": False,
     "min_notional": 5.5,
     "max_notional": 25.0,
     # ATR-bazlı dinamik SL/TP
@@ -525,6 +526,33 @@ def calc_amount(price, filters):
     return round(amt, 8)
 
 
+def get_real_slippage(binance, symbol):
+    """Spread + baz slipaj (orderbook'tan)"""
+    try:
+        ob = binance.order_book(symbol, limit=5)
+        bid = float(ob["bids"][0][0])
+        ask = float(ob["asks"][0][0])
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid
+        base = {"BTCUSDT": 0.001, "ETHUSDT": 0.001, "SOLUSDT": 0.002}.get(symbol, 0.003)
+        return spread_pct + base
+    except Exception as e:
+        log.warning(f"slippage hatası {symbol}: {e}")
+        return 0.005
+
+
+def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
+    """Risk-bazlı boyutlandırma (Van Tharp)."""
+    risk_amount = balance_usdt * RISK_CONFIG["risk_per_trade_pct"]
+    effective_sl = sl_pct + slippage_pct
+    if effective_sl <= 0:
+        return None
+    notional = risk_amount / effective_sl
+    notional = min(notional, RISK_CONFIG["max_notional"])
+    notional = max(notional, RISK_CONFIG["min_notional"])
+    return notional, risk_amount, effective_sl
+
+
 def open_coin(binance, hb, coin, dry_run=False, risk=None):
     symbol = coin["symbol"]
     pair = symbol.replace("USDT", "-USDT")
@@ -547,28 +575,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
     if not filt:
         add_blacklist(symbol, "filters yok")
         return False
-    # Dinamik pozisyon boyutlandırma (beyin)
-    balance = binance.get_available_balance("USDT")
-    if balance < 10:
-        log.warning(f"  yetersiz bakiye: {balance:.2f} USDT")
-        return False
-    target_notional, vol_mult = calculate_position_size(balance, coin)
-    log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2f})")
-
-    # Target notional → coin miktarı (stepSize ile yuvarlanmış)
-    step = float(filt["LOT_SIZE"]["stepSize"])
-    raw_amount = target_notional / price
-    steps = max(1, int(raw_amount / step))
-    amount = round(steps * step, 8)
-
-    # Min notional kontrolü
-    min_n = float(filt.get("MIN_NOTIONAL", {}).get("notional", 5))
-    if amount * price < min_n:
-        amount = round((min_n / price / step + 1) * step, 8)
-
-    log.info(f"  amount={amount} (≈{amount * price:.2f} USDT)")
-
-    # Yön kararı (dry modda da göster)
+    # Yön kararı
     side, side_name = decide_side(coin)
     if side is None:
         log.info(f"  atlandı: yön belirsiz (%{float(coin['priceChangePercent']):+.2f})")
@@ -578,12 +585,48 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
     # ATR-bazlı dinamik SL/TP
     atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
     if atr_pct is None:
-        atr_pct = 0.02  # fallback: %2
+        atr_pct = 0.02
         log.warning(f"  ATR alınamadı, fallback %2.0 kullanılıyor")
 
     sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
     tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
     log.info(f"  📊 ATR=%{atr_pct*100:.2f} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
+
+    # Slipaj (sadece flag açıksa)
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        slippage_pct = get_real_slippage(binance, symbol)
+        log.info(f"  📏 Slipaj=%{slippage_pct*100:.2f}")
+    else:
+        slippage_pct = 0.0
+
+    # Bakiye
+    balance = binance.get_available_balance("USDT")
+    if balance < 10:
+        log.warning(f"  yetersiz bakiye: {balance:.2f} USDT")
+        return False
+
+    # Boyutlandırma
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        result = calculate_position_size_v2(balance, sl_pct, slippage_pct)
+        if not result:
+            return False
+        target_notional, risk_amount, effective_sl = result
+        log.info(f"  🎯 Risk-bazlı: risk={risk_amount:.2f} USDT / eff_sl=%{effective_sl*100:.2f} → {target_notional:.2f} USDT")
+    else:
+        target_notional, vol_mult = calculate_position_size(balance, coin)
+        log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2f})")
+
+    # Target notional → amount
+    step = float(filt["LOT_SIZE"]["stepSize"])
+    raw_amount = target_notional / price
+    steps = max(1, int(raw_amount / step))
+    amount = round(steps * step, 8)
+
+    min_n = float(filt.get("MIN_NOTIONAL", {}).get("notional", 5))
+    if amount * price < min_n:
+        amount = round((min_n / price / step + 1) * step, 8)
+
+    log.info(f"  amount={amount} (≈{amount * price:.2f} USDT)")
 
     if dry_run:
         log.info("  [DRY] emir yok")
@@ -623,6 +666,30 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
         log.info(f"  ✅ SL trigger={trig} qty={amount} algoId={sr['algoId']}")
     else:
         log.warning(f"  ⚠️  SL hata: {sr}")
+
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        try:
+            pc = binance.position_risk()
+            for pos in pc:
+                if pos["symbol"] == symbol and float(pos["positionAmt"]) != 0:
+                    liq = float(pos.get("liquidationPrice", 0))
+                    entry_pos = float(pos["entryPrice"])
+                    if liq > 0:
+                        liq_dist = abs(entry_pos - liq) / entry_pos
+                        sl_dist = abs(entry_pos - trig) / entry_pos
+                        log.info(f"  🔍 Likidasyon={liq} (%{liq_dist*100:.2f}) vs SL %{sl_dist*100:.2f}")
+                        if sl_dist >= liq_dist * 0.7:
+                            log.critical(f"  🚨 SL likidasyona çok yakın — ACİL KAPAT")
+                            close_side = "SELL" if side == 1 else "BUY"
+                            binance._post("/fapi/v1/order", {
+                                "symbol": symbol, "side": close_side, "type": "MARKET",
+                                "quantity": str(amount), "reduceOnly": "true"
+                            })
+                            add_blacklist(symbol, "liq_too_close")
+                            return False
+                    break
+        except Exception as e:
+            log.warning(f"  Likidasyon kontrol hatası: {e}")
 
     if risk is not None:
         risk.register_open()
