@@ -32,6 +32,9 @@ RISK_CONFIG = {
     "max_trades_per_day": 20,
     "risk_per_trade_pct": 0.01,
     "risk_guards_enabled": True,
+    "target_risk_units": 3.0,
+    "min_leverage": 1,
+    "max_leverage": 5,
     "min_notional": 5.5,
     "max_notional": 25.0,
     # ATR-bazlı dinamik SL/TP
@@ -526,6 +529,20 @@ def calc_amount(price, filters):
     return round(amt, 8)
 
 
+def calculate_dynamic_leverage(atr_pct):
+    """
+    Dinamik kaldıraç: leverage = target_risk / ATR%
+    Referans: Moreira & Muir (2017), Alexander & Dakos (2022)
+    """
+    if atr_pct <= 0:
+        return RISK_CONFIG["min_leverage"]
+    target = RISK_CONFIG["target_risk_units"]
+    raw = target / (atr_pct * 100.0)
+    lev = int(round(raw))
+    lev = max(RISK_CONFIG["min_leverage"], min(RISK_CONFIG["max_leverage"], lev))
+    return lev
+
+
 def get_real_slippage(binance, symbol):
     """Spread + baz slipaj (orderbook'tan)"""
     try:
@@ -632,13 +649,20 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
         log.info("  [DRY] emir yok")
         return True
 
-    lr = binance.set_leverage(symbol, LEVERAGE)
+    # Dinamik kaldıraç (flag açıksa ATR-bazlı, kapalıysa sabit 3x)
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        dyn_lev = calculate_dynamic_leverage(atr_pct)
+        log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} → {dyn_lev}x")
+    else:
+        dyn_lev = LEVERAGE
+
+    lr = binance.set_leverage(symbol, dyn_lev)
     if isinstance(lr, dict) and "leverage" in lr:
         log.info(f"  leverage={lr['leverage']}x")
     else:
         log.warning(f"  leverage yanıtı: {lr}")
 
-    er = hb.create_executor(symbol, amount, LEVERAGE, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
+    er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
         add_blacklist(symbol, f"executor: {er}")
