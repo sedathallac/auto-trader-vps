@@ -19,6 +19,7 @@ class RiskEngine:
         self.daily_pnl = 0.0
         self.is_halted = False
         self.halt_reason = None
+        self.state = {}
         self.state_file = Path.home() / ".risk_engine_state.json"
         self._load_state()
 
@@ -30,16 +31,18 @@ class RiskEngine:
                 self.consecutive_losses = d.get("consecutive_losses", 0)
                 self.daily_trades = d.get("daily_trades", 0)
                 self.daily_pnl = d.get("daily_pnl", 0.0)
+                self.state = d
             except Exception:
                 pass
 
     def _save_state(self):
-        self.state_file.write_text(json.dumps({
+        self.state.update({
             "peak_equity": self.peak_equity,
             "consecutive_losses": self.consecutive_losses,
             "daily_trades": self.daily_trades,
             "daily_pnl": self.daily_pnl,
-        }, indent=2))
+        })
+        self.state_file.write_text(json.dumps(self.state, indent=2))
 
     def update_equity(self, current_equity):
         """Her döngüde çağır, drawdown + devre kesici kontrolü"""
@@ -99,10 +102,14 @@ class RiskEngine:
         if self.consecutive_losses >= self.cfg["max_consecutive_losses"]:
             return None, f"loss_limit ({self.consecutive_losses})"
 
-        risk_amount = balance * self.cfg["risk_per_trade_pct"]
         if stop_distance_pct <= 0:
             return None, "invalid_stop"
-        notional = risk_amount / stop_distance_pct
+        fee_pct = self.cfg.get("fee_pct_round_trip", 0.0008)
+        kelly = self.cfg.get("kelly_fraction", 0.25)
+        effective_sl = stop_distance_pct + fee_pct
+        risk_amount = balance * self.cfg["risk_per_trade_pct"]
+        raw_notional = risk_amount / effective_sl
+        notional = raw_notional * kelly
         notional = max(self.cfg["min_notional"], min(notional, self.cfg["max_notional"]))
         return notional, "approved"
 

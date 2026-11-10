@@ -1,10 +1,17 @@
-import json
 #!/usr/bin/env python3
 """auto_trader.py v4 — otonom kalite tarayıcı + native SL koruma"""
 import os, sys, time, hmac, hashlib, logging, argparse, json
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = requests.Session()
+_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504], allowed_methods=["GET","POST","DELETE"])
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
 import requests
 
@@ -12,7 +19,7 @@ BINANCE_FAPI = "https://fapi.binance.com"
 HB_API = "http://localhost:8000"
 HB_ACCOUNT = "master_account"
 
-MIN_VOLUME_USDT = 500_000_000
+MIN_VOLUME_USDT = 200_000_000
 MIN_PCT_CHANGE = 3.0
 MAX_PCT_CHANGE = 15.0
 MAX_SPREAD_PCT = 0.5
@@ -30,13 +37,15 @@ RISK_CONFIG = {
     "max_total_margin_pct": 0.40,
     "max_consecutive_losses": 3,
     "max_trades_per_day": 20,
-    "risk_per_trade_pct": 0.01,
+    "risk_per_trade_pct": 0.015,
+    "kelly_fraction": 0.25,
+    "fee_pct_round_trip": 0.0008,
     "risk_guards_enabled": True,
     "target_risk_units": 3.0,
     "min_leverage": 1,
     "max_leverage": 5,
     "min_notional": 5.5,
-    "max_notional": 25.0,
+    "max_notional": 10000.0,
     # ATR-bazlı dinamik SL/TP
     "atr_sl_multiplier": 1.5,
     "atr_tp_multiplier": 2.5,
@@ -85,14 +94,11 @@ PRESEED_BLACKLIST = [
     "IBITUSDT", "FBTCUSDT", "GBTCUSDT", "BITOUSDT",
     # Düşük likidite / sürekli sorun çıkaran
     "KORUUSDT", "JCTUSDT", "HYPEUSDT", "ZECUSDT",
+    # FAZ 2.1: Tokenize hisse/emtia (executor acilmaz)
+    "BZUSDT", "SKHYUSDT", "SNDKUSDT", "SPCXUSDT", "XAGUSDT", "MUUSDT",
+    "SNXXUSDT",
 ]
 
-log_file = Path.home() / "auto_trader.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
-)
 log = logging.getLogger(__name__)
 
 
@@ -104,9 +110,11 @@ def load_blacklist():
         except Exception:
             bl = {}
     now = time.time()
+    # FAZ 2.2: Preseed her zaman taze (TTL'den muaf)
     for s in PRESEED_BLACKLIST:
-        bl.setdefault(s, now)
-    return {k: v for k, v in bl.items() if now - v < BLACKLIST_TTL_SEC}
+        bl[s] = now
+    return {k: v for k, v in bl.items()
+            if k in PRESEED_BLACKLIST or (now - v) < BLACKLIST_TTL_SEC}
 
 
 def save_blacklist(bl):
@@ -139,9 +147,9 @@ class BinanceAPI:
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 60000
-            return requests.get(f"{BINANCE_FAPI}{path}?{self._sign(params)}",
+            return _session.get(f"{BINANCE_FAPI}{path}?{self._sign(params)}",
                                 headers=self._hdr(), timeout=15).json()
-        return requests.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15).json()
+        return _session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15).json()
 
     def _post(self, path, params, method="POST"):
         params = dict(params)
@@ -149,8 +157,8 @@ class BinanceAPI:
         params["recvWindow"] = 60000
         url = f"{BINANCE_FAPI}{path}?{self._sign(params)}"
         if method == "DELETE":
-            return requests.delete(url, headers=self._hdr(), timeout=15).json()
-        return requests.post(url, headers=self._hdr(), timeout=15).json()
+            return _session.delete(url, headers=self._hdr(), timeout=15).json()
+        return _session.post(url, headers=self._hdr(), timeout=15).json()
 
     def tickers(self):
         return self._get("/fapi/v1/ticker/24hr")
@@ -222,14 +230,19 @@ class HBAPI:
             "type": "position_executor", "connector_name": "binance_perpetual",
             "trading_pair": symbol.replace("USDT", "-USDT"), "side": side,
             "amount": str(amount), "leverage": lev,
-            "triple_barrier_config": {"stop_loss": sl, "take_profit": tp,
-                                      "time_limit": tl, "open_order_type": 1},
+            "triple_barrier_config": {
+                "stop_loss": sl, "take_profit": tp, "time_limit": tl,
+                "open_order_type": 1,
+                "take_profit_order_type": 1,
+                "stop_loss_order_type": 1,
+                "time_limit_order_type": 1,
+            },
         }}
-        return requests.post(f"{self.base}/executors/", json=payload,
+        return _session.post(f"{self.base}/executors/", json=payload,
                              auth=self.auth, timeout=30).json()
 
     def active_executors(self):
-        r = requests.post(f"{self.base}/executors/search",
+        r = _session.post(f"{self.base}/executors/search",
                           json={"is_active": True}, auth=self.auth, timeout=15)
         return r.json().get("data", [])
 
@@ -248,6 +261,45 @@ def heartbeat_tick():
         HEARTBEAT_FILE.write_text(datetime.now().isoformat())
     except Exception as e:
         log.error(f"Heartbeat yazılamadı: {e}")
+
+
+def sync_risk_engine(risk, hb):
+    """FAZ 1.2: Report closed executor PnLs to RiskEngine since last check."""
+    state_file = Path.home() / ".risk_engine_last_exec_check.json"
+    last_ts = 0
+    if state_file.exists():
+        try:
+            last_ts = json.loads(state_file.read_text()).get("last_close_ts", 0)
+        except Exception:
+            last_ts = 0
+    if last_ts == 0:
+        state_file.write_text(json.dumps({"last_close_ts": time.time()}))
+        log.info("  RiskEngine: ilk senkron, gecmis kapanislar atlaniyor")
+        return
+    reported = 0
+    max_close_ts = last_ts
+    try:
+        r = requests.post(f"{HB_API}/executors/search", json={},
+                          auth=hb.auth, timeout=15).json()
+        for e in r.get("data", []):
+            if e.get("status") != "TERMINATED":
+                continue
+            closed_at = float(e.get("close_timestamp") or 0)
+            if closed_at <= last_ts:
+                continue
+            pnl = float(e.get("net_pnl_quote") or 0)
+            if pnl != 0:
+                risk.register_trade_result(pnl)
+                reported += 1
+                log.info(f"  RiskEngine PnL: {e.get('trading_pair')} -> {pnl:+.4f}")
+            if closed_at > max_close_ts:
+                max_close_ts = closed_at
+        if reported:
+            log.info(f"  RiskEngine: {reported} kapanis islendi")
+    except Exception as e:
+        log.debug(f"sync_risk_engine: {e}")
+        return
+    state_file.write_text(json.dumps({"last_close_ts": max_close_ts}))
 
 
 def reconcile_positions(binance, hb):
@@ -288,6 +340,15 @@ def reconcile_positions(binance, hb):
         for sym in orphaned_on_hb:
             log.critical(f"🚨 DRIFT: HB'de {sym} executor var, borsada pozisyon yok")
             drift = True
+            # AUTO-HEAL
+            for e in hb_executors:
+                if e["trading_pair"].replace("-", "") == sym and e.get("status") == "RUNNING":
+                    eid = e.get("executor_id")
+                    try:
+                        r = requests.post(f"{HB_API}/executors/{eid}/stop", json={"close_type": "EARLY_STOP", "keep_position": True}, auth=hb.auth, timeout=15).json()
+                        log.warning("  AUTO-HEAL " + sym + " -> " + str(r.get("status")))
+                    except Exception as ex:
+                        log.error("  AUTO-HEAL HATA " + sym + ": " + str(ex))
 
         if not drift:
             log.info(f"✅ Reconciliation OK — {len(open_exchange_pos)} pozisyon senkron")
@@ -356,10 +417,15 @@ def ensure_sl_coverage(binance):
                 side = 1 if is_long else 2
                 filt = binance.filters(sym)
                 tick = float(filt["PRICE_FILTER"]["tickSize"]) if filt else 0.01
+                # FAZ 2.3: ATR bazli SL (open_coin ile tutarli)
+                atr_pct = calculate_atr(binance, sym) or 0.02
+                sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"],
+                                 RISK_CONFIG["sl_min_pct"]),
+                             RISK_CONFIG["sl_max_pct"])
                 if is_long:
-                    trig = round(round((entry * (1 - STOP_LOSS_PCT)) / tick) * tick, 8)
+                    trig = round(round((entry * (1 - sl_pct)) / tick) * tick, 8)
                 else:
-                    trig = round(round((entry * (1 + STOP_LOSS_PCT)) / tick) * tick, 8)
+                    trig = round(round((entry * (1 + sl_pct)) / tick) * tick, 8)
                 r = binance.place_algo_sl(sym, trig, qty, side)
                 if r.get("algoId"):
                     log.info(f"  ✅ {sym} SL gönderildi: trigger={trig} qty={qty} algoId={r['algoId']}")
@@ -449,11 +515,14 @@ def check_liquidity(binance, symbol):
         return False, f"orderbook: {e}"
 
 
-def scan_top(binance, n):
+def scan_top(binance, n, blacklist=None):
+    blacklist = blacklist or set()
     cands = []
     for d in binance.tickers():
         try:
             if not d["symbol"].endswith("USDT"):
+                continue
+            if d["symbol"] in blacklist:
                 continue
             vol = float(d["quoteVolume"])
             chg = abs(float(d["priceChangePercent"]))
@@ -551,11 +620,11 @@ def get_real_slippage(binance, symbol):
         ask = float(ob["asks"][0][0])
         mid = (bid + ask) / 2
         spread_pct = (ask - bid) / mid
-        base = {"BTCUSDT": 0.001, "ETHUSDT": 0.001, "SOLUSDT": 0.002}.get(symbol, 0.003)
-        return spread_pct + base
+        base = {"BTCUSDT": 0.0002, "ETHUSDT": 0.0002, "SOLUSDT": 0.0003}.get(symbol, 0.0005)
+        return (spread_pct / 2) + base
     except Exception as e:
         log.warning(f"slippage hatası {symbol}: {e}")
-        return 0.005
+        return 0.001
 
 
 def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
@@ -622,13 +691,13 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
         log.warning(f"  yetersiz bakiye: {balance:.2f} USDT")
         return False
 
-    # Boyutlandırma
-    if RISK_CONFIG.get("risk_guards_enabled", False):
-        result = calculate_position_size_v2(balance, sl_pct, slippage_pct)
-        if not result:
+    # Boyutlandırma (FAZ 1.2: RiskEngine onayı)
+    if RISK_CONFIG.get("risk_guards_enabled", False) and risk is not None:
+        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct)
+        if target_notional is None:
+            log.warning(f"  RiskEngine reddetti: {status}")
             return False
-        target_notional, risk_amount, effective_sl = result
-        log.info(f"  🎯 Risk-bazlı: risk={risk_amount:.2f} USDT / eff_sl=%{effective_sl*100:.2f} → {target_notional:.2f} USDT")
+        log.info(f"  RiskEngine onayladı: {target_notional:.2f} USDT (günlük: {risk.daily_trades}, ardışık zarar: {risk.consecutive_losses})")
     else:
         target_notional, vol_mult = calculate_position_size(balance, coin)
         log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2f})")
@@ -749,6 +818,17 @@ def run_once(dry_run=False):
     binance = BinanceAPI(bk, bs)
     hb = HBAPI(HB_API, hu, hp)
 
+    # FAZ 1.2: Günlük reset kontrolü
+    today = datetime.now().date().isoformat()
+    if risk.state.get("last_reset_date") != today:
+        risk.reset_daily()
+        risk.state["last_reset_date"] = today
+        risk._save_state()
+        log.info(f"  Günlük sayaçlar sıfırlandı ({today})")
+
+    # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir
+    sync_risk_engine(risk, hb)
+
     # cleanup_orphan_sl artık orphan_killer.py tarafından yapılıyor
     if not reconcile_positions(binance, hb):
         log.critical("🚨 Reconciliation drift — döngü atlanıyor")
@@ -788,7 +868,7 @@ def run_once(dry_run=False):
     log.info(f"Aktif: {sorted(active) if active else 'yok'}")
     log.info(f"Blacklist: {sorted(bl.keys())}")
 
-    picks = scan_top(binance, TOP_N * 3)
+    picks = scan_top(binance, TOP_N * 3, blacklist=set(bl.keys()))
     if not picks:
         log.warning("hiç aday yok")
         return
@@ -812,6 +892,12 @@ def run_once(dry_run=False):
 
 
 def main():
+    log_file = Path.home() / "auto_trader.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval", type=int, default=900)

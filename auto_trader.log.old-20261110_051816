@@ -1,0 +1,836 @@
+2026-11-09 21:22:31,870 [INFO] ============================================================
+2026-11-09 21:22:31,873 [INFO] Tarama: 2026-11-09T21:22:31.873074
+2026-11-09 21:22:31,874 [ERROR] BINANCE_KEY/SECRET yok
+2026-11-09 21:23:27,519 [INFO] ============================================================
+2026-11-09 21:23:27,522 [INFO] Tarama: 2026-11-09T21:23:27.522096
+2026-11-09 21:23:27,523 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:23:27,913 [ERROR] positionRisk alınamadı: {'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action, request ip: 179.61.207.234'}
+2026-11-09 21:23:27,914 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-09 21:25:55,645 [INFO] ============================================================
+2026-11-09 21:25:55,646 [INFO] Tarama: 2026-11-09T21:25:55.646111
+2026-11-09 21:25:55,646 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:25:56,140 [ERROR] positionRisk alınamadı: {'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action, request ip: 179.61.207.234'}
+2026-11-09 21:25:56,140 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-09 21:29:02,570 [INFO] ============================================================
+2026-11-09 21:29:02,570 [INFO] Tarama: 2026-11-09T21:29:02.570413
+2026-11-09 21:29:02,570 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:29:03,079 [CRITICAL] 🚨 DRIFT: Borsada XRPUSDT var (22.8), HB'de executor yok
+2026-11-09 21:29:03,080 [CRITICAL] 🚨 DRIFT: Borsada ETHUSDT var (0.011), HB'de executor yok
+2026-11-09 21:29:03,080 [CRITICAL] 🚨 DRIFT! Bu döngüde yeni işlem açılmayacak
+2026-11-09 21:29:03,080 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-09 21:30:11,848 [INFO] ============================================================
+2026-11-09 21:30:11,848 [INFO] Tarama: 2026-11-09T21:30:11.848847
+2026-11-09 21:30:11,849 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:30:12,287 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:30:18,027 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:30:18,344 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:30:18,673 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:30:18,675 [INFO] Aktif: yok
+2026-11-09 21:30:18,675 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 21:30:19,233 [INFO] → ETH-USDT fiyat=2121.11 hacim=12,570,162,525 skor=0.739
+2026-11-09 21:30:19,520 [INFO]   likidite OK: spread=0.00% depth=945,007
+2026-11-09 21:30:20,927 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:30:20,928 [INFO]   amount=0.011 (≈23.33 USDT)
+2026-11-09 21:30:20,928 [INFO]   yön=LONG
+2026-11-09 21:30:21,217 [INFO]   📊 ATR=%0.47 → SL=%1.00 TP=%1.50
+2026-11-09 21:30:21,217 [INFO]   [DRY] emir yok
+2026-11-09 21:30:21,217 [INFO] → XRP-USDT fiyat=1.0865 hacim=1,138,578,738 skor=0.223
+2026-11-09 21:30:21,522 [INFO]   likidite OK: spread=0.01% depth=2,445,294
+2026-11-09 21:30:22,132 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:30:22,132 [INFO]   amount=23.0 (≈24.99 USDT)
+2026-11-09 21:30:22,132 [INFO]   yön=LONG
+2026-11-09 21:30:23,462 [INFO]   📊 ATR=%0.65 → SL=%1.00 TP=%1.61
+2026-11-09 21:30:23,463 [INFO]   [DRY] emir yok
+2026-11-09 21:30:23,463 [INFO] Bitti: 2/2
+2026-11-09 21:34:31,079 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 21:34:31,079 [INFO] ============================================================
+2026-11-09 21:34:31,079 [INFO] Tarama: 2026-11-09T21:34:31.079739
+2026-11-09 21:34:31,080 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:34:31,576 [INFO] 🚀 Archiver başladı (60sn döngü)
+2026-11-09 21:34:36,588 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:34:37,357 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:34:38,214 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:34:38,616 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:34:38,617 [INFO] Aktif: yok
+2026-11-09 21:34:38,617 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 21:34:39,051 [INFO] → ETH-USDT fiyat=2120.98 hacim=12,578,115,140 skor=0.804
+2026-11-09 21:34:39,436 [INFO]   likidite OK: spread=0.00% depth=573,266
+2026-11-09 21:34:40,650 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:34:40,650 [INFO]   amount=0.011 (≈23.33 USDT)
+2026-11-09 21:34:40,650 [INFO]   yön=LONG
+2026-11-09 21:34:41,013 [INFO]   📊 ATR=%0.48 → SL=%1.00 TP=%1.50
+2026-11-09 21:34:41,401 [INFO]   leverage=3x
+2026-11-09 21:34:44,194 [INFO]   [BLACKLIST] ETHUSDT (executor: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"})
+2026-11-09 21:34:44,197 [ERROR]   executor açılamadı: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"}
+2026-11-09 21:34:44,197 [INFO] → XRP-USDT fiyat=1.0898 hacim=1,140,154,711 skor=0.284
+2026-11-09 21:34:44,624 [INFO]   likidite OK: spread=0.01% depth=2,173,530
+2026-11-09 21:34:45,368 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:34:45,370 [INFO]   amount=22.9 (≈24.96 USDT)
+2026-11-09 21:34:45,371 [INFO]   yön=LONG
+2026-11-09 21:34:45,725 [INFO]   📊 ATR=%0.67 → SL=%1.00 TP=%1.67
+2026-11-09 21:34:46,096 [INFO]   leverage=3x
+2026-11-09 21:34:49,507 [INFO]   [BLACKLIST] XRPUSDT (executor: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"})
+2026-11-09 21:34:49,507 [ERROR]   executor açılamadı: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"}
+2026-11-09 21:34:49,507 [INFO] Bitti: 0/2
+2026-11-09 21:38:41,810 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 21:38:41,810 [INFO] ============================================================
+2026-11-09 21:38:41,810 [INFO] Tarama: 2026-11-09T21:38:41.810836
+2026-11-09 21:38:41,811 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:38:42,224 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:38:43,017 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:38:43,415 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:38:43,816 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:38:43,819 [INFO] Aktif: yok
+2026-11-09 21:38:43,820 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'ETHUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XRPUSDT', 'ZECUSDT']
+2026-11-09 21:38:44,459 [INFO] yeni aday yok
+2026-11-09 21:40:35,791 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 21:40:35,791 [INFO] ============================================================
+2026-11-09 21:40:35,791 [INFO] Tarama: 2026-11-09T21:40:35.791342
+2026-11-09 21:40:35,791 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:40:36,303 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:40:37,165 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:40:37,535 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:40:39,038 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:40:39,039 [INFO] Aktif: yok
+2026-11-09 21:40:39,039 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 21:40:39,547 [INFO] → ETH-USDT fiyat=2126.42 hacim=12,590,608,800 skor=0.881
+2026-11-09 21:40:39,918 [INFO]   likidite OK: spread=0.00% depth=613,247
+2026-11-09 21:40:41,634 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×1.00)
+2026-11-09 21:40:41,635 [INFO]   amount=0.011 (≈23.39 USDT)
+2026-11-09 21:40:41,635 [INFO]   yön=LONG
+2026-11-09 21:40:41,987 [INFO]   📊 ATR=%0.48 → SL=%1.00 TP=%1.50
+2026-11-09 21:40:42,394 [INFO]   leverage=3x
+2026-11-09 21:40:44,599 [INFO]   [BLACKLIST] ETHUSDT (executor: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"})
+2026-11-09 21:40:44,599 [ERROR]   executor açılamadı: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"}
+2026-11-09 21:40:44,599 [INFO] → XRP-USDT fiyat=1.0959 hacim=1,142,499,982 skor=0.364
+2026-11-09 21:40:45,980 [INFO]   likidite OK: spread=0.01% depth=2,344,787
+2026-11-09 21:40:46,734 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:40:46,735 [INFO]   amount=22.8 (≈24.99 USDT)
+2026-11-09 21:40:46,735 [INFO]   yön=LONG
+2026-11-09 21:40:47,152 [INFO]   📊 ATR=%0.70 → SL=%1.04 TP=%1.74
+2026-11-09 21:40:47,568 [INFO]   leverage=3x
+2026-11-09 21:40:50,704 [INFO]   [BLACKLIST] XRPUSDT (executor: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"})
+2026-11-09 21:40:50,704 [ERROR]   executor açılamadı: {'detail': "Error creating executor: 'NoneType' object has no attribute 'encode'"}
+2026-11-09 21:40:50,704 [INFO] Bitti: 0/2
+2026-11-09 21:41:42,746 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 21:41:42,747 [INFO] ============================================================
+2026-11-09 21:41:42,748 [INFO] Tarama: 2026-11-09T21:41:42.747987
+2026-11-09 21:41:42,748 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:41:43,154 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:41:44,165 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:41:44,918 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:41:45,442 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:41:45,443 [INFO] Aktif: yok
+2026-11-09 21:41:45,443 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'ETHUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XRPUSDT', 'ZECUSDT']
+2026-11-09 21:41:45,882 [INFO] yeni aday yok
+2026-11-09 21:43:44,028 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 21:43:44,029 [INFO] ============================================================
+2026-11-09 21:43:44,029 [INFO] Tarama: 2026-11-09T21:43:44.029397
+2026-11-09 21:43:44,031 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:43:44,415 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 21:43:45,186 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 21:43:45,591 [INFO] 💰 Equity=310.04 | DD=%0.00 | Peak=310.04
+2026-11-09 21:43:45,978 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 21:43:45,979 [INFO] Aktif: yok
+2026-11-09 21:43:45,979 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 21:43:46,711 [INFO] → ETH-USDT fiyat=2125.63 hacim=12,592,873,737 skor=0.878
+2026-11-09 21:43:47,077 [INFO]   likidite OK: spread=0.00% depth=368,865
+2026-11-09 21:43:48,753 [INFO]   bakiye=310.04 → hedef_notional=25.00 USDT (vol×1.00)
+2026-11-09 21:43:48,754 [INFO]   amount=0.011 (≈23.38 USDT)
+2026-11-09 21:43:48,754 [INFO]   yön=LONG
+2026-11-09 21:43:49,099 [INFO]   📊 ATR=%0.48 → SL=%1.00 TP=%1.50
+2026-11-09 21:43:49,467 [INFO]   leverage=3x
+2026-11-09 21:43:51,495 [INFO]   executor=5MamAtY4ZE393UUZFAfPB6SkzfsbU7VuuQCiJ1p3ur8y
+2026-11-09 21:43:59,516 [INFO]   ✅ doldu: 23.37 USDT
+2026-11-09 21:43:59,906 [INFO]   ✅ SL trigger=2104.37 qty=0.011 algoId=2000001634446791
+2026-11-09 21:43:59,907 [INFO]   📊 RiskEngine: günlük sayaç arttı
+2026-11-09 21:43:59,907 [INFO] → SNDK-USDT fiyat=889.09 hacim=2,612,733,501 skor=0.409
+2026-11-09 21:44:00,255 [WARNING]   atlandı: depth 42,050
+2026-11-09 21:44:00,256 [INFO]   [BLACKLIST] SNDKUSDT (depth 42,050)
+2026-11-09 21:44:00,256 [INFO] Bitti: 1/2
+2026-11-09 21:48:59,448 [INFO] 📊 Arşiv: 0 trade, 0 emir, 14 hata
+2026-11-09 21:56:47,149 [INFO] ✅ 36 yeni fill arşivlendi
+2026-11-09 21:59:00,328 [INFO] ============================================================
+2026-11-09 21:59:00,329 [INFO] Tarama: 2026-11-09T21:59:00.329017
+2026-11-09 21:59:00,330 [INFO] 🔍 State Reconciliation...
+2026-11-09 21:59:00,734 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-09 21:59:01,891 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-09 21:59:02,287 [INFO] 💰 Equity=310.03 | DD=%0.00 | Peak=310.04
+2026-11-09 21:59:03,701 [INFO] 📊 Marjin kullanımı: %2.5 (limit: %40)
+2026-11-09 21:59:03,702 [INFO] Aktif: ['ETH-USDT']
+2026-11-09 21:59:03,702 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 21:59:04,104 [INFO] → XRP-USDT fiyat=1.0905 hacim=1,147,107,455 skor=0.365
+2026-11-09 21:59:04,449 [INFO]   likidite OK: spread=0.01% depth=2,380,932
+2026-11-09 21:59:05,718 [INFO]   bakiye=302.23 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 21:59:05,719 [INFO]   amount=22.9 (≈24.97 USDT)
+2026-11-09 21:59:05,719 [INFO]   yön=LONG
+2026-11-09 21:59:06,078 [INFO]   📊 ATR=%0.66 → SL=%1.00 TP=%1.64
+2026-11-09 21:59:06,750 [INFO]   leverage=3x
+2026-11-09 21:59:08,283 [INFO]   executor=36FPB381FSRxZe5fMxGsUZyYFomf3r499KXb7ULeSR6b
+2026-11-09 21:59:16,301 [INFO]   ✅ doldu: 24.97 USDT
+2026-11-09 21:59:16,680 [INFO]   ✅ SL trigger=1.0796 qty=22.9 algoId=2000001634539317
+2026-11-09 21:59:16,683 [INFO]   📊 RiskEngine: günlük sayaç arttı
+2026-11-09 21:59:16,683 [INFO] Bitti: 1/1
+2026-11-09 22:03:35,829 [INFO] ✅ 32 yeni emir arşivlendi
+2026-11-09 22:03:35,837 [INFO] 📊 Arşiv: 36 trade, 32 emir, 28 hata
+2026-11-09 22:11:43,573 [INFO] ✅ 3 yeni fill arşivlendi
+2026-11-09 22:14:16,735 [INFO] ============================================================
+2026-11-09 22:14:16,736 [INFO] Tarama: 2026-11-09T22:14:16.736326
+2026-11-09 22:14:16,737 [INFO] 🔍 State Reconciliation...
+2026-11-09 22:14:17,557 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 22:14:19,235 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 22:14:19,863 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 22:14:20,268 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 22:14:20,269 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 22:14:20,269 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 22:14:20,744 [INFO] yeni aday yok
+2026-11-09 22:18:36,179 [INFO] 📊 Arşiv: 39 trade, 32 emir, 42 hata
+2026-11-09 22:29:20,761 [INFO] ============================================================
+2026-11-09 22:29:20,761 [INFO] Tarama: 2026-11-09T22:29:20.761773
+2026-11-09 22:29:20,763 [INFO] 🔍 State Reconciliation...
+2026-11-09 22:29:21,208 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 22:29:22,715 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 22:29:23,178 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 22:29:23,534 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 22:29:23,536 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 22:29:23,536 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 22:29:24,054 [INFO] yeni aday yok
+2026-11-09 22:33:12,354 [INFO] 📊 Arşiv: 39 trade, 32 emir, 56 hata
+2026-11-09 22:44:24,146 [INFO] ============================================================
+2026-11-09 22:44:24,146 [INFO] Tarama: 2026-11-09T22:44:24.146697
+2026-11-09 22:44:24,147 [INFO] 🔍 State Reconciliation...
+2026-11-09 22:44:24,569 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 22:44:26,658 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 22:44:27,097 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 22:44:27,570 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 22:44:27,570 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 22:44:27,570 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 22:44:29,227 [INFO] yeni aday yok
+2026-11-09 22:48:42,638 [INFO] 📊 Arşiv: 39 trade, 32 emir, 70 hata
+2026-11-09 22:59:29,240 [INFO] ============================================================
+2026-11-09 22:59:29,240 [INFO] Tarama: 2026-11-09T22:59:29.240689
+2026-11-09 22:59:29,241 [INFO] 🔍 State Reconciliation...
+2026-11-09 22:59:29,632 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 22:59:31,150 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 22:59:31,539 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 22:59:31,907 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 22:59:31,908 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 22:59:31,908 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 22:59:32,304 [INFO] yeni aday yok
+2026-11-09 23:03:07,592 [INFO] 📊 Arşiv: 39 trade, 32 emir, 84 hata
+2026-11-09 23:04:09,303 [INFO] ============================================================
+2026-11-09 23:04:09,303 [INFO] Tarama: 2026-11-09T23:04:09.303460
+2026-11-09 23:04:09,303 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:04:09,755 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:04:11,284 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:04:11,778 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:04:12,210 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:04:12,210 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:04:12,210 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:04:12,881 [INFO] → BZ-USDT fiyat=90.96 hacim=861,618,856 skor=0.363
+2026-11-09 23:04:13,264 [INFO]   likidite OK: spread=0.01% depth=1,088,018
+2026-11-09 23:04:14,514 [INFO]   yön=LONG
+2026-11-09 23:04:15,026 [INFO]   📊 ATR=%0.63 → SL=%1.00 TP=%1.59
+2026-11-09 23:04:15,472 [INFO]   bakiye=293.93 → hedef_notional=25.00 USDT (vol×0.85)
+2026-11-09 23:04:15,473 [INFO]   amount=0.27 (≈24.56 USDT)
+2026-11-09 23:04:15,473 [INFO]   [DRY] emir yok
+2026-11-09 23:04:15,473 [INFO] Bitti: 1/1
+2026-11-09 23:06:06,397 [INFO] ============================================================
+2026-11-09 23:06:06,397 [INFO] Tarama: 2026-11-09T23:06:06.397426
+2026-11-09 23:06:06,398 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:06:06,801 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:06:08,201 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:06:08,604 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:06:08,992 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:06:08,993 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:06:08,993 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:06:09,635 [INFO] → BZ-USDT fiyat=90.99 hacim=865,092,715 skor=0.350
+2026-11-09 23:06:10,139 [INFO]   likidite OK: spread=0.01% depth=1,094,457
+2026-11-09 23:06:11,153 [INFO]   yön=LONG
+2026-11-09 23:06:11,594 [INFO]   📊 ATR=%0.64 → SL=%1.00 TP=%1.59
+2026-11-09 23:06:12,061 [INFO]   📏 Slipaj=%0.31
+2026-11-09 23:06:12,413 [INFO]   🎯 Risk-bazlı: risk=2.94 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-09 23:06:12,414 [INFO]   amount=0.27 (≈24.57 USDT)
+2026-11-09 23:06:12,414 [INFO]   [DRY] emir yok
+2026-11-09 23:06:12,414 [INFO] Bitti: 1/1
+2026-11-09 23:07:06,451 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 23:07:06,452 [INFO] ============================================================
+2026-11-09 23:07:06,453 [INFO] Tarama: 2026-11-09T23:07:06.452997
+2026-11-09 23:07:06,453 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:07:06,864 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:07:08,682 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:07:09,069 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:07:09,801 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:07:09,804 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:07:09,804 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:07:10,444 [INFO] → BZ-USDT fiyat=91.07 hacim=865,675,257 skor=0.327
+2026-11-09 23:07:10,811 [INFO]   likidite OK: spread=0.01% depth=1,039,178
+2026-11-09 23:07:11,650 [INFO]   yön=LONG
+2026-11-09 23:07:11,995 [INFO]   📊 ATR=%0.64 → SL=%1.00 TP=%1.61
+2026-11-09 23:07:12,351 [INFO]   📏 Slipaj=%0.31
+2026-11-09 23:07:12,698 [INFO]   🎯 Risk-bazlı: risk=2.94 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-09 23:07:12,698 [INFO]   amount=0.27 (≈24.59 USDT)
+2026-11-09 23:07:13,321 [INFO]   leverage=3x
+2026-11-09 23:07:14,542 [INFO]   executor=4iCTEJrCquvGBBQrKXoDFqG9TYy2MC72LCoRukChK1XY
+2026-11-09 23:07:22,567 [WARNING]   ⚠️  dolmadı: filled=0.00 err=8
+2026-11-09 23:07:22,569 [INFO]   [BLACKLIST] BZUSDT (dolmadı)
+2026-11-09 23:07:22,569 [INFO] Bitti: 0/1
+2026-11-09 23:16:32,943 [INFO] ============================================================
+2026-11-09 23:16:32,943 [INFO] Tarama: 2026-11-09T23:16:32.943459
+2026-11-09 23:16:32,944 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:16:33,476 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:16:35,490 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:16:36,003 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:16:36,478 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:16:36,479 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:16:36,479 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:16:36,986 [INFO] → MU-USDT fiyat=739.57 hacim=1,145,425,354 skor=0.329
+2026-11-09 23:16:37,425 [WARNING]   atlandı: depth 38,335
+2026-11-09 23:16:37,426 [INFO]   [BLACKLIST] MUUSDT (depth 38,335)
+2026-11-09 23:16:37,426 [INFO] Bitti: 0/1
+2026-11-09 23:16:47,304 [INFO] 📊 Arşiv: 39 trade, 32 emir, 98 hata
+2026-11-09 23:18:38,092 [INFO] ============================================================
+2026-11-09 23:18:38,092 [INFO] Tarama: 2026-11-09T23:18:38.092452
+2026-11-09 23:18:38,093 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:18:38,863 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:18:40,593 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:18:40,996 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:18:41,524 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:18:41,525 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:18:41,525 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:18:42,998 [INFO] yeni aday yok
+2026-11-09 23:22:22,643 [INFO] ============================================================
+2026-11-09 23:22:22,643 [INFO] Tarama: 2026-11-09T23:22:22.643859
+2026-11-09 23:22:22,644 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:22:23,042 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:22:24,499 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:22:24,890 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:22:25,253 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:22:25,254 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:22:25,254 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:22:25,700 [INFO] yeni aday yok
+2026-11-09 23:23:04,087 [INFO] ============================================================
+2026-11-09 23:23:04,087 [INFO] Tarama: 2026-11-09T23:23:04.087437
+2026-11-09 23:23:04,088 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:23:05,952 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:23:08,006 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:23:08,510 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:23:08,918 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:23:08,919 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:23:08,919 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:23:09,313 [INFO] yeni aday yok
+2026-11-09 23:25:35,679 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 23:25:35,679 [INFO] ============================================================
+2026-11-09 23:25:35,679 [INFO] Tarama: 2026-11-09T23:25:35.679938
+2026-11-09 23:25:35,680 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:25:36,450 [INFO] ✅ Reconciliation OK — 2 pozisyon senkron
+2026-11-09 23:25:38,021 [INFO] ✅ SL koruması tam (2 pozisyon)
+2026-11-09 23:25:38,483 [INFO] 💰 Equity=310.01 | DD=%0.01 | Peak=310.04
+2026-11-09 23:25:38,873 [INFO] 📊 Marjin kullanımı: %5.2 (limit: %40)
+2026-11-09 23:25:38,874 [INFO] Aktif: ['ETH-USDT', 'XRP-USDT']
+2026-11-09 23:25:38,874 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:25:39,268 [INFO] yeni aday yok
+2026-11-09 23:30:38,943 [INFO] 📊 Arşiv: 39 trade, 32 emir, 112 hata
+2026-11-09 23:34:44,532 [INFO] 🚀 Archiver başladı (60sn döngü)
+2026-11-09 23:34:44,543 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 23:34:44,547 [INFO] ============================================================
+2026-11-09 23:34:44,547 [INFO] Tarama: 2026-11-09T23:34:44.547258
+2026-11-09 23:34:44,550 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:34:45,605 [ERROR] reconcile_positions hata: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+Traceback (most recent call last):
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connectionpool.py", line 793, in urlopen
+    response = self._make_request(
+        conn,
+    ...<10 lines>...
+        **response_kw,
+    )
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connectionpool.py", line 540, in _make_request
+    response = conn.getresponse()
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connection.py", line 638, in getresponse
+    httplib_response = super().getresponse()
+  File "/usr/lib/python3.14/http/client.py", line 1459, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [Errno 104] Connection reset by peer
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/venv/lib/python3.14/site-packages/requests/adapters.py", line 696, in send
+    resp = conn.urlopen(
+        method=request.method,
+    ...<9 lines>...
+        chunked=chunked,
+    )
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connectionpool.py", line 847, in urlopen
+    retries = retries.increment(
+        method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
+    )
+  File "/root/venv/lib/python3.14/site-packages/urllib3/util/retry.py", line 510, in increment
+    raise reraise(type(error), error, _stacktrace)
+          ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.14/site-packages/urllib3/util/util.py", line 38, in reraise
+    raise value.with_traceback(tb)
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connectionpool.py", line 793, in urlopen
+    response = self._make_request(
+        conn,
+    ...<10 lines>...
+        **response_kw,
+    )
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connectionpool.py", line 540, in _make_request
+    response = conn.getresponse()
+  File "/root/venv/lib/python3.14/site-packages/urllib3/connection.py", line 638, in getresponse
+    httplib_response = super().getresponse()
+  File "/usr/lib/python3.14/http/client.py", line 1459, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/socket.py", line 725, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+urllib3.exceptions.ProtocolError: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/auto_trader.py", line 267, in reconcile_positions
+    hb_executors = hb.active_executors()
+  File "/root/auto_trader.py", line 232, in active_executors
+    r = requests.post(f"{self.base}/executors/search",
+                      json={"is_active": True}, auth=self.auth, timeout=15)
+  File "/root/venv/lib/python3.14/site-packages/requests/api.py", line 134, in post
+    return request("post", url, data=data, json=json, **kwargs)
+  File "/root/venv/lib/python3.14/site-packages/requests/api.py", line 71, in request
+    return session.request(method=method, url=url, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.14/site-packages/requests/sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/root/venv/lib/python3.14/site-packages/requests/sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+  File "/root/venv/lib/python3.14/site-packages/requests/adapters.py", line 711, in send
+    raise ConnectionError(err, request=request)
+requests.exceptions.ConnectionError: ('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))
+2026-11-09 23:34:45,743 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-09 23:42:09,422 [INFO] ✅ 2 yeni fill arşivlendi
+2026-11-09 23:48:02,403 [INFO] ✅ 2 yeni emir arşivlendi
+2026-11-09 23:48:02,412 [INFO] 📊 Arşiv: 41 trade, 34 emir, 129 hata
+2026-11-09 23:49:45,955 [INFO] ============================================================
+2026-11-09 23:49:45,955 [INFO] Tarama: 2026-11-09T23:49:45.955524
+2026-11-09 23:49:45,956 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:49:46,860 [CRITICAL] 🚨 DRIFT: Borsada XRPUSDT var (22.9), HB'de executor yok
+2026-11-09 23:49:46,861 [CRITICAL] 🚨 DRIFT: Borsada ETHUSDT var (0.011), HB'de executor yok
+2026-11-09 23:49:46,861 [CRITICAL] 🚨 DRIFT! Bu döngüde yeni işlem açılmayacak
+2026-11-09 23:49:46,861 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-09 23:56:15,080 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-09 23:56:15,081 [INFO] ============================================================
+2026-11-09 23:56:15,081 [INFO] Tarama: 2026-11-09T23:56:15.081116
+2026-11-09 23:56:15,083 [INFO] 🔍 State Reconciliation...
+2026-11-09 23:56:15,983 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-09 23:56:16,755 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-09 23:56:17,160 [INFO] 💰 Equity=310.14 | DD=%0.00 | Peak=310.14
+2026-11-09 23:56:17,557 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-09 23:56:17,559 [INFO] Aktif: yok
+2026-11-09 23:56:17,559 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-09 23:56:18,195 [INFO] → ETH-USDT fiyat=2130.67 hacim=12,919,402,936 skor=0.748
+2026-11-09 23:56:18,544 [INFO]   likidite OK: spread=0.00% depth=557,415
+2026-11-09 23:56:19,308 [INFO]   yön=LONG
+2026-11-09 23:56:19,703 [INFO]   📊 ATR=%0.40 → SL=%1.00 TP=%1.50
+2026-11-09 23:56:20,051 [INFO]   📏 Slipaj=%0.10
+2026-11-09 23:56:20,489 [INFO]   🎯 Risk-bazlı: risk=3.10 USDT / eff_sl=%1.10 → 25.00 USDT
+2026-11-09 23:56:20,489 [INFO]   amount=0.011 (≈23.44 USDT)
+2026-11-09 23:56:20,489 [INFO]   🧠 Dinamik kaldıraç: ATR=%0.40 → 5x
+2026-11-09 23:56:20,865 [INFO]   leverage=5x
+2026-11-09 23:56:22,825 [INFO]   executor=obur1zSS9ndg2rFZnWhjNZsRnxFfWruYG8cWVEtRfe8
+2026-11-09 23:56:30,852 [INFO]   ✅ doldu: 23.44 USDT
+2026-11-09 23:56:31,342 [INFO]   ✅ SL trigger=2109.36 qty=0.011 algoId=2000001635482792
+2026-11-09 23:56:31,740 [INFO]   📊 RiskEngine: günlük sayaç arttı
+2026-11-09 23:56:31,741 [INFO] Bitti: 1/1
+2026-11-10 00:01:19,356 [INFO] ✅ 2 yeni emir arşivlendi
+2026-11-10 00:01:19,373 [INFO] 📊 Arşiv: 41 trade, 36 emir, 150 hata
+2026-11-10 00:07:55,212 [INFO] ✅ 4 yeni fill arşivlendi
+2026-11-10 00:11:31,802 [INFO] ============================================================
+2026-11-10 00:11:31,805 [INFO] Tarama: 2026-11-10T00:11:31.805457
+2026-11-10 00:11:31,808 [INFO] 🔍 State Reconciliation...
+2026-11-10 00:11:32,238 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 00:11:33,365 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 00:11:33,749 [INFO] 💰 Equity=762.10 | DD=%0.00 | Peak=762.10
+2026-11-10 00:11:34,113 [INFO] 📊 Marjin kullanımı: %0.6 (limit: %40)
+2026-11-10 00:11:34,114 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 00:11:34,114 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 00:11:34,582 [INFO] yeni aday yok
+2026-11-10 00:14:09,690 [INFO] ✅ 1 yeni emir arşivlendi
+2026-11-10 00:14:09,698 [INFO] 📊 Arşiv: 45 trade, 37 emir, 171 hata
+2026-11-10 00:26:34,758 [INFO] ============================================================
+2026-11-10 00:26:34,759 [INFO] Tarama: 2026-11-10T00:26:34.759271
+2026-11-10 00:26:34,760 [INFO] 🔍 State Reconciliation...
+2026-11-10 00:26:35,172 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 00:26:36,327 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 00:26:36,775 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 00:26:37,216 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 00:26:37,217 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 00:26:37,218 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 00:26:37,612 [INFO] yeni aday yok
+2026-11-10 00:27:31,202 [INFO] 📊 Arşiv: 45 trade, 37 emir, 192 hata
+2026-11-10 00:39:09,207 [INFO] 📊 Arşiv: 45 trade, 37 emir, 213 hata
+2026-11-10 00:41:37,791 [INFO] ============================================================
+2026-11-10 00:41:37,791 [INFO] Tarama: 2026-11-10T00:41:37.791426
+2026-11-10 00:41:37,792 [INFO] 🔍 State Reconciliation...
+2026-11-10 00:41:38,198 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 00:41:39,211 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 00:41:39,646 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 00:41:39,953 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 00:41:39,954 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 00:41:39,954 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 00:41:41,228 [INFO] yeni aday yok
+2026-11-10 00:50:42,811 [INFO] 📊 Arşiv: 45 trade, 37 emir, 234 hata
+2026-11-10 00:56:41,472 [INFO] ============================================================
+2026-11-10 00:56:41,473 [INFO] Tarama: 2026-11-10T00:56:41.473934
+2026-11-10 00:56:41,495 [INFO] 🔍 State Reconciliation...
+2026-11-10 00:56:41,973 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 00:56:42,996 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 00:56:43,373 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 00:56:43,694 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 00:56:43,695 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 00:56:43,695 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 00:56:44,495 [INFO] → SKHY-USDT fiyat=135.54 hacim=595,018,596 skor=0.449
+2026-11-10 00:56:44,796 [INFO]   likidite OK: spread=0.01% depth=566,275
+2026-11-10 00:56:45,475 [INFO]   yön=SHORT
+2026-11-10 00:56:45,775 [INFO]   📊 ATR=%0.63 → SL=%1.00 TP=%1.57
+2026-11-10 00:56:46,079 [INFO]   📏 Slipaj=%0.31
+2026-11-10 00:56:46,394 [INFO]   🎯 Risk-bazlı: risk=11.33 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-10 00:56:46,394 [INFO]   amount=0.18 (≈24.40 USDT)
+2026-11-10 00:56:46,394 [INFO]   🧠 Dinamik kaldıraç: ATR=%0.63 → 5x
+2026-11-10 00:56:46,704 [INFO]   leverage=5x
+2026-11-10 00:56:47,953 [INFO]   executor=JAsyWSQ1oV34VNSrj1MtqAEfqH961CPQuYrE1iLDTFve
+2026-11-10 00:56:55,977 [WARNING]   ⚠️  dolmadı: filled=0.00 err=8
+2026-11-10 00:56:55,978 [INFO]   [BLACKLIST] SKHYUSDT (dolmadı)
+2026-11-10 00:56:55,978 [INFO] Bitti: 0/1
+2026-11-10 01:02:21,545 [INFO] 📊 Arşiv: 45 trade, 37 emir, 246 hata
+2026-11-10 01:11:56,022 [INFO] ============================================================
+2026-11-10 01:11:56,023 [INFO] Tarama: 2026-11-10T01:11:56.023139
+2026-11-10 01:11:56,023 [INFO] 🔍 State Reconciliation...
+2026-11-10 01:11:56,355 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 01:11:57,717 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 01:11:58,036 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 01:11:58,352 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 01:11:58,353 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 01:11:58,353 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 01:11:58,667 [INFO] yeni aday yok
+2026-11-10 01:13:54,885 [INFO] 📊 Arşiv: 45 trade, 37 emir, 258 hata
+2026-11-10 01:25:30,846 [INFO] 📊 Arşiv: 45 trade, 37 emir, 270 hata
+2026-11-10 01:26:59,071 [INFO] ============================================================
+2026-11-10 01:26:59,075 [INFO] Tarama: 2026-11-10T01:26:59.075689
+2026-11-10 01:26:59,086 [INFO] 🔍 State Reconciliation...
+2026-11-10 01:26:59,554 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 01:27:00,683 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 01:27:01,262 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 01:27:01,603 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 01:27:01,604 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 01:27:01,604 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 01:27:01,915 [INFO] yeni aday yok
+2026-11-10 01:36:45,033 [INFO] 📊 Arşiv: 45 trade, 37 emir, 282 hata
+2026-11-10 01:42:01,939 [INFO] ============================================================
+2026-11-10 01:42:01,939 [INFO] Tarama: 2026-11-10T01:42:01.939502
+2026-11-10 01:42:01,940 [INFO] 🔍 State Reconciliation...
+2026-11-10 01:42:02,280 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 01:42:03,164 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 01:42:03,521 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 01:42:03,841 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 01:42:03,845 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 01:42:03,845 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 01:42:04,280 [INFO] yeni aday yok
+2026-11-10 01:47:58,635 [INFO] 📊 Arşiv: 45 trade, 37 emir, 293 hata
+2026-11-10 01:57:04,428 [INFO] ============================================================
+2026-11-10 01:57:04,429 [INFO] Tarama: 2026-11-10T01:57:04.429420
+2026-11-10 01:57:04,430 [INFO] 🔍 State Reconciliation...
+2026-11-10 01:57:04,834 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 01:57:05,803 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 01:57:06,423 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 01:57:06,799 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 01:57:06,802 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 01:57:06,802 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 01:57:07,374 [INFO] yeni aday yok
+2026-11-10 01:59:15,685 [INFO] 📊 Arşiv: 45 trade, 37 emir, 303 hata
+2026-11-10 02:10:36,828 [INFO] 📊 Arşiv: 45 trade, 37 emir, 313 hata
+2026-11-10 02:12:07,489 [INFO] ============================================================
+2026-11-10 02:12:07,491 [INFO] Tarama: 2026-11-10T02:12:07.490754
+2026-11-10 02:12:07,493 [INFO] 🔍 State Reconciliation...
+2026-11-10 02:12:08,068 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 02:12:09,321 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 02:12:09,653 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 02:12:09,969 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 02:12:09,970 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 02:12:09,970 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 02:12:10,289 [INFO] yeni aday yok
+2026-11-10 02:22:00,689 [INFO] 📊 Arşiv: 45 trade, 37 emir, 322 hata
+2026-11-10 02:27:10,302 [INFO] ============================================================
+2026-11-10 02:27:10,302 [INFO] Tarama: 2026-11-10T02:27:10.302861
+2026-11-10 02:27:10,303 [INFO] 🔍 State Reconciliation...
+2026-11-10 02:27:10,639 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 02:27:11,592 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 02:27:11,916 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 02:27:12,232 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 02:27:12,232 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 02:27:12,232 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 02:27:13,062 [INFO] yeni aday yok
+2026-11-10 02:33:25,767 [INFO] 📊 Arşiv: 45 trade, 37 emir, 331 hata
+2026-11-10 02:42:13,081 [INFO] ============================================================
+2026-11-10 02:42:13,082 [INFO] Tarama: 2026-11-10T02:42:13.082097
+2026-11-10 02:42:13,082 [INFO] 🔍 State Reconciliation...
+2026-11-10 02:42:13,429 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 02:42:14,485 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 02:42:14,866 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 02:42:15,234 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 02:42:15,236 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 02:42:15,237 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 02:42:15,661 [INFO] yeni aday yok
+2026-11-10 02:44:38,504 [INFO] 📊 Arşiv: 45 trade, 37 emir, 340 hata
+2026-11-10 02:52:18,202 [INFO]   [BLACKLIST] __TEST_FAKE__ (diagnostic)
+2026-11-10 02:56:09,726 [INFO] 📊 Arşiv: 45 trade, 37 emir, 349 hata
+2026-11-10 02:57:15,699 [INFO] ============================================================
+2026-11-10 02:57:15,699 [INFO] Tarama: 2026-11-10T02:57:15.699537
+2026-11-10 02:57:15,700 [INFO] 🔍 State Reconciliation...
+2026-11-10 02:57:16,046 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 02:57:16,953 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 02:57:17,272 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 02:57:17,580 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 02:57:17,581 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 02:57:17,581 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 02:57:17,918 [INFO] yeni aday yok
+2026-11-10 03:07:38,060 [INFO] 📊 Arşiv: 45 trade, 37 emir, 356 hata
+2026-11-10 03:12:18,168 [INFO] ============================================================
+2026-11-10 03:12:18,168 [INFO] Tarama: 2026-11-10T03:12:18.168929
+2026-11-10 03:12:18,169 [INFO] 🔍 State Reconciliation...
+2026-11-10 03:12:18,504 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 03:12:19,376 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 03:12:19,692 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 03:12:19,994 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 03:12:19,994 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 03:12:19,994 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 03:12:20,531 [INFO] yeni aday yok
+2026-11-10 03:18:48,130 [INFO] 📊 Arşiv: 45 trade, 37 emir, 363 hata
+2026-11-10 03:27:20,545 [INFO] ============================================================
+2026-11-10 03:27:20,546 [INFO] Tarama: 2026-11-10T03:27:20.546021
+2026-11-10 03:27:20,546 [INFO] 🔍 State Reconciliation...
+2026-11-10 03:27:20,952 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 03:27:22,006 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 03:27:22,321 [INFO] 💰 Equity=1137.90 | DD=%0.00 | Peak=1137.90
+2026-11-10 03:27:22,622 [INFO] 📊 Marjin kullanımı: %0.4 (limit: %40)
+2026-11-10 03:27:22,622 [INFO] Aktif: ['ETH-USDT']
+2026-11-10 03:27:22,622 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 03:27:22,925 [INFO] yeni aday yok
+2026-11-10 03:30:05,453 [INFO] 📊 Arşiv: 45 trade, 37 emir, 370 hata
+2026-11-10 03:41:26,470 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 03:41:26,470 [INFO] ============================================================
+2026-11-10 03:41:26,470 [INFO] Tarama: 2026-11-10T03:41:26.470819
+2026-11-10 03:41:26,471 [INFO] 🔍 State Reconciliation...
+2026-11-10 03:41:26,908 [CRITICAL] 🚨 DRIFT: Borsada ETHUSDT var (0.011), HB'de executor yok
+2026-11-10 03:41:26,908 [CRITICAL] 🚨 DRIFT! Bu döngüde yeni işlem açılmayacak
+2026-11-10 03:41:26,910 [CRITICAL] 🚨 Reconciliation drift — döngü atlanıyor
+2026-11-10 03:41:37,640 [INFO] 📊 Arşiv: 45 trade, 37 emir, 380 hata
+2026-11-10 03:47:49,777 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 03:47:49,777 [INFO] ============================================================
+2026-11-10 03:47:49,778 [INFO] Tarama: 2026-11-10T03:47:49.778044
+2026-11-10 03:47:49,778 [INFO] 🔍 State Reconciliation...
+2026-11-10 03:47:50,238 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 03:47:50,824 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 03:47:51,127 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 03:47:51,678 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 03:47:51,678 [INFO] Aktif: yok
+2026-11-10 03:47:51,678 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 03:47:51,984 [INFO] → SPCX-USDT fiyat=142.37 hacim=687,580,196 skor=1.000
+2026-11-10 03:47:52,270 [INFO]   likidite OK: spread=0.01% depth=477,702
+2026-11-10 03:47:53,426 [INFO]   yön=SHORT
+2026-11-10 03:47:53,808 [INFO]   📊 ATR=%0.16 → SL=%1.00 TP=%1.50
+2026-11-10 03:47:54,102 [INFO]   📏 Slipaj=%0.31
+2026-11-10 03:47:54,495 [INFO]   🎯 Risk-bazlı: risk=11.38 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-10 03:47:54,496 [INFO]   amount=0.17 (≈24.20 USDT)
+2026-11-10 03:47:54,496 [INFO]   🧠 Dinamik kaldıraç: ATR=%0.16 → 5x
+2026-11-10 03:47:54,800 [INFO]   leverage=5x
+2026-11-10 03:47:56,630 [INFO]   executor=CNiRUrfoFxGqdUDzPuJzaZ7PpE4BgNn2Yx9WMbR194Dm
+2026-11-10 03:48:04,647 [WARNING]   ⚠️  dolmadı: filled=0.00 err=8
+2026-11-10 03:48:04,648 [INFO]   [BLACKLIST] SPCXUSDT (dolmadı)
+2026-11-10 03:48:04,648 [INFO] Bitti: 0/1
+2026-11-10 03:52:41,540 [INFO] ✅ 1 yeni emir arşivlendi
+2026-11-10 03:52:41,550 [INFO] 📊 Arşiv: 45 trade, 38 emir, 390 hata
+2026-11-10 03:58:46,451 [INFO] ✅ 1 yeni fill arşivlendi
+2026-11-10 04:03:04,686 [INFO] ============================================================
+2026-11-10 04:03:04,686 [INFO] Tarama: 2026-11-10T04:03:04.686718
+2026-11-10 04:03:04,687 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:03:05,006 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:03:05,605 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:03:05,922 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:03:06,238 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:03:06,238 [INFO] Aktif: yok
+2026-11-10 04:03:06,239 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 04:03:06,787 [WARNING] hiç aday yok
+2026-11-10 04:03:10,119 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:03:10,119 [INFO] ============================================================
+2026-11-10 04:03:10,119 [INFO] Tarama: 2026-11-10T04:03:10.119401
+2026-11-10 04:03:10,120 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:03:10,530 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:03:11,222 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:03:11,523 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:03:11,829 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:03:11,830 [INFO] Aktif: yok
+2026-11-10 04:03:11,830 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'ZECUSDT']
+2026-11-10 04:03:12,134 [WARNING] hiç aday yok
+2026-11-10 04:03:52,292 [INFO] 📊 Arşiv: 46 trade, 38 emir, 400 hata
+2026-11-10 04:08:32,317 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:08:32,318 [INFO] ============================================================
+2026-11-10 04:08:32,318 [INFO] Tarama: 2026-11-10T04:08:32.318253
+2026-11-10 04:08:32,324 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:08:32,994 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:08:33,801 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:08:34,239 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:08:34,544 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:08:34,544 [INFO] Aktif: yok
+2026-11-10 04:08:34,545 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:08:34,864 [INFO] → SNXX-USDT fiyat=3.63 hacim=456,984,351 skor=0.989
+2026-11-10 04:08:35,170 [INFO]   likidite OK: spread=0.28% depth=6,089,782
+2026-11-10 04:08:36,380 [INFO]   yön=SHORT
+2026-11-10 04:08:36,671 [INFO]   📊 ATR=%1.39 → SL=%2.09 TP=%3.48
+2026-11-10 04:08:36,956 [INFO]   📏 Slipaj=%0.57
+2026-11-10 04:08:37,251 [INFO]   🎯 Risk-bazlı: risk=11.38 USDT / eff_sl=%2.66 → 25.00 USDT
+2026-11-10 04:08:37,251 [INFO]   amount=6.88 (≈24.97 USDT)
+2026-11-10 04:08:37,252 [INFO]   🧠 Dinamik kaldıraç: ATR=%1.39 → 2x
+2026-11-10 04:08:37,540 [INFO]   leverage=2x
+2026-11-10 04:08:39,406 [INFO]   executor=2CSCkhJ9hBgfZ7JtnGWS57AARFWJFdrt5GWPhJfFPPHe
+2026-11-10 04:08:47,437 [WARNING]   ⚠️  dolmadı: filled=0.00 err=8
+2026-11-10 04:08:47,440 [INFO]   [BLACKLIST] SNXXUSDT (dolmadı)
+2026-11-10 04:08:47,441 [INFO] → ON-USDT fiyat=0.1658 hacim=322,687,044 skor=0.824
+2026-11-10 04:08:47,740 [WARNING]   atlandı: depth 27,697
+2026-11-10 04:08:47,742 [INFO]   [BLACKLIST] ONUSDT (depth 27,697)
+2026-11-10 04:08:47,744 [INFO] Bitti: 0/2
+2026-11-10 04:13:18,801 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:13:18,801 [INFO] ============================================================
+2026-11-10 04:13:18,801 [INFO] Tarama: 2026-11-10T04:13:18.801925
+2026-11-10 04:13:18,802 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:13:19,243 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:13:19,826 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:13:20,132 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:13:20,431 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:13:20,432 [INFO] Aktif: yok
+2026-11-10 04:13:20,432 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:13:20,770 [INFO] → AVAX-USDT fiyat=8.715 hacim=311,052,644 skor=1.000
+2026-11-10 04:13:21,101 [INFO]   likidite OK: spread=0.01% depth=219,899
+2026-11-10 04:13:21,886 [INFO]   yön=SHORT
+2026-11-10 04:13:22,238 [INFO]   📊 ATR=%0.56 → SL=%1.00 TP=%1.50
+2026-11-10 04:13:22,625 [INFO]   📏 Slipaj=%0.31
+2026-11-10 04:13:22,945 [INFO]   🎯 Risk-bazlı: risk=11.38 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-10 04:13:22,946 [INFO]   amount=2.0 (≈17.43 USDT)
+2026-11-10 04:13:22,946 [INFO]   🧠 Dinamik kaldıraç: ATR=%0.56 → 5x
+2026-11-10 04:13:23,252 [INFO]   leverage=5x
+2026-11-10 04:13:23,293 [INFO]   [BLACKLIST] AVAXUSDT (executor: {'detail': "Invalid executor config: 4 validation errors for PositionExecutorConfig\ntriple_barrier_config.open_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.take_profit_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.stop_loss_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.time_limit_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum"})
+2026-11-10 04:13:23,294 [ERROR]   executor açılamadı: {'detail': "Invalid executor config: 4 validation errors for PositionExecutorConfig\ntriple_barrier_config.open_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.take_profit_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.stop_loss_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum\ntriple_barrier_config.time_limit_order_type\n  Input should be 1, 2, 3, 4, 5 or 6 [type=enum, input_value='MARKET', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/enum"}
+2026-11-10 04:13:23,294 [INFO] Bitti: 0/1
+2026-11-10 04:14:45,681 [INFO] 📊 Arşiv: 46 trade, 38 emir, 411 hata
+2026-11-10 04:15:24,853 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:15:24,854 [INFO] ============================================================
+2026-11-10 04:15:24,854 [INFO] Tarama: 2026-11-10T04:15:24.854165
+2026-11-10 04:15:24,854 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:15:25,254 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:15:25,898 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:15:26,209 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:15:26,521 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:15:26,521 [INFO] Aktif: yok
+2026-11-10 04:15:26,522 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'AVAXUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:15:26,831 [WARNING] hiç aday yok
+2026-11-10 04:16:58,080 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:16:58,081 [INFO] ============================================================
+2026-11-10 04:16:58,081 [INFO] Tarama: 2026-11-10T04:16:58.081655
+2026-11-10 04:16:58,082 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:16:58,496 [INFO] ✅ Reconciliation OK — 0 pozisyon senkron
+2026-11-10 04:16:59,165 [INFO] SL kontrolü: açık pozisyon yok
+2026-11-10 04:16:59,510 [INFO] 💰 Equity=1137.84 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:16:59,981 [INFO] 📊 Marjin kullanımı: %0.0 (limit: %40)
+2026-11-10 04:16:59,982 [INFO] Aktif: yok
+2026-11-10 04:16:59,982 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:17:00,304 [INFO] → AVAX-USDT fiyat=8.724 hacim=311,463,440 skor=1.000
+2026-11-10 04:17:00,591 [INFO]   likidite OK: spread=0.01% depth=219,659
+2026-11-10 04:17:01,227 [INFO]   yön=SHORT
+2026-11-10 04:17:01,511 [INFO]   📊 ATR=%0.54 → SL=%1.00 TP=%1.50
+2026-11-10 04:17:01,799 [INFO]   📏 Slipaj=%0.31
+2026-11-10 04:17:02,095 [INFO]   🎯 Risk-bazlı: risk=11.38 USDT / eff_sl=%1.31 → 25.00 USDT
+2026-11-10 04:17:02,095 [INFO]   amount=2.0 (≈17.45 USDT)
+2026-11-10 04:17:02,095 [INFO]   🧠 Dinamik kaldıraç: ATR=%0.54 → 5x
+2026-11-10 04:17:02,380 [INFO]   leverage=5x
+2026-11-10 04:17:03,459 [INFO]   executor=EJxiV5heK34bRSm2FR66MaCA8gdTDPXCjhZ4zndH8ZNT
+2026-11-10 04:17:11,479 [INFO]   ✅ doldu: 17.45 USDT
+2026-11-10 04:17:12,257 [INFO]   ✅ SL trigger=8.811 qty=2.0 algoId=2000001637287433
+2026-11-10 04:17:12,688 [INFO]   🔍 Likidasyon=574.76416527 (%6488.31) vs SL %1.00
+2026-11-10 04:17:12,688 [INFO]   📊 RiskEngine: günlük sayaç arttı
+2026-11-10 04:17:12,689 [INFO] Bitti: 1/1
+2026-11-10 04:20:39,320 [INFO] ✅ 1 yeni fill arşivlendi
+2026-11-10 04:24:29,506 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:24:29,506 [INFO] ============================================================
+2026-11-10 04:24:29,506 [INFO] Tarama: 2026-11-10T04:24:29.506907
+2026-11-10 04:24:29,508 [INFO] 🌅 Günlük sayaçlar sıfırlandı
+2026-11-10 04:24:29,508 [INFO]   Günlük sayaçlar sıfırlandı (2026-11-10)
+2026-11-10 04:24:29,508 [INFO]   RiskEngine: ilk senkron, gecmis kapanislar atlaniyor
+2026-11-10 04:24:29,508 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:24:30,168 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 04:24:31,052 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 04:24:31,379 [INFO] 💰 Equity=1137.83 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:24:31,685 [INFO] 📊 Marjin kullanımı: %0.3 (limit: %40)
+2026-11-10 04:24:31,686 [INFO] Aktif: ['AVAX-USDT']
+2026-11-10 04:24:31,686 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:24:31,991 [INFO] yeni aday yok
+2026-11-10 04:25:32,963 [INFO] ✅ 1 yeni emir arşivlendi
+2026-11-10 04:25:32,973 [INFO] 📊 Arşiv: 47 trade, 39 emir, 422 hata
+2026-11-10 04:28:02,528 [INFO] Döngü, 900s (heartbeat her 60s)
+2026-11-10 04:28:02,528 [INFO] ============================================================
+2026-11-10 04:28:02,528 [INFO] Tarama: 2026-11-10T04:28:02.528715
+2026-11-10 04:28:02,556 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:28:02,945 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 04:28:04,036 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 04:28:04,503 [INFO] 💰 Equity=1137.83 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:28:04,803 [INFO] 📊 Marjin kullanımı: %0.3 (limit: %40)
+2026-11-10 04:28:04,803 [INFO] Aktif: ['AVAX-USDT']
+2026-11-10 04:28:04,804 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:28:05,119 [INFO] yeni aday yok
+2026-11-10 04:36:29,867 [INFO] 📊 Arşiv: 47 trade, 39 emir, 433 hata
+2026-11-10 04:43:05,136 [INFO] ============================================================
+2026-11-10 04:43:05,136 [INFO] Tarama: 2026-11-10T04:43:05.136693
+2026-11-10 04:43:05,159 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:43:05,839 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 04:43:07,244 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 04:43:07,555 [INFO] 💰 Equity=1137.83 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:43:07,858 [INFO] 📊 Marjin kullanımı: %0.3 (limit: %40)
+2026-11-10 04:43:07,859 [INFO] Aktif: ['AVAX-USDT']
+2026-11-10 04:43:07,859 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:43:08,166 [INFO] yeni aday yok
+2026-11-10 04:58:08,329 [INFO] ============================================================
+2026-11-10 04:58:08,330 [INFO] Tarama: 2026-11-10T04:58:08.330317
+2026-11-10 04:58:08,353 [INFO] 🔍 State Reconciliation...
+2026-11-10 04:58:08,673 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 04:58:09,559 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 04:58:09,872 [INFO] 💰 Equity=1137.83 | DD=%0.01 | Peak=1137.90
+2026-11-10 04:58:10,183 [INFO] 📊 Marjin kullanımı: %0.3 (limit: %40)
+2026-11-10 04:58:10,184 [INFO] Aktif: ['AVAX-USDT']
+2026-11-10 04:58:10,184 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 04:58:11,004 [INFO] yeni aday yok
+2026-11-10 05:13:11,018 [INFO] ============================================================
+2026-11-10 05:13:11,018 [INFO] Tarama: 2026-11-10T05:13:11.018645
+2026-11-10 05:13:11,044 [INFO] 🔍 State Reconciliation...
+2026-11-10 05:13:11,457 [INFO] ✅ Reconciliation OK — 1 pozisyon senkron
+2026-11-10 05:13:12,338 [INFO] ✅ SL koruması tam (1 pozisyon)
+2026-11-10 05:13:12,647 [INFO] 💰 Equity=1137.83 | DD=%0.01 | Peak=1137.90
+2026-11-10 05:13:12,946 [INFO] 📊 Marjin kullanımı: %0.3 (limit: %40)
+2026-11-10 05:13:12,947 [INFO] Aktif: ['AVAX-USDT']
+2026-11-10 05:13:12,947 [INFO] Blacklist: ['AAPLUSDT', 'AMDUSDT', 'AMZNUSDT', 'BITOUSDT', 'BZUSDT', 'CLUSDT', 'COINUSDT', 'FBTCUSDT', 'GBTCUSDT', 'GOOGLUSDT', 'HOODUSDT', 'HYPEUSDT', 'IBITUSDT', 'INTCUSDT', 'JCTUSDT', 'KORUUSDT', 'MARAUSDT', 'METAUSDT', 'MSFTUSDT', 'MSTRUSDT', 'MUUSDT', 'NFLXUSDT', 'NVDAUSDT', 'ONUSDT', 'QCOMUSDT', 'QQQUSDT', 'RIOTUSDT', 'SKHYNIXUSDT', 'SKHYUSDT', 'SNDKUSDT', 'SNXXUSDT', 'SOXLUSDT', 'SOXSUSDT', 'SPCXUSDT', 'SPYUSDT', 'SQQQUSDT', 'TQQQUSDT', 'TSLAUSDT', 'XAGUSDT', 'ZECUSDT']
+2026-11-10 05:13:13,256 [INFO] yeni aday yok

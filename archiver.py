@@ -12,16 +12,22 @@ from auto_trader import BinanceAPI, HBAPI
 LOG = Path.home() / "archiver.log"
 DB = Path.home() / ".trading_archive.db"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG), logging.StreamHandler(sys.stdout)]
-)
 log = logging.getLogger("archiver")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fh = logging.FileHandler(LOG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_fh)
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(_sh)
 
 
 def init_db():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=30.0, isolation_level=None)
+    conn.execute('PRAGMA busy_timeout = 30000')
+    conn.execute('PRAGMA journal_mode = WAL')
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +83,7 @@ def sync_trades(binance, conn):
         symbols = set()
         positions = binance.position_risk()
         if isinstance(positions, list):
-            symbols |= {p["symbol"] for p in positions}
+            symbols |= {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
         # Bilinen sembolleri de ekle (tracked)
         tracked_file = Path.home() / ".tracked_symbols.json"
         if tracked_file.exists():
@@ -129,7 +135,7 @@ def sync_orders(binance, conn):
         positions = binance.position_risk()
         symbols = set()
         if isinstance(positions, list):
-            symbols |= {p["symbol"] for p in positions}
+            symbols |= {p["symbol"] for p in positions if float(p.get("positionAmt", 0)) != 0}
         tracked_file = Path.home() / ".tracked_symbols.json"
         if tracked_file.exists():
             symbols |= set(json.loads(tracked_file.read_text()))
@@ -174,6 +180,8 @@ def sync_orders(binance, conn):
 
 
 def parse_logs(conn):
+    STATE = Path.home() / ".parse_state.json"
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
     """auto_trader.log ve orphan_killer.log'daki hataları arşivle."""
     c = conn.cursor()
     for log_path, source in [
@@ -184,20 +192,41 @@ def parse_logs(conn):
             continue
         try:
             # Son 500 satırı oku
-            lines = log_path.read_text().splitlines()[-500:]
+            size = log_path.stat().st_size
+            key = str(log_path)
+            if key not in state:
+                state[key] = size
+                continue
+            last = state[key]
+            if size < last:
+                last = 0
+            if size == last:
+                continue
+            with open(log_path, "r") as f:
+                f.seek(last)
+                lines = f.read().splitlines()
+                new_offset = f.tell()
             for line in lines:
                 if any(k in line for k in ["ERROR", "CRITICAL", "Traceback", "Exception"]):
                     # Duplicate kontrolü (aynı mesaj son 60 saniyede varsa atla)
                     msg = line[:500]
+                    # FIX: dedup tam satir ile (raw_line = line, msg degil)
                     c.execute("""SELECT COUNT(*) FROM errors
-                        WHERE raw_line = ? AND captured_at > datetime('now','-1 minute')""", (msg,))
+                        WHERE raw_line = ? AND captured_at > datetime('now','-30 days')""", (line,))
                     if c.fetchone()[0] == 0:
                         level = "CRITICAL" if "CRITICAL" in line else "ERROR"
                         c.execute("""INSERT INTO errors (source, level, message, raw_line)
                             VALUES (?, ?, ?, ?)""", (source, level, msg, line))
             conn.commit()
+            state[key] = new_offset
         except Exception as e:
             log.debug(f"parse_logs {source}: {e}")
+
+
+    try:
+        STATE.write_text(json.dumps(state, indent=2))
+    except Exception:
+        pass
 
 
 def capture_heartbeat(conn):

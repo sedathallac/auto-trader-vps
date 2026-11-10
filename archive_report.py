@@ -3,7 +3,13 @@
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
-conn = sqlite3.connect('/home/reisfurkan/.trading_archive.db')
+from pathlib import Path as _P
+import sys as _s
+_DB = _P.home() / '.trading_archive.db'
+if not _DB.exists():
+    print('HATA: DB bulunamadi: ' + str(_DB))
+    _s.exit(1)
+conn = sqlite3.connect(str(_DB))
 c = conn.cursor()
 
 print("\n" + "═" * 70)
