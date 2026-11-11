@@ -175,6 +175,11 @@ class BinanceAPI:
     def position_risk(self):
         return self._get("/fapi/v2/positionRisk", signed=True)
 
+    def position_mode(self):
+        """GET /fapi/v1/positionSide/dual -> {"dualSidePosition": bool}.
+        true = HEDGE (long+short per symbol), false = ONEWAY (single netted)."""
+        return self._get("/fapi/v1/positionSide/dual", signed=True)
+
     def open_algo_orders_for(self, symbol):
         r = self._get("/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
         if isinstance(r, list):
@@ -717,6 +722,25 @@ def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
     return notional, risk_amount, effective_sl
 
 
+def _verify_oneway(binance):
+    """Verify the account is in ONEWAY position mode (A9/F7).
+
+    Returns (ok, mode). ok is True ONLY when the exchange confirms ONEWAY
+    (dualSidePosition == false). HEDGE, or any unverifiable result, returns
+    (False, ...) so the caller fails closed and blocks new entries — the
+    symbol-keyed reservation and netting assumptions only hold under ONEWAY.
+    """
+    try:
+        r = binance.position_mode()
+    except Exception:
+        return (False, "UNKNOWN")
+    if not isinstance(r, dict) or "dualSidePosition" not in r:
+        return (False, "UNKNOWN")
+    v = r["dualSidePosition"]
+    hedge = (v.strip().lower() == "true") if isinstance(v, str) else bool(v)
+    return ((not hedge), "HEDGE" if hedge else "ONEWAY")
+
+
 def _exchange_open_symbols(binance):
     """Set of symbols with a non-zero exchange position, or None on API failure.
     None means the caller MUST fail-closed (do not admit a new position)."""
@@ -1069,6 +1093,15 @@ def run_once(dry_run=False):
                          f"released={len(_rc.released)} kept={len(_rc.kept)}")
     except Exception as e:
         log.warning(f"rezervasyon reconcile hatası: {e}")
+
+    # A9/F7: ONEWAY start guarantee. The symbol-keyed reservation + netting
+    # assumptions only hold in ONEWAY; HEDGE or an unverifiable mode fails closed
+    # (protection/reconcile above already ran; only NEW entries are blocked).
+    _mode_ok, _mode = _verify_oneway(binance)
+    if not _mode_ok:
+        log.critical(f"🚨 Pozisyon modu {_mode} (ONEWAY değil) — yeni giriş fail-closed engellendi")
+        return
+    log.info("  ✅ Pozisyon modu ONEWAY doğrulandı")
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
