@@ -54,3 +54,4 @@ risk_ledger.db-wal
 
 # Test temp files
 tmp*_c3_mod.py
+.lesshst
