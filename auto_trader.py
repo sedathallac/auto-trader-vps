@@ -265,33 +265,29 @@ def heartbeat_tick():
 
 
 def sync_risk_engine(risk, hb):
-    """Report closed executor PnLs to RiskEngine, idempotent via executor_id set."""
-    state_file = Path.home() / ".risk_engine_last_exec_check.json"
-    state = {"last_close_ts": 0, "reported_executor_ids": []}
-    if state_file.exists():
-        try:
-            loaded = json.loads(state_file.read_text())
-            state["last_close_ts"] = float(loaded.get("last_close_ts", 0))
-            state["reported_executor_ids"] = list(loaded.get("reported_executor_ids", []))
-        except Exception as e:
-            log.warning(f"risk state yüklenemedi: {e}")
-    last_ts = state["last_close_ts"]
-    reported_ids = set(state["reported_executor_ids"])
+    """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY)."""
+    import sqlite3 as _sq
+    from datetime import timezone as _tz
 
-    if last_ts == 0 and not reported_ids:
-        state_file.write_text(json.dumps({"last_close_ts": time.time(), "reported_executor_ids": []}))
-        log.info("  RiskEngine: ilk senkron, gecmis kapanislar atlaniyor")
+    db_path = Path.home() / "risk_ledger.db"
+
+    try:
+        with _sq.connect(str(db_path), timeout=10) as conn:
+            meta = conn.execute("SELECT last_close_ts FROM sync_meta WHERE id=1").fetchone()
+            last_ts = float(meta[0]) if meta else 0.0
+            reported_ids = {r[0] for r in conn.execute("SELECT executor_id FROM trade_ledger")}
+    except Exception as e:
+        log.critical(f"🚨 C3: sync_meta/ledger okunamadi, fail-closed: {e}")
         return
 
     reported = 0
     max_close_ts = last_ts
-    new_ids = set()
     try:
         r = requests.post(f"{HB_API}/executors/search", json={},
                           auth=hb.auth, timeout=15).json()
         all_execs = r.get("data", [])
         terminated = [e for e in all_execs if e.get("status") == "TERMINATED"]
-        log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} already-reported")
+        log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} in ledger")
         for e in terminated:
             eid = e.get("executor_id")
             if not eid:
@@ -299,18 +295,18 @@ def sync_risk_engine(risk, hb):
             if eid in reported_ids:
                 continue
             closed_at = float(e.get("close_timestamp") or 0)
-            if closed_at <= last_ts and not reported_ids:
-                # Migration: old schema had only last_close_ts. Skip pre-watermark executors.
-                new_ids.add(eid)
+            if closed_at <= last_ts:
+                # Pre-watermark: skip (already handled via migration or previous sync)
                 continue
             pnl = float(e.get("net_pnl_quote") or 0)
-            if pnl != 0:
-                risk.register_trade_result(pnl)
+            pair = e.get("trading_pair")
+            closed_at_iso = datetime.fromtimestamp(closed_at).isoformat() if closed_at else None
+            inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso)
+            if inserted:
                 reported += 1
-                new_ids.add(eid)
-                log.info(f"  RiskEngine PnL: {e.get('trading_pair')} -> {pnl:+.4f}")
+                log.info(f"  RiskEngine PnL: {pair} -> {pnl:+.4f} ({msg})")
             else:
-                new_ids.add(eid)
+                log.debug(f"  skip {eid[:12]}: {msg}")
             if closed_at > max_close_ts:
                 max_close_ts = closed_at
         if reported:
@@ -319,14 +315,16 @@ def sync_risk_engine(risk, hb):
         log.warning(f"  RiskEngine sync HATA: {type(e).__name__}: {e}")
         return
 
-    # Persist state atomically + prune to last 24h of ids
-    now_ts = time.time()
-    all_ids = reported_ids | new_ids
-    state_file.write_text(json.dumps({
-        "last_close_ts": max_close_ts,
-        "reported_executor_ids": sorted(all_ids),
-        "last_sync_ts": now_ts,
-    }, indent=2))
+    try:
+        now = datetime.now(_tz.utc).isoformat()
+        with _sq.connect(str(db_path), timeout=10) as conn:
+            conn.execute(
+                "UPDATE sync_meta SET last_close_ts=?, updated_at=? WHERE id=1",
+                (max_close_ts, now)
+            )
+            conn.commit()
+    except Exception as e:
+        log.critical(f"🚨 C3: sync_meta güncellenemedi: {e}")
 
 
 def reconcile_positions(binance, hb):
