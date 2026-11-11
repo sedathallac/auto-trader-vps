@@ -27,3 +27,17 @@ backup_pre_promote_*/
 
 # Runtime raporlar
 reports/
+
+# Secrets / personal files — NEVER track
+.bashrc
+.bash_history
+.profile
+.cache/
+.config/
+.ssh/
+*.env
+*.bak-*
+*.bak_*
+*.log.old-*
+*.db.bak-*
+reports/
