@@ -30,7 +30,7 @@ STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
 TOP_N = 2
-MAX_OPEN_POSITIONS = 5
+MAX_OPEN_POSITIONS = 0  # EMERGENCY: yeni giris durdu
 
 RISK_CONFIG = {
     "max_drawdown_pct": 0.20,
@@ -264,42 +264,68 @@ def heartbeat_tick():
 
 
 def sync_risk_engine(risk, hb):
-    """FAZ 1.2: Report closed executor PnLs to RiskEngine since last check."""
+    """Report closed executor PnLs to RiskEngine, idempotent via executor_id set."""
     state_file = Path.home() / ".risk_engine_last_exec_check.json"
-    last_ts = 0
+    state = {"last_close_ts": 0, "reported_executor_ids": []}
     if state_file.exists():
         try:
-            last_ts = json.loads(state_file.read_text()).get("last_close_ts", 0)
+            loaded = json.loads(state_file.read_text())
+            state["last_close_ts"] = float(loaded.get("last_close_ts", 0))
+            state["reported_executor_ids"] = list(loaded.get("reported_executor_ids", []))
         except Exception:
-            last_ts = 0
-    if last_ts == 0:
-        state_file.write_text(json.dumps({"last_close_ts": time.time()}))
+            pass
+    last_ts = state["last_close_ts"]
+    reported_ids = set(state["reported_executor_ids"])
+
+    if last_ts == 0 and not reported_ids:
+        state_file.write_text(json.dumps({"last_close_ts": time.time(), "reported_executor_ids": []}))
         log.info("  RiskEngine: ilk senkron, gecmis kapanislar atlaniyor")
         return
+
     reported = 0
     max_close_ts = last_ts
+    new_ids = set()
     try:
         r = requests.post(f"{HB_API}/executors/search", json={},
                           auth=hb.auth, timeout=15).json()
-        for e in r.get("data", []):
-            if e.get("status") != "TERMINATED":
+        all_execs = r.get("data", [])
+        terminated = [e for e in all_execs if e.get("status") == "TERMINATED"]
+        log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} already-reported")
+        for e in terminated:
+            eid = e.get("executor_id")
+            if not eid:
+                continue
+            if eid in reported_ids:
                 continue
             closed_at = float(e.get("close_timestamp") or 0)
-            if closed_at <= last_ts:
+            if closed_at <= last_ts and not reported_ids:
+                # Migration: old schema had only last_close_ts. Skip pre-watermark executors.
+                new_ids.add(eid)
                 continue
             pnl = float(e.get("net_pnl_quote") or 0)
             if pnl != 0:
                 risk.register_trade_result(pnl)
                 reported += 1
+                new_ids.add(eid)
                 log.info(f"  RiskEngine PnL: {e.get('trading_pair')} -> {pnl:+.4f}")
+            else:
+                new_ids.add(eid)
             if closed_at > max_close_ts:
                 max_close_ts = closed_at
         if reported:
-            log.info(f"  RiskEngine: {reported} kapanis islendi")
+            log.info(f"  RiskEngine: {reported} yeni kapanis islendi")
     except Exception as e:
-        log.debug(f"sync_risk_engine: {e}")
+        log.warning(f"  RiskEngine sync HATA: {type(e).__name__}: {e}")
         return
-    state_file.write_text(json.dumps({"last_close_ts": max_close_ts}))
+
+    # Persist state atomically + prune to last 24h of ids
+    now_ts = time.time()
+    all_ids = reported_ids | new_ids
+    state_file.write_text(json.dumps({
+        "last_close_ts": max_close_ts,
+        "reported_executor_ids": sorted(all_ids),
+        "last_sync_ts": now_ts,
+    }, indent=2))
 
 
 def reconcile_positions(binance, hb):
@@ -340,15 +366,31 @@ def reconcile_positions(binance, hb):
         for sym in orphaned_on_hb:
             log.critical(f"🚨 DRIFT: HB'de {sym} executor var, borsada pozisyon yok")
             drift = True
-            # AUTO-HEAL
+            # AUTO-HEAL with per-symbol cooldown (avoid hammering HB)
+            cooldown_sec = 300
+            heal_state_file = Path.home() / ".auto_heal_cooldown.json"
+            heal_state = {}
+            if heal_state_file.exists():
+                try:
+                    heal_state = json.loads(heal_state_file.read_text())
+                except Exception:
+                    heal_state = {}
+            last_heal = heal_state.get(sym, 0)
+            now_ts = time.time()
+            if now_ts - last_heal < cooldown_sec:
+                log.info(f"  AUTO-HEAL {sym}: cooldown ({int(now_ts - last_heal)}s/{cooldown_sec}s)")
+                continue
             for e in hb_executors:
                 if e["trading_pair"].replace("-", "") == sym and e.get("status") == "RUNNING":
                     eid = e.get("executor_id")
                     try:
                         r = requests.post(f"{HB_API}/executors/{eid}/stop", json={"close_type": "EARLY_STOP", "keep_position": True}, auth=hb.auth, timeout=15).json()
                         log.warning("  AUTO-HEAL " + sym + " -> " + str(r.get("status")))
+                        heal_state[sym] = now_ts
+                        heal_state_file.write_text(json.dumps(heal_state, indent=2))
                     except Exception as ex:
                         log.error("  AUTO-HEAL HATA " + sym + ": " + str(ex))
+                    break
 
         if not drift:
             log.info(f"✅ Reconciliation OK — {len(open_exchange_pos)} pozisyon senkron")
@@ -555,6 +597,9 @@ def calculate_position_size(balance_usdt, coin):
 
     # Hedef marjin (tüm işlemler için)
     total_target_margin = balance_usdt * TARGET_MARGIN_USAGE_PCT
+    if MAX_OPEN_POSITIONS <= 0:
+        log.warning("calculate_position_size: MAX_OPEN_POSITIONS <= 0, returning 0")
+        return 0.0, 0.0
     margin_per_trade = total_target_margin / MAX_OPEN_POSITIONS
     base_notional = margin_per_trade * LEVERAGE
 
@@ -788,16 +833,43 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
         risk.register_open()
         log.info(f"  📊 RiskEngine: günlük sayaç arttı")
 
-    # Tracked listesine ekle (orphan_killer için)
+    # Tracked list (orphan_killer cleanup only) - atomic write
     try:
         TRACKED_JSON = Path.home() / ".tracked_symbols.json"
         tracked = set()
         if TRACKED_JSON.exists():
             tracked = set(json.loads(TRACKED_JSON.read_text()))
         tracked.add(symbol)
-        TRACKED_JSON.write_text(json.dumps(sorted(tracked), indent=2))
+        tmp = TRACKED_JSON.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(sorted(tracked), indent=2))
+        tmp.replace(TRACKED_JSON)
     except Exception as e:
-        log.debug(f"tracked update: {e}")
+        log.warning(f"tracked update: {e}")
+
+    # Permanent archive_symbols registration (independent of orphan_killer)
+    try:
+        import sqlite3
+        _adb = sqlite3.connect("/root/.trading_archive.db", timeout=10)
+        _adb.execute("""CREATE TABLE IF NOT EXISTS archive_symbols (
+            symbol TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_trade_sync TEXT,
+            last_order_sync TEXT
+        )""")
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc).isoformat().replace("+00:00", "Z")
+        _adb.execute("""
+            INSERT INTO archive_symbols (symbol, first_seen_at, last_seen_at, source)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET last_seen_at=excluded.last_seen_at
+        """, (symbol, _now, _now, "auto_trader_open"))
+        _adb.commit()
+        _adb.close()
+    except Exception as e:
+        log.warning(f"archive_symbols register failed: {e}")
 
     return True
 

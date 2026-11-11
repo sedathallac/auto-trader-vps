@@ -27,7 +27,9 @@ def load_tracked():
 
 
 def save_tracked(syms):
-    TRACKED.write_text(json.dumps(sorted(syms), indent=2))
+    tmp = TRACKED.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sorted(syms), indent=2))
+    tmp.replace(TRACKED)
 
 
 HEARTBEAT_FILE = Path.home() / ".auto_trader.heartbeat"
