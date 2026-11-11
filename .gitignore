@@ -41,3 +41,16 @@ reports/
 *.log.old-*
 *.db.bak-*
 reports/
+
+# C3: SQLite risk ledger (runtime data)
+risk_ledger.db
+risk_ledger.db-*
+risk_ledger.db-shm
+risk_ledger.db-wal
+
+# C3: migrated JSON backups (artifacts)
+.risk_engine_state.json.migrated-*
+.risk_engine_last_exec_check.json.migrated-*
+
+# Test temp files
+tmp*_c3_mod.py
