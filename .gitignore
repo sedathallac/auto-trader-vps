@@ -55,3 +55,7 @@ risk_ledger.db-wal
 # Test temp files
 tmp*_c3_mod.py
 .lesshst
+
+# SQLite WAL sidecar files (archiver DB)
+*.db-shm
+*.db-wal
