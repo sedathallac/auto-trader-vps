@@ -3,6 +3,7 @@
 Binance API'den fill/emir geçmişi çeker, logları parse eder, SQLite'a yazar.
 """
 import os, sys, time, json, sqlite3, logging
+from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, os.path.expanduser("~"))
 
