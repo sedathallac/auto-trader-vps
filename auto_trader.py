@@ -17,6 +17,7 @@ _retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504], 
 _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
+from position_reservation import PositionReserver
 import requests
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -716,7 +717,40 @@ def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
     return notional, risk_amount, effective_sl
 
 
-def open_coin(binance, hb, coin, dry_run=False, risk=None):
+def _exchange_open_symbols(binance):
+    """Set of symbols with a non-zero exchange position, or None on API failure.
+    None means the caller MUST fail-closed (do not admit a new position)."""
+    positions = binance.position_risk()
+    if not isinstance(positions, list):
+        return None
+    out = set()
+    for p in positions:
+        try:
+            if float(p.get("positionAmt", 0)) != 0:
+                out.add(p["symbol"])
+        except (TypeError, ValueError, KeyError):
+            continue
+    return out
+
+
+def _reservation_should_keep(create_result) -> bool:
+    """Fate of a slot reservation after create_executor returns.
+
+    KEEP (do not release) when the executor exists OR the outcome is UNKNOWN (a
+    position may have been created). RELEASE only on a CONFIRMED failure: no
+    executor id and outcome != UNKNOWN (NOT_CREATED, pre-create refusal, or a
+    <500 rejection). This preserves the reserved slot across UNKNOWN outcomes so
+    the cap can never be under-counted; reconcile() resolves it against the
+    exchange later.
+    """
+    if not isinstance(create_result, dict):
+        return True  # unparseable -> treat as UNKNOWN, keep (fail-safe for cap)
+    if create_result.get("executor_id"):
+        return True
+    return create_result.get("outcome") == "UNKNOWN"
+
+
+def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None):
     # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü
     try:
         _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
@@ -817,9 +851,34 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
     else:
         log.warning(f"  leverage yanıtı: {lr}")
 
+    # TOCTOU FIX: atomically reserve a position slot BEFORE the create POST.
+    # exchange_open_symbols comes from positionRisk (single source of truth); the
+    # reservation counts exchange positions UNION outstanding reservations against
+    # MAX_OPEN_POSITIONS in one BEGIN IMMEDIATE tx, so concurrent candidates or a
+    # second process can never breach the cap. Released on confirmed failure;
+    # KEPT on UNKNOWN (reconcile resolves it against the exchange later).
+    _res_id = None
+    if reserver is not None:
+        _eos = _exchange_open_symbols(binance)
+        if _eos is None:
+            log.critical("🚨 rezervasyon: positionRisk alınamadı, fail-closed (yeni pozisyon yok)")
+            return False
+        _rr = reserver.reserve(symbol, _eos)
+        if not _rr.ok:
+            log.info(f"  🔒 rezervasyon reddetti: {_rr.reason} (kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
+            return False
+        _res_id = _rr.reservation_id
+        log.info(f"  🔒 slot rezerve (id={_res_id}, kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
+
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
+        if reserver is not None and _res_id is not None:
+            if _reservation_should_keep(er):
+                log.warning(f"  🔒 rezervasyon KORUNUYOR (id={_res_id}): UNKNOWN sonuç, reconcile çözecek")
+            else:
+                reserver.release(_res_id, reason="executor_not_created")
+                log.info(f"  🔓 rezervasyon serbest (id={_res_id}): executor oluşmadı")
         add_blacklist(symbol, f"executor: {er}")
         log.error(f"  executor açılamadı: {er}")
         return False
@@ -959,6 +1018,11 @@ def run_once(dry_run=False):
     log.info(f"Tarama: {datetime.now().isoformat()}")
     heartbeat_tick()
     risk = RiskEngine(RISK_CONFIG)
+    reserver = PositionReserver(risk.db_file, MAX_OPEN_POSITIONS)
+    try:
+        reserver.init_schema()
+    except Exception as e:
+        log.error(f"rezervasyon şeması init hatası: {e}")
     bk = os.environ.get("BINANCE_KEY")
     bs = os.environ.get("BINANCE_SECRET")
     hu = os.environ.get("HB_USERNAME", "FURKAN")
@@ -992,6 +1056,19 @@ def run_once(dry_run=False):
         return
 
     ensure_sl_coverage(binance)
+
+    # Reservation reconcile: promote reservations whose position now exists on the
+    # exchange, release stale/UNKNOWN ones. Also runs restart recovery (persisted
+    # reservations are resolved against positionRisk on every loop incl. the first).
+    try:
+        _eos = _exchange_open_symbols(binance)
+        if _eos is not None:
+            _rc = reserver.reconcile(_eos)
+            if _rc.promoted or _rc.released:
+                log.info(f"  🔁 rezervasyon reconcile: promoted={len(_rc.promoted)} "
+                         f"released={len(_rc.released)} kept={len(_rc.kept)}")
+    except Exception as e:
+        log.warning(f"rezervasyon reconcile hatası: {e}")
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
@@ -1045,7 +1122,7 @@ def run_once(dry_run=False):
             log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
             break
         try:
-            if open_coin(binance, hb, c, dry_run=dry_run, risk=risk):
+            if open_coin(binance, hb, c, dry_run=dry_run, risk=risk, reserver=reserver):
                 ok += 1
         except Exception as e:
             log.exception(f"{c['symbol']} istisna: {e}")
