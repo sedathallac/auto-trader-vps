@@ -7,3 +7,23 @@ __pycache__/
 .tracked_symbols.json
 .trading_archive.db
 *.log
+
+# Runtime state (tracked degil, ignore)
+.auto_trader.heartbeat
+.parse_state.json
+.risk_engine_last_exec_check.json
+.risk_engine_state.json
+.risk_engine_state.json.bak-*
+
+# Backup'lar (runtime)
+*.bak
+*.bak-*
+*.bak_*
+backup_*/
+backup_pre_promote_*/
+
+# DB yedekleri (ana .db zaten ignore'da)
+.trading_archive.db.bak-*
+
+# Runtime raporlar
+reports/
