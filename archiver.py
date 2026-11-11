@@ -2,8 +2,7 @@
 """archiver.py — Kapsamlı ticaret arşivleme beyni.
 Binance API'den fill/emir geçmişi çeker, logları parse eder, SQLite'a yazar.
 """
-import os, sys, time, json, sqlite3, logging, re
-from datetime import datetime, timezone
+import os, sys, time, json, sqlite3, logging
 from pathlib import Path
 sys.path.insert(0, os.path.expanduser("~"))
 

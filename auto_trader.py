@@ -107,7 +107,8 @@ def load_blacklist():
     if BLACKLIST_FILE.exists():
         try:
             bl = json.loads(BLACKLIST_FILE.read_text())
-        except Exception:
+        except Exception as e:
+            log.warning(f"blacklist yüklenemedi, boş kabul: {e}")
             bl = {}
     now = time.time()
     # FAZ 2.2: Preseed her zaman taze (TTL'den muaf)
@@ -272,8 +273,8 @@ def sync_risk_engine(risk, hb):
             loaded = json.loads(state_file.read_text())
             state["last_close_ts"] = float(loaded.get("last_close_ts", 0))
             state["reported_executor_ids"] = list(loaded.get("reported_executor_ids", []))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"risk state yüklenemedi: {e}")
     last_ts = state["last_close_ts"]
     reported_ids = set(state["reported_executor_ids"])
 
@@ -373,7 +374,8 @@ def reconcile_positions(binance, hb):
             if heal_state_file.exists():
                 try:
                     heal_state = json.loads(heal_state_file.read_text())
-                except Exception:
+                except Exception as e:
+                    log.warning(f"auto-heal state yüklenemedi: {e}")
                     heal_state = {}
             last_heal = heal_state.get(sym, 0)
             now_ts = time.time()
@@ -505,7 +507,7 @@ def check_stale_data(binance, max_age_sec=30):
         local_ms = int(time.time() * 1000)
         diff_sec = abs(server_ms - local_ms) / 1000
         if diff_sec > max_age_sec:
-            log.critical(f"🚨 STALE DATA: Sunucu-yerel fark {diff_sec:.1f}sn (limit: {max_age_sec}sn)")
+            log.critical(f"🚨 STALE DATA: Sunucu-yerel fark {diff_sec:.1}sn (limit: {max_age_sec}sn)")
             return False
         log.debug(f"✅ Data taze (fark: {diff_sec:.2f}sn)")
         return True
@@ -699,7 +701,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
 
     # Korelasyon limiti kontrolü
     if not check_correlation_limit(symbol, binance):
-        log.info(f"  atlandı: korelasyon limiti")
+        log.info("  atlandı: korelasyon limiti")
         return False
 
     filt = binance.filters(symbol)
@@ -717,16 +719,16 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
     atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
     if atr_pct is None:
         atr_pct = 0.02
-        log.warning(f"  ATR alınamadı, fallback %2.0 kullanılıyor")
+        log.warning("  ATR alınamadı, fallback %2.0 kullanılıyor")
 
     sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
     tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
-    log.info(f"  📊 ATR=%{atr_pct*100:.2f} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
+    log.info(f"  📊 ATR=%{atr_pct*100:.2} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
 
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
         slippage_pct = get_real_slippage(binance, symbol)
-        log.info(f"  📏 Slipaj=%{slippage_pct*100:.2f}")
+        log.info(f"  📏 Slipaj=%{slippage_pct*100:.2}")
     else:
         slippage_pct = 0.0
 
@@ -745,7 +747,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
         log.info(f"  RiskEngine onayladı: {target_notional:.2f} USDT (günlük: {risk.daily_trades}, ardışık zarar: {risk.consecutive_losses})")
     else:
         target_notional, vol_mult = calculate_position_size(balance, coin)
-        log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2f})")
+        log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2})")
 
     # Target notional → amount
     step = float(filt["LOT_SIZE"]["stepSize"])
@@ -815,9 +817,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
                     if liq > 0:
                         liq_dist = abs(entry_pos - liq) / entry_pos
                         sl_dist = abs(entry_pos - trig) / entry_pos
-                        log.info(f"  🔍 Likidasyon={liq} (%{liq_dist*100:.2f}) vs SL %{sl_dist*100:.2f}")
+                        log.info(f"  🔍 Likidasyon={liq} (%{liq_dist*100:.2}) vs SL %{sl_dist*100:.2}")
                         if sl_dist >= liq_dist * 0.7:
-                            log.critical(f"  🚨 SL likidasyona çok yakın — ACİL KAPAT")
+                            log.critical("  🚨 SL likidasyona çok yakın — ACİL KAPAT")
                             close_side = "SELL" if side == 1 else "BUY"
                             binance._post("/fapi/v1/order", {
                                 "symbol": symbol, "side": close_side, "type": "MARKET",
@@ -831,7 +833,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
 
     if risk is not None:
         risk.register_open()
-        log.info(f"  📊 RiskEngine: günlük sayaç arttı")
+        log.info("  📊 RiskEngine: günlük sayaç arttı")
 
     # Tracked list (orphan_killer cleanup only) - atomic write
     try:
@@ -915,7 +917,8 @@ def run_once(dry_run=False):
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-    except Exception:
+    except Exception as e:
+        log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
         active = set()
     if len(active) >= MAX_OPEN_POSITIONS:
         log.info(f"Maks pozisyon limiti ({MAX_OPEN_POSITIONS}) dolu → yeni açmıyorum")
@@ -924,7 +927,7 @@ def run_once(dry_run=False):
     try:
         eq = binance.get_balance("USDT")
         risk.update_equity(eq)
-        log.info(f"💰 Equity={eq:.2f} | DD=%{risk.current_drawdown*100:.2f} | Peak={risk.peak_equity:.2f}")
+        log.info(f"💰 Equity={eq:.2} | DD=%{risk.current_drawdown*100:.2} | Peak={risk.peak_equity:.2}")
 
         # Exposure cap kontrolü
         positions_for_exposure = binance.position_risk()

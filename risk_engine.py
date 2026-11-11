@@ -32,8 +32,8 @@ class RiskEngine:
                 self.daily_trades = d.get("daily_trades", 0)
                 self.daily_pnl = d.get("daily_pnl", 0.0)
                 self.state = d
-            except Exception:
-                pass
+            except Exception as e:
+                __import__("logging").getLogger("risk_engine").warning(f"state yüklenemedi: {e}")
 
     def _save_state(self):
         self.state.update({
@@ -76,7 +76,7 @@ class RiskEngine:
         log.info(f"📊 Marjin kullanımı: %{usage*100:.1f} (limit: %{self.cfg.get('max_total_margin_pct', 0.4)*100:.0f})")
         if usage > self.cfg.get("max_total_margin_pct", 0.4):
             self.is_halted = True
-            self.halt_reason = f"Exposure limit aşıldı (%{usage*100:.1f})"
+            self.halt_reason = f"Exposure limit aşıldı (%{usage*100:.1})"
             log.critical(f"🚨 {self.halt_reason} — yeni pozisyon açılmayacak")
 
     def register_trade_result(self, pnl_quote):
