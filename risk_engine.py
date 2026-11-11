@@ -31,6 +31,8 @@ class RiskEngine:
                 self.consecutive_losses = d.get("consecutive_losses", 0)
                 self.daily_trades = d.get("daily_trades", 0)
                 self.daily_pnl = d.get("daily_pnl", 0.0)
+                self.is_halted = d.get("is_halted", False)
+                self.halt_reason = d.get("halt_reason")
                 self.state = d
             except Exception as e:
                 __import__("logging").getLogger("risk_engine").warning(f"state yüklenemedi: {e}")
@@ -41,6 +43,8 @@ class RiskEngine:
             "consecutive_losses": self.consecutive_losses,
             "daily_trades": self.daily_trades,
             "daily_pnl": self.daily_pnl,
+            "is_halted": self.is_halted,
+            "halt_reason": self.halt_reason,
         })
         self.state_file.write_text(json.dumps(self.state, indent=2))
 

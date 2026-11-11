@@ -45,7 +45,7 @@ RISK_CONFIG = {
     "min_leverage": 1,
     "max_leverage": 5,
     "min_notional": 5.5,
-    "max_notional": 10000.0,
+    "max_notional": 25.0,   # C1-FIX: Hard cap 25 USDT (önceden 10000 idi ve bypass ediliyordu)
     # ATR-bazlı dinamik SL/TP
     "atr_sl_multiplier": 1.5,
     "atr_tp_multiplier": 2.5,
