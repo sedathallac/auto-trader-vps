@@ -30,7 +30,7 @@ STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
 TOP_N = 2
-MAX_OPEN_POSITIONS = 0  # EMERGENCY: yeni giris durdu
+MAX_OPEN_POSITIONS = max(0, int(os.getenv("MAX_OPEN_POSITIONS", "0")))  # 0 = EMERGENCY (yeni giris durdu)
 
 RISK_CONFIG = {
     "max_drawdown_pct": 0.20,
