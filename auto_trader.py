@@ -9,7 +9,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 _session = requests.Session()
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504], allowed_methods=["GET","POST","DELETE"])
+# F3/F4: only idempotent reads are retried automatically. A POST/DELETE that the
+# server processed but answered with 5xx/timeout must NOT be re-sent blindly
+# (duplicate executor = duplicate position). Write outcomes are resolved by
+# querying state instead (see HBAPI.create_executor).
+_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504], allowed_methods=["GET"])
 _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
@@ -226,7 +230,18 @@ class HBAPI:
         self.base = base
         self.auth = (user, pw)
 
+    def _active_ids_for(self, pair):
+        return {e.get("executor_id") for e in self.active_executors()
+                if e.get("trading_pair") == pair}
+
     def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
+        """Single-shot create. On 5xx/timeout the outcome is UNKNOWN: never
+        resend; resolve by diffing active executors for the pair."""
+        pair = symbol.replace("USDT", "-USDT")
+        try:
+            before = self._active_ids_for(pair)
+        except Exception as e:
+            return {"error": f"pre-create executor snapshot failed, refusing: {e}"}
         payload = {"account_name": HB_ACCOUNT, "executor_config": {
             "type": "position_executor", "connector_name": "binance_perpetual",
             "trading_pair": symbol.replace("USDT", "-USDT"), "side": side,
@@ -239,8 +254,24 @@ class HBAPI:
                 "time_limit_order_type": 1,
             },
         }}
-        return _session.post(f"{self.base}/executors/", json=payload,
-                             auth=self.auth, timeout=30).json()
+        try:
+            r = _session.post(f"{self.base}/executors/", json=payload,
+                              auth=self.auth, timeout=30)
+            if r.status_code < 500:
+                return r.json()
+            cause = f"HTTP {r.status_code}"
+        except requests.exceptions.RequestException as e:
+            cause = f"{type(e).__name__}: {e}"
+        # UNKNOWN outcome -> resolve from state, do not resend
+        try:
+            new = self._active_ids_for(pair) - before
+        except Exception as e:
+            return {"error": f"UNKNOWN create outcome ({cause}); resolve failed: {e}",
+                    "outcome": "UNKNOWN"}
+        if len(new) == 1:
+            return {"executor_id": next(iter(new)), "resolved_after": cause}
+        return {"error": f"UNKNOWN create outcome ({cause}); new executors={sorted(new)}",
+                "outcome": "UNKNOWN" if new else "NOT_CREATED"}
 
     def active_executors(self):
         r = _session.post(f"{self.base}/executors/search",
