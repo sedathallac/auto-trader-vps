@@ -487,7 +487,8 @@ def check_correlation_limit(symbol, binance):
     try:
         positions = binance.position_risk()
         if not isinstance(positions, list):
-            return True
+            log.critical("🚨 C6: positionRisk alınamadı, fail-closed")
+            return False
         open_symbols = [p["symbol"] for p in positions if float(p["positionAmt"]) != 0]
         same_sector = [s for s in open_symbols if SECTOR_MAP.get(s, s) == target_sector]
         if len(same_sector) >= MAX_PER_SECTOR:
@@ -495,8 +496,8 @@ def check_correlation_limit(symbol, binance):
             return False
         return True
     except Exception as e:
-        log.warning(f"Korelasyon kontrol hatası: {e}")
-        return True
+        log.critical(f"🚨 C6: korelasyon kontrol hatası, fail-closed: {e}")
+        return False
 
 
 def check_stale_data(binance, max_age_sec=30):
@@ -687,6 +688,15 @@ def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
 
 
 def open_coin(binance, hb, coin, dry_run=False, risk=None):
+    # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü
+    try:
+        _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
+    except Exception as e:
+        log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
+        return False
+    if len(_cur) >= MAX_OPEN_POSITIONS:
+        log.info(f"  C6: limit dolu ({len(_cur)}/{MAX_OPEN_POSITIONS}), atlanıyor")
+        return False
     symbol = coin["symbol"]
     pair = symbol.replace("USDT", "-USDT")
     price = float(coin["lastPrice"])
@@ -996,6 +1006,15 @@ def run_once(dry_run=False):
 
     ok = 0
     for c in candidates:
+        # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et
+        try:
+            _cur_active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
+        except Exception as e:
+            log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
+            break
+        if len(_cur_active) >= MAX_OPEN_POSITIONS:
+            log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
+            break
         try:
             if open_coin(binance, hb, c, dry_run=dry_run, risk=risk):
                 ok += 1
