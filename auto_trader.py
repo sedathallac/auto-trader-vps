@@ -802,10 +802,49 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None):
     else:
         trig = round(round((price * (1 + sl_pct)) / tick) * tick, 8)
     sr = binance.place_algo_sl(symbol, trig, amount, side)
-    if sr.get("algoId"):
-        log.info(f"  ✅ SL trigger={trig} qty={amount} algoId={sr['algoId']}")
+    algo_id = sr.get("algoId") if isinstance(sr, dict) else None
+    
+    sl_verified = False
+    if algo_id:
+        log.info(f"  ⏳ SL emri gonderildi (algoId={algo_id}), dogrulaniyor...")
+        # Retry mekanizması: 3 deneme, her biri 3 saniye arayla
+        for attempt in range(3):
+            time.sleep(3)
+            try:
+                open_orders = binance.open_algo_orders_for(symbol)
+                for o in open_orders:
+                    if str(o.get("algoId")) == str(algo_id):
+                        # Miktar alanı için birden fazla olası anahtarı kontrol et
+                        o_qty = float(o.get("quantity") or o.get("origQty") or o.get("qty") or 0)
+                        if o_qty >= float(amount) * 0.95:
+                            sl_verified = True
+                            break
+                if sl_verified:
+                    break
+                log.warning(f"  SL dogrulama denemesi {attempt+1}/3 basarisiz, tekrar deneniyor...")
+            except Exception as e:
+                log.error(f"  SL dogrulama hatasi (API): {e}")
+
+    if not sl_verified:
+        log.critical(f"  🚨 SL DOGRULANAMADI! (algoId={algo_id}). Pozisyon acil KAPATILIYOR!")
+        close_side = "SELL" if side == 1 else "BUY"
+        try:
+            # Market emri ile pozisyonu kapat (reduceOnly)
+            binance._post("/fapi/v1/order", {
+                "symbol": symbol, "side": close_side, "type": "MARKET",
+                "quantity": str(amount), "reduceOnly": "true"
+            })
+            log.info("  ✅ Pozisyon piyasa emriyle kapatildi.")
+        except Exception as e:
+            log.critical(f"  🚨🚨 ACIL KAPATMA BASARISIZ: {e} !!! MANUEL MUDAHALE GEREKLI !!!")
+        
+        if risk is not None:
+            risk.is_halted = True
+            risk.halt_reason = f"SL dogrulanamadi: {symbol}"
+            risk._save_state()
+        return False
     else:
-        log.warning(f"  ⚠️  SL hata: {sr}")
+        log.info(f"  ✅ SL dogrulandi (algoId={algo_id}, qty={amount})")
 
     if RISK_CONFIG.get("risk_guards_enabled", False):
         try:
