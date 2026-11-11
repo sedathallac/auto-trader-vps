@@ -235,6 +235,9 @@ def sync_orders(binance, conn):
                     continue
                 for o in orders:
                     try:
+                        _pre_exists = c.execute(
+                            "SELECT 1 FROM orders WHERE order_id=?", (o.get("orderId"),)
+                        ).fetchone() is not None
                         c.execute("""INSERT INTO orders
                             (order_id, symbol, side, type, status, price,
                              orig_qty, executed_qty, stop_price, update_time)
@@ -255,7 +258,7 @@ def sync_orders(binance, conn):
                             float(o.get("stopPrice", 0)),
                             int(o.get("updateTime", 0)),
                         ))
-                        if c.rowcount > 0:
+                        if c.rowcount > 0 and not _pre_exists:
                             new_count += 1
                     except Exception as e:
                         log.warning(f"Order insert hatası: {e}")
@@ -317,13 +320,13 @@ def parse_logs(conn):
             conn.commit()
             state[key] = new_offset
         except Exception as e:
-            log.debug(f"parse_logs {source}: {e}")
+            log.warning(f"parse_logs {source}: {e}")
 
 
     try:
         STATE.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    except Exception as _e:
+        log.warning(f"parse_logs outer: {_e}")
 
 
 def capture_heartbeat(conn):
