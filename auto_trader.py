@@ -292,6 +292,15 @@ class HBAPI:
                 return e
         return None
 
+    def stop_executor(self, eid, keep_position=True):
+        """Stop an executor WITHOUT letting it place its own close
+        (keep_position=True == POSITION_HOLD, so HB's autonomous close/TP paths
+        do not run). Used by the CloseCoordinator handoff. Returns HB response."""
+        return _session.post(
+            f"{self.base}/executors/{eid}/stop",
+            json={"close_type": "EARLY_STOP", "keep_position": bool(keep_position)},
+            auth=self.auth, timeout=15).json()
+
 
 def heartbeat_tick():
     """Her döngüde çağrılır, botun yaşadığını gösteren zaman damgası"""
