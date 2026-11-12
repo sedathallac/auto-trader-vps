@@ -1284,20 +1284,63 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         trig = round(round((price * (1 - sl_pct)) / tick) * tick, 8)
     else:
         trig = round(round((price * (1 + sl_pct)) / tick) * tick, 8)
-    # Faz2.1 (K-1/K-2) pre-open reconciliation: cancel any leftover algo SL for this
-    # symbol (an orphan from a prior/closed position) BEFORE placing the new one, so a
-    # freshly opened position can never end up with a DUPLICATE SL.
+    # === K-4: open_coin SL-placement intent (full prevention of the open_coin <->
+    # ensure_sl_coverage double-SL race) ===
+    # Acquire the SAME cross-process SlPlacementStore intent (K-3) that
+    # ensure_sl_coverage uses, keyed on (symbol, '<side>:<entryPrice>') from exchange
+    # truth, so the two paths can never both place an SL for this position epoch --
+    # without waiting for the <=60s deterministic dedupe. Done BEFORE the pre-open
+    # reconciliation: if another process owns this placement we must not cancel its
+    # SL nor place a duplicate; we skip and let the sl_status verification below
+    # confirm it (or fail-closed emergency close, exactly as today).
     try:
-        for _o in binance.open_algo_orders_for(symbol):
-            _aid = _o.get("algoId")
-            if _aid:
-                binance.cancel_algo_order(_aid)
-                log.info(f"  🧹 pre-open: eski algo SL iptal (algoId={_aid}) — tek SL garantisi")
-    except Exception as e:
-        log.warning(f"  pre-open SL reconciliation hatası: {e}")
+        from sl_placement import SlPlacementStore, ACQUIRED as _SL_ACQ
+        _oc_store = SlPlacementStore(SL_LEDGER_DB)
+        _oc_store.init_schema()
+    except Exception as _e:
+        log.warning(f"K-4 SlPlacementStore kurulamadi: {_e}")
+        _oc_store = None
+        _SL_ACQ = "ACQUIRED"
+    _oc_tok = None
+    if _oc_store is not None:
+        try:
+            _oc_pr = binance.position_risk()
+            _oc_p = next((q for q in _oc_pr if q.get("symbol") == symbol
+                          and float(q["positionAmt"]) != 0), None) \
+                if isinstance(_oc_pr, list) else None
+            if _oc_p is not None:
+                _oc_tok = ("LONG" if side == 1 else "SHORT") + ":" + str(_oc_p.get("entryPrice"))
+        except Exception as _e:
+            log.warning(f"K-4 intent token alinamadi (positionRisk): {_e}")
+            _oc_tok = None
+    _oc_owned = (_oc_store is None or _oc_tok is None
+                 or _oc_store.acquire(symbol, _oc_tok) == _SL_ACQ)
 
-    sr = binance.place_algo_sl(symbol, trig, amount, side)
-    algo_id = sr.get("algoId") if isinstance(sr, dict) else None
+    if not _oc_owned:
+        log.info(f"  BUSY: {symbol} SL yerlestirme baska process'te - open_coin atladi, dogrulamaya birakildi")
+        sr = None
+        algo_id = None
+    else:
+        # Faz2.1 (K-1/K-2) pre-open reconciliation: cancel any leftover algo SL for this
+        # symbol (orphan from a prior/closed position) BEFORE placing the new one, so a
+        # freshly opened position can never end up with a DUPLICATE SL.
+        try:
+            for _o in binance.open_algo_orders_for(symbol):
+                _aid = _o.get("algoId")
+                if _aid:
+                    binance.cancel_algo_order(_aid)
+                    log.info(f"  pre-open: eski algo SL iptal (algoId={_aid}) - tek SL garantisi")
+        except Exception as e:
+            log.warning(f"  pre-open SL reconciliation hatasi: {e}")
+
+        sr = binance.place_algo_sl(symbol, trig, amount, side)
+        algo_id = sr.get("algoId") if isinstance(sr, dict) else None
+        if _oc_store is not None and _oc_tok is not None:
+            if isinstance(sr, dict) and sr.get("algoId"):
+                _oc_store.mark_placed(symbol, _oc_tok)
+            else:
+                _oc_store.release(symbol, _oc_tok)   # failure -> reflect reality/retry
+    # === /K-4 ===
 
     # F-1: verify the SL with the inc10.1 mode-aware tri-state sl_status, NOT a bare
     # algoId+qty>=95% check. PRESENT requires a LIVE STOP_MARKET that FULLY protects
