@@ -21,6 +21,11 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 
 ## Dizin yapısı ve durum
 - `findings/2026-11-11_sol_double_close.md` — SOL olayı forensic. **YAZILDI**
+- `findings/INCREMENT_11_sol_double_close_regression.md` — SOL çift-kapatma GERÇEK-KOD
+  regresyonu (CloseCoordinator→adapter→BinanceAPI, yalnızca `_session` mock).
+  **YAZILDI (inc11, 2026-11-12)**; 12 test+1 xfail GREEN, davranışsal RED kanıtlı,
+  tests/ **187 passed, 1 xfailed**. AYRI KÖK NEDEN RC-2: `ensure_sl_coverage` kapsama
+  kontrolü zayıf (sadece algo emri varlığı) → inc11.1 önerildi.
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**
