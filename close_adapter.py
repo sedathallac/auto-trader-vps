@@ -126,7 +126,14 @@ class BinanceHBCloseAdapter:
                 raise CloseAdapterError(
                     f"HB executor {e.get('executor_id')} for {symbol} has no "
                     f"order_ids mapping -> UNKNOWN (fail-closed)")
-            ids |= set(oids)
+            # C-1: order_ids is [open, close, tp]; a DISABLED barrier slot (K1=B
+            # disables close/TP) is None -> no order was ever placed, so it is not an
+            # unresolvable order and must NOT become a query stub (None has no
+            # orderId/clientOrderId -> order_terminal/cancel would always fail ->
+            # UNRESOLVED -> the close would be refused forever). Drop None/empty ONLY;
+            # every REAL tracked id is still resolved (an unknown/live real order
+            # still blocks -> fail-closed).
+            ids |= {o for o in oids if o is not None and o != ""}
         return ids
 
     def protective_orders(self, symbol) -> list:
