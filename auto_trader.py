@@ -336,8 +336,31 @@ def heartbeat_tick():
         log.error(f"Heartbeat yazılamadı: {e}")
 
 
-def sync_risk_engine(risk, hb):
-    """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY)."""
+def is_flat_confirmed(positions, symbol):
+    """K2: a position is 'flat' ONLY when `positions` is a valid list that
+    CONTAINS `symbol` with positionAmt == 0. A non-list (API error), a missing /
+    mismatched symbol, a non-zero amount, or an unparseable amount all return
+    False — so an outage, a stale/partial snapshot or a partial close is NEVER
+    mistaken for a closed position (fail-closed)."""
+    if not isinstance(positions, list):
+        return False
+    for p in positions:
+        if p.get("symbol") == symbol:
+            try:
+                return float(p.get("positionAmt", "nan")) == 0.0
+            except (TypeError, ValueError):
+                return False
+    return False  # symbol absent -> not confirmed flat
+
+
+def sync_risk_engine(risk, hb, binance=None):
+    """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY).
+
+    K2: a TERMINATED executor's PnL is recorded ONLY after a current, successful
+    Binance positionRisk query confirms that symbol is flat (positionAmt == 0).
+    If positionRisk errors/timeouts, is stale/missing, or the position is not
+    zero (partial close), the close is NOT recorded — it stays UNKNOWN/open and a
+    CRITICAL alarm is raised (fail-closed)."""
     import sqlite3 as _sq
     from datetime import timezone as _tz
 
@@ -360,6 +383,12 @@ def sync_risk_engine(risk, hb):
         all_execs = r.get("data", [])
         terminated = [e for e in all_execs if e.get("status") == "TERMINATED"]
         log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} in ledger")
+        # K2: single exchange snapshot used to confirm each close is really flat.
+        try:
+            _positions = binance.position_risk() if binance is not None else None
+        except Exception as _pe:
+            _positions = None
+            log.warning(f"  K2: positionRisk alınamadı (flat teyidi yok): {_pe}")
         for e in terminated:
             eid = e.get("executor_id")
             if not eid:
@@ -372,6 +401,14 @@ def sync_risk_engine(risk, hb):
                 continue
             pnl = float(e.get("net_pnl_quote") or 0)
             pair = e.get("trading_pair")
+            # K2 gate: do NOT record a close (final PnL) unless the exchange
+            # confirms this symbol is flat. Fail-closed on error/stale/partial.
+            _symbol = pair.replace("-", "") if pair else None
+            if not is_flat_confirmed(_positions, _symbol):
+                log.critical(f"🚨 K2: executor {str(eid)[:12]} TERMINATED ama borsa "
+                             f"flat DEĞİL/doğrulanamadı ({_symbol}) — PnL YAZILMADI, "
+                             f"kapanmış sayılmadı (fail-closed)")
+                continue
             closed_at_iso = datetime.fromtimestamp(closed_at).isoformat() if closed_at else None
             inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso)
             if inserted:
@@ -1164,7 +1201,7 @@ def run_once(dry_run=False):
         log.info(f"  Günlük sayaçlar sıfırlandı ({today})")
 
     # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir
-    sync_risk_engine(risk, hb)
+    sync_risk_engine(risk, hb, binance=binance)
 
     # cleanup_orphan_sl artık orphan_killer.py tarafından yapılıyor
     if not reconcile_positions(binance, hb):
