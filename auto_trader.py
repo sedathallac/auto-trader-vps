@@ -1201,30 +1201,36 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         trig = round(round((price * (1 + sl_pct)) / tick) * tick, 8)
     sr = binance.place_algo_sl(symbol, trig, amount, side)
     algo_id = sr.get("algoId") if isinstance(sr, dict) else None
-    
+
+    # F-1: verify the SL with the inc10.1 mode-aware tri-state sl_status, NOT a bare
+    # algoId+qty>=95% check. PRESENT requires a LIVE STOP_MARKET that FULLY protects
+    # THIS position under its mode (side / positionSide / reduceOnly|closePosition /
+    # quantity / status). ABSENT or UNKNOWN -> not verified -> emergency close.
+    # Placement is ONEWAY only; HEDGE never reaches here (run_once gates it) and
+    # sl_status would reject a ONEWAY-style SL in HEDGE -> fail-closed.
+    from close_adapter import BinanceHBCloseAdapter, SL_PRESENT, SL_UNKNOWN
+    _sl_adapter = BinanceHBCloseAdapter(binance, None)
+    _mode_ok, _mode = _verify_oneway(binance)
+    _side_str = "LONG" if side == 1 else "SHORT"
     sl_verified = False
-    if algo_id:
-        log.info(f"  ⏳ SL emri gonderildi (algoId={algo_id}), dogrulaniyor...")
-        # Retry mekanizması: 3 deneme, her biri 3 saniye arayla
-        for attempt in range(3):
-            time.sleep(3)
-            try:
-                open_orders = binance.open_algo_orders_for(symbol)
-                for o in open_orders:
-                    if str(o.get("algoId")) == str(algo_id):
-                        # Miktar alanı için birden fazla olası anahtarı kontrol et
-                        o_qty = float(o.get("quantity") or o.get("origQty") or o.get("qty") or 0)
-                        if o_qty >= float(amount) * 0.95:
-                            sl_verified = True
-                            break
-                if sl_verified:
-                    break
-                log.warning(f"  SL dogrulama denemesi {attempt+1}/3 basarisiz, tekrar deneniyor...")
-            except Exception as e:
-                log.error(f"  SL dogrulama hatasi (API): {e}")
+    sl_state = None
+    log.info(f"  ⏳ SL emri gonderildi (algoId={algo_id}), sl_status ile dogrulaniyor...")
+    for attempt in range(3):
+        time.sleep(3)
+        try:
+            sl_state = _sl_adapter.sl_status(symbol, _side_str, mode=_mode,
+                                             position_amt=amount)
+        except Exception as e:
+            log.error(f"  SL durum sorgu hatasi (API): {e}")
+            sl_state = SL_UNKNOWN
+        if sl_state == SL_PRESENT:
+            sl_verified = True
+            break
+        log.warning(f"  SL dogrulama {attempt+1}/3: durum={sl_state} (algoId={algo_id})")
 
     if not sl_verified:
-        log.critical(f"  🚨 SL DOGRULANAMADI! (algoId={algo_id}). Pozisyon acil KAPATILIYOR!")
+        log.critical(f"  🚨 SL DOGRULANAMADI! (durum={sl_state}, algoId={algo_id}). "
+                     f"Pozisyon acil KAPATILIYOR!")
         try:
             # Single close authority (inc13): coordinated reduce-only close, not a
             # raw market POST — idempotent + flat-confirmed + cross-process guarded.
