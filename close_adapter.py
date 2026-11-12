@@ -265,7 +265,11 @@ class BinanceHBCloseAdapter:
                 return SL_UNKNOWN                  # malformed element
             if str(o.get("symbol") or "").upper() != symbol.upper():
                 return SL_UNKNOWN                  # wrong symbol -> cannot verify match
-            typ = str(o.get("type") or o.get("algoType") or "").upper()
+            # Live Binance openAlgoOrders puts the stop type in `orderType`
+            # ('STOP_MARKET') while `algoType` is 'CONDITIONAL'; read orderType FIRST
+            # (falling back to `type` for the legacy/test shape) so a real SL is not
+            # misread as CONDITIONAL -> skipped -> ABSENT -> spurious emergency close.
+            typ = str(o.get("orderType") or o.get("type") or o.get("algoType") or "").upper()
             st = str(o.get("algoStatus") or o.get("status") or "").upper()
             if "STOP" not in typ or st not in _SL_LIVE:
                 continue                           # not a STOP, or terminal -> not protective
