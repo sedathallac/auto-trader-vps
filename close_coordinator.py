@@ -29,6 +29,11 @@ from decimal import Decimal
 from enum import Enum
 from typing import Dict
 
+from close_intent import ACQUIRED as INTENT_ACQUIRED  # noqa: F401
+from close_intent import BUSY as INTENT_BUSY
+from close_intent import CLOSED as INTENT_CLOSED
+from close_intent import STALE as INTENT_STALE
+
 
 class CloseState(str, Enum):
     HANDOFF_PENDING = "HANDOFF_PENDING"
@@ -69,8 +74,12 @@ class CloseCoordinator:
         close_reduce_only(symbol, qty, position_side=None) -> Decimal  # filled qty
     """
 
-    def __init__(self, exchange):
+    def __init__(self, exchange, intent_store=None):
         self.ex = exchange
+        # Optional cross-PROCESS close-intent (CloseIntentStore). None -> single
+        # process only (in-memory idempotency + the exchange reduceOnly backstop).
+        # When set, a second PROCESS that is not the intent owner never sends a POST.
+        self.intent = intent_store
         self._state: Dict[str, CloseState] = {}
         self._closed: set = set()
         # Serialise request_close so concurrent in-process triggers (two threads /
@@ -159,6 +168,36 @@ class CloseCoordinator:
             return CloseResult(True, CloseState.CLOSED, "ALREADY_FLAT",
                                reason="exchange flat before close")
 
+        # Cross-PROCESS close-intent gate: atomically become the close owner before
+        # sending anything. A second process that is not the owner never sends a new
+        # POST; it reports the in-flight / finished intent instead. The token is a
+        # position-period id from exchange truth (side+entryPrice), so a NEW position
+        # on the same symbol — or a HEDGE LONG vs SHORT — is a separate intent.
+        token = None
+        if self.intent is not None:
+            try:
+                token = self.ex.position_token(symbol)
+            except Exception as e:
+                self._state[symbol] = CloseState.FAILED_SAFE
+                return CloseResult(False, CloseState.FAILED_SAFE, "POSITION_TOKEN_FAILED",
+                                   reason=str(e), critical=True)
+            ir = self.intent.acquire(symbol, token)
+            if ir.status == INTENT_CLOSED:
+                self._closed.add(symbol)
+                return CloseResult(True, CloseState.CLOSED, "IGNORED_ALREADY_CLOSED",
+                                   reason="close-intent CLOSED (another process)")
+            if ir.status == INTENT_BUSY:
+                return CloseResult(False, CloseState.EXCHANGE_STATE_VERIFIED,
+                                   "IGNORED_IN_PROGRESS",
+                                   reason="another process owns the in-flight close",
+                                   detail={"amt": str(amt), "token": token})
+            if ir.status == INTENT_STALE:
+                self._state[symbol] = CloseState.FAILED_SAFE
+                return CloseResult(False, CloseState.FAILED_SAFE, "INTENT_STALE",
+                                   reason=ir.reason, critical=True,
+                                   detail={"token": token})
+            # ACQUIRED -> this process owns the single close.
+
         # 4) EXTERNAL_AUTHORITY_ACTIVE: send exactly ONE reduce-only / positionSide
         #    close, then confirm flat. reduce-only can never cross zero (-2022).
         mode = self.ex.position_mode()
@@ -168,7 +207,10 @@ class CloseCoordinator:
             position_side = "LONG" if amt > 0 else "SHORT"
         try:
             self.ex.close_reduce_only(symbol, qty, position_side=position_side)
+            if self.intent is not None:
+                self.intent.mark_sent(symbol, token)  # POST issued (not yet confirmed)
         except Exception as e:
+            # UNKNOWN send outcome: do NOT release the intent (no blind re-POST).
             self._state[symbol] = CloseState.FAILED_SAFE
             return CloseResult(False, CloseState.FAILED_SAFE, "CLOSE_SEND_FAILED",
                                reason=str(e), critical=True)
@@ -189,9 +231,12 @@ class CloseCoordinator:
         if after == 0:
             self._state[symbol] = CloseState.EXTERNAL_AUTHORITY_ACTIVE
             self._closed.add(symbol)
+            if self.intent is not None:
+                self.intent.mark_closed(symbol, token)  # TERMINAL: flat-confirmed
             return CloseResult(True, CloseState.CLOSED, "SENT_REDUCE_ONLY",
                                reason="closed and flat-confirmed")
         # Partial close: remaining exposure is preserved; do NOT blindly resend.
+        # The intent stays active (not terminal) so reconcile handles the remainder.
         return CloseResult(False, CloseState.EXCHANGE_STATE_VERIFIED, "PARTIAL",
                            reason=f"partial close, remaining={after}",
                            critical=True, detail={"remaining": str(after)})

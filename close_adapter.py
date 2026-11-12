@@ -70,6 +70,30 @@ class BinanceHBCloseAdapter:
                     raise CloseAdapterError(f"bad positionAmt for {symbol}: {e}")
         return Decimal("0")  # symbol absent -> genuinely no position
 
+    def position_token(self, symbol) -> str:
+        """A position-PERIOD id for the cross-process close-intent, from exchange
+        truth: '<side>:<entryPrice>'. side distinguishes a HEDGE LONG vs SHORT on the
+        same symbol; entryPrice distinguishes a new position period from a prior
+        (closed) one. RAISES on any API failure / missing position (fail-closed: no
+        token -> no close POST). Never fabricated from local state."""
+        r = self.binance.position_risk()
+        if not isinstance(r, list):
+            raise CloseAdapterError(f"positionRisk unavailable for token: {r}")
+        for p in r:
+            if p.get("symbol") == symbol:
+                try:
+                    amt = Decimal(str(p.get("positionAmt", "0")))
+                except Exception as e:
+                    raise CloseAdapterError(f"bad positionAmt for token {symbol}: {e}")
+                if amt == 0:
+                    raise CloseAdapterError(f"no open position for token {symbol}")
+                side = "LONG" if amt > 0 else "SHORT"
+                entry = str(p.get("entryPrice", "")).strip()
+                if not entry:
+                    raise CloseAdapterError(f"missing entryPrice for token {symbol}")
+                return f"{side}:{entry}"
+        raise CloseAdapterError(f"symbol {symbol} absent from positionRisk for token")
+
     def position_mode(self) -> str:
         r = self.binance.position_mode()
         if not isinstance(r, dict) or "dualSidePosition" not in r:

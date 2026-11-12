@@ -38,6 +38,10 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
   **YAZILDI (inc12, 2026-11-12)**; RC-A CloseCoordinator lock (thread + cross-process
   SQLite), RC-B `_OPEN_UNPROTECTED` flat-temizliği. 25 yeni test GREEN, davranışsal RED
   (2 kök neden), tests/ **229 passed**.
+- `design/INCREMENT_12_1_close_intent.md` — cross-process close-intent/idempotency
+  (`close_intent.py`, aynı SQLite defteri). **YAZILDI (inc12.1, 2026-11-12)**; 21 yeni
+  test GREEN (gerçek iki-process tek POST), tests/ **250 passed**. DENETİM: CloseCoordinator
+  üretim döngüsüne BAĞLI DEĞİL (kritik entegrasyon açığı — deploy bloklu).
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**
