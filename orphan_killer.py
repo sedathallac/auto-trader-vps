@@ -74,6 +74,21 @@ def scan_and_kill(binance=None):
         return
     open_syms = {p["symbol"] for p in positions if float(p["positionAmt"]) != 0}
 
+    # K-5 Görev B: deterministik dedupe BACKSTOP. K-3'ün keep-max-algoId temizliği
+    # (_dedupe_algo_sl) burada, her açık pozisyon için, ensure_sl_coverage'dan
+    # BAĞIMSIZ çalışır. Böylece ensure_sl_coverage değişse veya bir istisna atsa
+    # bile (aşağıda yakalanıyor) çift SL bu 60sn'lik döngüde yine de temizlenir.
+    # Dedupe deterministik ve idempotenttir: en büyük algoId her zaman hayatta kalır,
+    # bu yüzden eşzamanlı iki process asla iki kopyayı birden iptal edemez (korumasız
+    # bırakmaz). Order temizliği ile pozisyon koruması ayrı endişelerdir (inc8).
+    if open_syms:
+        try:
+            from auto_trader import _dedupe_algo_sl
+            for _sym in open_syms:
+                _dedupe_algo_sl(b, _sym)
+        except Exception as e:
+            log.exception(f"K-5 dedupe backstop: {e}")
+
     # ROOT-CAUSE FIX (inc8): SL protection for OPEN positions runs INDEPENDENT of
     # the orphan list. Previously ensure_sl_coverage was only reached at the end,
     # so an empty to_check (open positions but no closed-symbol orphans) returned
