@@ -31,6 +31,10 @@ MAX_SPREAD_PCT = 0.5
 MIN_DEPTH_USDT = 50_000
 TARGET_NOTIONAL = 10.0
 LEVERAGE = 3
+# Faz 3: bilimsel kaldıraç/boyutlandırma bayrağı. off=canlı davranış değişmez,
+# compare=eski↔yeni yan yana loglanır (eski kullanılır), on=yeni formül kullanılır
+# (önce kalibrasyon + dry-run şart). Varsayılan 'off'.
+SCIENTIFIC_SIZING = os.getenv("SCIENTIFIC_SIZING", "off").strip().lower()
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
@@ -1194,6 +1198,34 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         target_notional, vol_mult = calculate_position_size(balance, coin)
         log.info(f"  bakiye={balance:.2f} → hedef_notional={target_notional:.2f} USDT (vol×{vol_mult:.2})")
 
+    # === Faz 3: bilimsel kaldıraç + boyutlandırma (birleşik L/S, margin=S/L) ===
+    # Bayrak 'off' iken bu blok atlanır -> canlı davranış DEĞİŞMEZ. 'compare' eski↔yeni
+    # değerleri loglar ama ESKİyi kullanır; 'on' yeni formülü kullanır (kalibrasyon şart).
+    _new_lev = None  # 'on' modunda aşağıdaki kaldıraç bloğunda kullanılır
+    if SCIENTIFIC_SIZING in ("compare", "on"):
+        try:
+            from leverage_engine import (signal_stats_from_ledger, scientific_leverage,
+                                         scientific_position_size, margin_for)
+            _dd = float(getattr(risk, "current_drawdown", 0.0) or 0.0)
+            _stats = signal_stats_from_ledger(SL_LEDGER_DB)
+            _new_s = scientific_position_size(
+                balance, RISK_CONFIG["risk_per_trade_pct"], atr_pct, _stats,
+                MIN_NOTIONAL_USDT, MAX_NOTIONAL_USDT)
+            _new_lev = scientific_leverage(atr_pct, _stats, _dd)
+            _old_lev = (calculate_dynamic_leverage(atr_pct)
+                        if RISK_CONFIG.get("risk_guards_enabled", False) else LEVERAGE)
+            log.info(
+                f"  🔬 Faz3[{SCIENTIFIC_SIZING}]: q={_stats.q:.2f} "
+                f"(n={_stats.n}, f*={_stats.f_star:.3f}, reliable={_stats.reliable}) | "
+                f"S: eski={target_notional:.2f} → yeni={_new_s:.2f} | "
+                f"L: eski={_old_lev} → yeni={_new_lev:.2f} | "
+                f"margin≈{margin_for(_new_s, _new_lev):.2f} USDT")
+            if SCIENTIFIC_SIZING == "on":
+                target_notional = _new_s
+        except Exception as _e:
+            log.warning(f"  Faz3 leverage_engine hatası (eski formüle düşülüyor): {_e}")
+            _new_lev = None
+
     # Target notional → amount
     step = float(filt["LOT_SIZE"]["stepSize"])
     raw_amount = target_notional / price
@@ -1211,7 +1243,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return True
 
     # Dinamik kaldıraç (flag açıksa ATR-bazlı, kapalıysa sabit 3x)
-    if RISK_CONFIG.get("risk_guards_enabled", False):
+    if SCIENTIFIC_SIZING == "on" and _new_lev is not None:
+        dyn_lev = max(1, int(round(_new_lev)))
+        log.info(f"  🔬 Faz3 kaldıraç uygulandı: {dyn_lev}x (bilimsel formül)")
+    elif RISK_CONFIG.get("risk_guards_enabled", False):
         dyn_lev = calculate_dynamic_leverage(atr_pct)
         log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} → {dyn_lev}x")
     else:
