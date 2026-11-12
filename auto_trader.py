@@ -582,6 +582,35 @@ def should_block_new_entries(unprotected=None):
     return len(u) > 0
 
 
+def new_entry_allowed(drift, stale, mode_ok, unprotected):
+    """Pure new-entry gate (K6): allowed only when NONE of the blockers hold.
+    Independent of the protection check, which runs regardless of drift/stale."""
+    return (not drift) and (not stale) and bool(mode_ok) and (not unprotected)
+
+
+def protect_then_gate(binance, reserver, drift, stale):
+    """K6: run the protection check (SL coverage + CRITICAL alarms) and the
+    reservation reconcile REGARDLESS of drift/stale, THEN decide whether new
+    entries are allowed. A reconciliation drift blocks new entries but never
+    disables protection for open positions. Returns (allow_new_entry, reasons)."""
+    ensure_sl_coverage(binance)  # <- always runs; drift/stale never skip it
+    try:
+        _eos = _exchange_open_symbols(binance)
+        if _eos is not None and reserver is not None:
+            _rc = reserver.reconcile(_eos)
+            if _rc.promoted or _rc.released:
+                log.info(f"  🔁 rezervasyon reconcile: promoted={len(_rc.promoted)} "
+                         f"released={len(_rc.released)} kept={len(_rc.kept)}")
+    except Exception as e:
+        log.warning(f"rezervasyon reconcile hatası: {e}")
+    mode_ok, mode = _verify_oneway(binance)
+    unprotected = should_block_new_entries()
+    allow = new_entry_allowed(drift=drift, stale=stale, mode_ok=mode_ok,
+                              unprotected=unprotected)
+    return allow, {"drift": drift, "stale": stale, "mode": mode,
+                   "mode_ok": mode_ok, "unprotected": unprotected}
+
+
 def ensure_sl_coverage(binance):
     try:
         positions = binance.position_risk()
@@ -1203,46 +1232,25 @@ def run_once(dry_run=False):
     # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir
     sync_risk_engine(risk, hb, binance=binance)
 
-    # cleanup_orphan_sl artık orphan_killer.py tarafından yapılıyor
-    if not reconcile_positions(binance, hb):
-        log.critical("🚨 Reconciliation drift — döngü atlanıyor")
+    # cleanup_orphan_sl artık orphan_killer.py tarafından yapılıyor.
+    # K6: compute drift/stale as FLAGS (do not early-return on them) so the
+    # protection check still runs for open positions; then gate new entries.
+    drift = not reconcile_positions(binance, hb)
+    stale = not check_stale_data(binance, max_age_sec=30)
+
+    allow_new, _reasons = protect_then_gate(binance, reserver, drift, stale)
+    if not allow_new:
+        if drift:
+            log.critical("🚨 Reconciliation drift — yeni giriş engellendi (koruma denetimi yine de çalıştı)")
+        if stale:
+            log.critical("🚨 Stale data — yeni giriş engellendi")
+        if not _reasons["mode_ok"]:
+            log.critical(f"🚨 Pozisyon modu {_reasons['mode']} (ONEWAY değil) — yeni giriş fail-closed engellendi")
+        if _reasons["unprotected"]:
+            log.critical(f"🚨 OPEN_UNPROTECTED {sorted(_OPEN_UNPROTECTED)} — yeni giriş "
+                         f"engellendi (borsa SL doğrulanana dek alarm açık)")
         return
-
-    # Stale data kontrolü
-    if not check_stale_data(binance, max_age_sec=30):
-        log.critical("🚨 Stale data — bu döngüde yeni pozisyon açılmayacak")
-        return
-
-    ensure_sl_coverage(binance)
-
-    # Reservation reconcile: promote reservations whose position now exists on the
-    # exchange, release stale/UNKNOWN ones. Also runs restart recovery (persisted
-    # reservations are resolved against positionRisk on every loop incl. the first).
-    try:
-        _eos = _exchange_open_symbols(binance)
-        if _eos is not None:
-            _rc = reserver.reconcile(_eos)
-            if _rc.promoted or _rc.released:
-                log.info(f"  🔁 rezervasyon reconcile: promoted={len(_rc.promoted)} "
-                         f"released={len(_rc.released)} kept={len(_rc.kept)}")
-    except Exception as e:
-        log.warning(f"rezervasyon reconcile hatası: {e}")
-
-    # A9/F7: ONEWAY start guarantee. The symbol-keyed reservation + netting
-    # assumptions only hold in ONEWAY; HEDGE or an unverifiable mode fails closed
-    # (protection/reconcile above already ran; only NEW entries are blocked).
-    _mode_ok, _mode = _verify_oneway(binance)
-    if not _mode_ok:
-        log.critical(f"🚨 Pozisyon modu {_mode} (ONEWAY değil) — yeni giriş fail-closed engellendi")
-        return
-    log.info("  ✅ Pozisyon modu ONEWAY doğrulandı")
-
-    # Increment 9: while any position is OPEN_UNPROTECTED (SL not confirmed on the
-    # exchange, esp. -2021), block ALL new entries and keep the CRITICAL alarm up.
-    if should_block_new_entries():
-        log.critical(f"🚨 OPEN_UNPROTECTED {sorted(_OPEN_UNPROTECTED)} — yeni giriş "
-                     f"engellendi (borsa SL doğrulanana dek alarm açık)")
-        return
+    log.info("  ✅ Koruma denetimi çalıştı; mod ONEWAY; yeni giriş izni var")
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
