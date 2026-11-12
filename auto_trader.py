@@ -231,6 +231,37 @@ class BinanceAPI:
         })
 
 
+def build_executor_config(symbol, amount, lev, side):
+    """K1=B: a position_executor with NO autonomous close barriers.
+
+    stop_loss / take_profit / time_limit / trailing_stop are all disabled so
+    Hummingbot never places its own close. In dev-2.18.0 every control_* barrier
+    is skipped when its configured value is falsy (control_stop_loss /
+    control_take_profit / control_trailing_stop guard on the value; control_time_
+    limit depends on time_limit), and the SHUTTING_DOWN retry close path only runs
+    on a NON keep_position stop (POSITION_HOLD stops without placing a close). So
+    with all four None, no SL / market-TP / limit-TP / trailing / time-limit close
+    can be produced. The exchange reduceOnly STOP_MARKET algo order is the sole SL
+    authority; TP and time-limit become CloseCoordinator responsibilities
+    (CloseCoordinator.request_take_profit / request_time_limit).
+    """
+    return {
+        "type": "position_executor",
+        "connector_name": "binance_perpetual",
+        "trading_pair": symbol.replace("USDT", "-USDT"),
+        "side": side,
+        "amount": str(amount),
+        "leverage": lev,
+        "triple_barrier_config": {
+            "stop_loss": None,
+            "take_profit": None,
+            "time_limit": None,
+            "trailing_stop": None,
+            "open_order_type": 1,
+        },
+    }
+
+
 class HBAPI:
     def __init__(self, base, user, pw):
         self.base = base
@@ -242,24 +273,19 @@ class HBAPI:
 
     def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
         """Single-shot create. On 5xx/timeout the outcome is UNKNOWN: never
-        resend; resolve by diffing active executors for the pair."""
+        resend; resolve by diffing active executors for the pair.
+
+        K1=B: the executor is created with NO autonomous close barriers (see
+        build_executor_config). sl/tp/tl are accepted for signature compatibility
+        but are NOT handed to Hummingbot as barriers — the exchange algo SL is the
+        sole SL authority and TP/time-limit route through the CloseCoordinator."""
         pair = symbol.replace("USDT", "-USDT")
         try:
             before = self._active_ids_for(pair)
         except Exception as e:
             return {"error": f"pre-create executor snapshot failed, refusing: {e}"}
-        payload = {"account_name": HB_ACCOUNT, "executor_config": {
-            "type": "position_executor", "connector_name": "binance_perpetual",
-            "trading_pair": symbol.replace("USDT", "-USDT"), "side": side,
-            "amount": str(amount), "leverage": lev,
-            "triple_barrier_config": {
-                "stop_loss": sl, "take_profit": tp, "time_limit": tl,
-                "open_order_type": 1,
-                "take_profit_order_type": 1,
-                "stop_loss_order_type": 1,
-                "time_limit_order_type": 1,
-            },
-        }}
+        payload = {"account_name": HB_ACCOUNT,
+                   "executor_config": build_executor_config(symbol, amount, lev, side)}
         try:
             r = _session.post(f"{self.base}/executors/", json=payload,
                               auth=self.auth, timeout=30)
@@ -478,6 +504,47 @@ def cleanup_orphan_sl(binance):
         log.exception(f"cleanup_orphan_sl: {e}")
 
 
+# OPEN_UNPROTECTED (increment 9): symbols whose exchange SL could not be placed
+# (especially Binance -2021 ORDER_WOULD_IMMEDIATELY_TRIGGER). While this map is
+# non-empty the bot is OPEN_UNPROTECTED: new entries are blocked and a CRITICAL
+# alarm stays up until the real exchange state is resolved. We NEVER auto-change
+# the stop price or close the position here — those are separate security
+# procedures.
+_OPEN_UNPROTECTED = {}  # symbol -> Binance error code (or None)
+
+
+def sl_placement_outcome(result):
+    """Classify a place_algo_sl result. ("PROTECTED", None) when accepted (has
+    algoId); else ("UNPROTECTED", code) with the Binance error code when present
+    (e.g. -2021)."""
+    if isinstance(result, dict) and result.get("algoId"):
+        return ("PROTECTED", None)
+    code = result.get("code") if isinstance(result, dict) else None
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    return ("UNPROTECTED", code)
+
+
+def note_sl_outcome(unprotected, symbol, result):
+    """Pure transition for the OPEN_UNPROTECTED map. Returns (new_map, action);
+    action in {PROTECTED, UNPROTECTED_2021, UNPROTECTED_OTHER}."""
+    state, code = sl_placement_outcome(result)
+    m = dict(unprotected)
+    if state == "PROTECTED":
+        m.pop(symbol, None)
+        return (m, "PROTECTED")
+    m[symbol] = code
+    return (m, "UNPROTECTED_2021" if code == -2021 else "UNPROTECTED_OTHER")
+
+
+def should_block_new_entries(unprotected=None):
+    """True while any position is OPEN_UNPROTECTED (SL not confirmed on exchange)."""
+    u = _OPEN_UNPROTECTED if unprotected is None else unprotected
+    return len(u) > 0
+
+
 def ensure_sl_coverage(binance):
     try:
         positions = binance.position_risk()
@@ -498,6 +565,14 @@ def ensure_sl_coverage(binance):
         log.warning(f"⚠️  SL eksik: {missing}")
         for sym in missing:
             try:
+                # Stop uncontrolled retry: a symbol already flagged -2021 is NOT
+                # re-sent (resending the same trigger just fails again). Keep the
+                # CRITICAL alarm up until the real exchange state is resolved.
+                if _OPEN_UNPROTECTED.get(sym) == -2021:
+                    log.critical(f"🚨 OPEN_UNPROTECTED {sym}: SL -2021 sürüyor — "
+                                 f"korumasız; yeni giriş durduruldu; otomatik SL "
+                                 f"yeniden gönderimi DURDURULDU (kontrolsüz retry yok)")
+                    continue
                 p = open_pos[sym]
                 qty = abs(float(p["positionAmt"]))
                 entry = float(p["entryPrice"])
@@ -515,10 +590,23 @@ def ensure_sl_coverage(binance):
                 else:
                     trig = round(round((entry * (1 + sl_pct)) / tick) * tick, 8)
                 r = binance.place_algo_sl(sym, trig, qty, side)
-                if r.get("algoId"):
-                    log.info(f"  ✅ {sym} SL gönderildi: trigger={trig} qty={qty} algoId={r['algoId']}")
+                _new, _action = note_sl_outcome(_OPEN_UNPROTECTED, sym, r)
+                _OPEN_UNPROTECTED.clear()
+                _OPEN_UNPROTECTED.update(_new)
+                if _action == "PROTECTED":
+                    log.info(f"  ✅ {sym} SL gönderildi: trigger={trig} qty={qty} "
+                             f"algoId={r['algoId']} → OPEN_PROTECTED")
+                elif _action == "UNPROTECTED_2021":
+                    # -2021: OPEN_UNPROTECTED. Do NOT change the stop price and do
+                    # NOT close the position (separate security procedures).
+                    log.critical(f"🚨 OPEN_UNPROTECTED {sym}: SL -2021 (would "
+                                 f"immediately trigger) — korumasız, yeni giriş "
+                                 f"durduruldu; stop fiyatı DEĞİŞTİRİLMEDİ, pozisyon "
+                                 f"KAPATILMADI; borsa durumu çözülene dek alarm açık")
                 else:
-                    log.error(f"  ❌ {sym} SL hata: {r}")
+                    log.critical(f"🚨 OPEN_UNPROTECTED {sym}: SL konulamadı "
+                                 f"code={_OPEN_UNPROTECTED.get(sym)} ({r}) — yeni "
+                                 f"giriş durduruldu")
             except Exception as e:
                 log.exception(f"  {sym} SL istisna: {e}")
     except Exception as e:
@@ -1111,6 +1199,13 @@ def run_once(dry_run=False):
         log.critical(f"🚨 Pozisyon modu {_mode} (ONEWAY değil) — yeni giriş fail-closed engellendi")
         return
     log.info("  ✅ Pozisyon modu ONEWAY doğrulandı")
+
+    # Increment 9: while any position is OPEN_UNPROTECTED (SL not confirmed on the
+    # exchange, esp. -2021), block ALL new entries and keep the CRITICAL alarm up.
+    if should_block_new_entries():
+        log.critical(f"🚨 OPEN_UNPROTECTED {sorted(_OPEN_UNPROTECTED)} — yeni giriş "
+                     f"engellendi (borsa SL doğrulanana dek alarm açık)")
+        return
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}

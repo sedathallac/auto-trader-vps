@@ -78,6 +78,18 @@ class CloseCoordinator:
             return CloseState.CLOSED
         return self._state.get(symbol, CloseState.HANDOFF_PENDING)
 
+    # ---- TP / time-limit routed through the SINGLE close authority ----------
+    # HB's autonomous TP/time-limit closes are disabled (build_executor_config).
+    # When the bot decides to take profit or expire a position, it calls these so
+    # the exit is one coordinated reduce-only/positionSide close — never a second,
+    # uncoordinated MARKET order. (The *trigger* logic — when to TP/expire — is a
+    # later increment; this is the routing interface so the function is not lost.)
+    def request_take_profit(self, symbol: str) -> "CloseResult":
+        return self.request_close(symbol, close_type="TAKE_PROFIT")
+
+    def request_time_limit(self, symbol: str) -> "CloseResult":
+        return self.request_close(symbol, close_type="TIME_LIMIT")
+
     # ---- the single close entry point -----------------------------------
     def request_close(self, symbol: str, close_type: str = "MANUAL") -> CloseResult:
         # Idempotency (F15): one effective close; late/duplicate triggers ignored.
