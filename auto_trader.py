@@ -660,6 +660,43 @@ def protect_then_gate(binance, reserver, drift, stale):
                    "mode_ok": mode_ok, "unprotected": unprotected}
 
 
+# K-3: shared ledger path for the cross-process SL-placement intent (same db as the
+# reservation / close-intent). Overridable in tests.
+SL_LEDGER_DB = str(Path.home() / "risk_ledger.db")
+
+
+def _dedupe_algo_sl(binance, symbol):
+    """K-3 deterministic dedupe backstop: if `symbol` has MORE THAN ONE live STOP algo
+    SL, KEEP the one with the MAX algoId and cancel the rest. The keep rule is
+    deterministic, so two processes running this concurrently can never cancel BOTH
+    (each cancels the same non-max set; the max always survives -> never unprotected).
+    Returns the list of cancelled algoIds."""
+    cancelled = []
+    try:
+        orders = binance.open_algo_orders_for(symbol)
+        if not isinstance(orders, list):
+            return cancelled
+        stops = [o for o in orders
+                 if o.get("algoId") is not None
+                 and "STOP" in str(o.get("orderType") or o.get("type")
+                                   or o.get("algoType") or "").upper()]
+        if len(stops) <= 1:
+            return cancelled
+        keep = max(stops, key=lambda o: int(o["algoId"]))
+        for o in stops:
+            if o["algoId"] != keep["algoId"]:
+                try:
+                    binance.cancel_algo_order(o["algoId"])
+                    cancelled.append(o["algoId"])
+                    log.info(f"  🧹 K-3 dedupe {symbol}: fazla SL iptal "
+                             f"(algoId={o['algoId']}, tutulan={keep['algoId']})")
+                except Exception as e:
+                    log.warning(f"  K-3 dedupe iptal hatası {symbol}/{o['algoId']}: {e}")
+    except Exception as e:
+        log.warning(f"  K-3 dedupe hatası {symbol}: {e}")
+    return cancelled
+
+
 def ensure_sl_coverage(binance):
     try:
         positions = binance.position_risk()
@@ -667,6 +704,10 @@ def ensure_sl_coverage(binance):
             log.warning(f"positionRisk hata: {positions}")
             return
         open_pos = {p["symbol"]: p for p in positions if float(p["positionAmt"]) != 0}
+        # K-3 deterministic dedupe backstop: clean any duplicate SL on every open
+        # position (both processes run this; deterministic keep-max never cancels both).
+        for _sym in open_pos:
+            _dedupe_algo_sl(binance, _sym)
         # RC-B: a reliable positionRisk read (a list) is authoritative flat
         # confirmation. Clear any stale OPEN_UNPROTECTED alarm for a symbol that is
         # no longer open, so an old (e.g. -2021) entry can never block new entries
@@ -724,6 +765,15 @@ def ensure_sl_coverage(binance):
                 log.info(f"✅ SL koruması tam ({len(open_pos)} pozisyon)")
             return
         log.warning(f"⚠️  SL eksik (ONEWAY, yerleştirilecek): {missing}")
+        # K-3 cross-process SL-placement intent (same shared ledger as reservation).
+        try:
+            from sl_placement import SlPlacementStore, ACQUIRED as _SL_ACQ
+            _sl_store = SlPlacementStore(SL_LEDGER_DB)
+            _sl_store.init_schema()
+        except Exception as _e:
+            log.warning(f"K-3 SlPlacementStore kurulamadı: {_e}")
+            _sl_store = None
+            _SL_ACQ = "ACQUIRED"
         for sym in missing:
             try:
                 # Stop uncontrolled retry: a symbol already flagged -2021 is NOT
@@ -750,7 +800,18 @@ def ensure_sl_coverage(binance):
                     trig = round(round((entry * (1 - sl_pct)) / tick) * tick, 8)
                 else:
                     trig = round(round((entry * (1 + sl_pct)) / tick) * tick, 8)
+                # K-3: only ONE process places this (symbol, position-epoch) SL; a
+                # concurrent ensure_sl_coverage (orphan_killer) sees BUSY and skips.
+                _tok = ("LONG" if is_long else "SHORT") + ":" + str(p.get("entryPrice"))
+                if _sl_store is not None and _sl_store.acquire(sym, _tok) != _SL_ACQ:
+                    log.info(f"  ⏸️ {sym} SL yerleştirme başka process'te (BUSY) — atlandı")
+                    continue
                 r = binance.place_algo_sl(sym, trig, qty, side)
+                if _sl_store is not None:
+                    if isinstance(r, dict) and r.get("algoId"):
+                        _sl_store.mark_placed(sym, _tok)
+                    else:
+                        _sl_store.release(sym, _tok)   # failure -> allow reality/retry
                 _new, _action = note_sl_outcome(_OPEN_UNPROTECTED, sym, r)
                 _OPEN_UNPROTECTED.clear()
                 _OPEN_UNPROTECTED.update(_new)
