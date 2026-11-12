@@ -131,7 +131,8 @@ class TestAdapterMapping(unittest.TestCase):
         self.assertFalse(BinanceHBCloseAdapter(fb4, FakeHB()).cancel_order({"symbol": "SOLUSDT", "orderId": 7}))  # ambiguous -> not terminal
 
     def test_stop_executor_keep_position_true(self):
-        hb = FakeHB(execs=[{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1"}])
+        hb = FakeHB(execs=[{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1",
+                            "custom_info": {"order_ids": []}}])
         BinanceHBCloseAdapter(FakeBinance(pos=-0.3), hb).stop_executor(SYM)
         self.assertEqual(hb.stopped, [("E1", True)])
 
@@ -166,7 +167,8 @@ class TestCoordinatorWithRealAdapterFaults(unittest.TestCase):
 
     def test_full_flow_closes_and_confirms_flat(self):
         fb = FakeBinance(pos=-0.3, mode_dual=False)
-        hb = FakeHB(execs=[{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1"}])
+        hb = FakeHB(execs=[{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1",
+                            "custom_info": {"order_ids": []}}])
         cc = CloseCoordinator(BinanceHBCloseAdapter(fb, hb))
         r = cc.request_close(SYM, "MANUAL")
         self.assertTrue(r.ok)

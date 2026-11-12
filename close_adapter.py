@@ -62,21 +62,31 @@ class BinanceHBCloseAdapter:
         return HEDGE if hedge else ONEWAY
 
     def _hb_order_ids(self, symbol):
-        """Client order ids tracked by THIS symbol's HB executor (_open_order /
-        _close_order / _take_profit_limit_order, via get_custom_info.order_ids).
-        Raises on an unavailable executor list (API error -> fail-closed). Returns
-        a set when the executor is found (possibly empty), or None when NO executor
-        exists for the pair (unknown attribution)."""
+        """Union of the client order ids tracked by ALL HB executors on this
+        symbol (a pair can have several executors — grid / multi-level — each with
+        its own _open_order/_close_order/_take_profit_limit_order via
+        get_custom_info.order_ids). Does NOT stop at the first executor. Raises on
+        an unavailable executor list OR any matched executor whose order_ids
+        mapping is missing/not-a-list (restart/mapping lost -> UNKNOWN, fail-
+        closed). Returns the (possibly empty) union when executors are found, or
+        None when NO executor exists for the pair."""
         pair = symbol.replace("USDT", "-USDT")
         execs = self.hb.active_executors()
         if not isinstance(execs, list):
             raise CloseAdapterError(f"active_executors [HB] unavailable: {execs}")
-        for e in execs:
-            if e.get("trading_pair") == pair:
-                info = e.get("custom_info") or {}
-                ids = info.get("order_ids")
-                return set(ids) if isinstance(ids, list) else set()
-        return None
+        matched = [e for e in execs if e.get("trading_pair") == pair]
+        if not matched:
+            return None
+        ids = set()
+        for e in matched:
+            info = e.get("custom_info")
+            oids = info.get("order_ids") if isinstance(info, dict) else None
+            if not isinstance(oids, list):
+                raise CloseAdapterError(
+                    f"HB executor {e.get('executor_id')} for {symbol} has no "
+                    f"order_ids mapping -> UNKNOWN (fail-closed)")
+            ids |= set(oids)
+        return ids
 
     def protective_orders(self, symbol) -> list:
         """The orders tracked by THIS symbol's HB executor. get_custom_info.order_ids
