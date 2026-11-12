@@ -23,6 +23,7 @@ mock that models ONEWAY netting + reduce-only clamping, and drives the real
 BinanceAPI/HBAPI in production. No order is sent except the single coordinated
 reduce-only/positionSide close.
 """
+import threading
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -72,6 +73,13 @@ class CloseCoordinator:
         self.ex = exchange
         self._state: Dict[str, CloseState] = {}
         self._closed: set = set()
+        # Serialise request_close so concurrent in-process triggers (two threads /
+        # two executors) cannot both run a handoff and send a second close POST;
+        # the second then sees _closed -> IGNORED. Cross-PROCESS safety does NOT
+        # rely on this lock (no shared memory) — it comes from the exchange being
+        # the atomic authority (reduceOnly can never cross zero, -2022). RLock so
+        # request_take_profit/request_time_limit can re-enter.
+        self._lock = threading.RLock()
 
     def state_of(self, symbol: str) -> CloseState:
         if symbol in self._closed:
@@ -92,6 +100,12 @@ class CloseCoordinator:
 
     # ---- the single close entry point -----------------------------------
     def request_close(self, symbol: str, close_type: str = "MANUAL") -> CloseResult:
+        # Atomic per-coordinator: concurrent triggers serialise so the idempotency
+        # check + the close POST happen as one critical section (no double-POST).
+        with self._lock:
+            return self._request_close_locked(symbol, close_type)
+
+    def _request_close_locked(self, symbol: str, close_type: str = "MANUAL") -> CloseResult:
         # Idempotency (F15): one effective close; late/duplicate triggers ignored.
         if symbol in self._closed:
             return CloseResult(True, CloseState.CLOSED, "IGNORED_ALREADY_CLOSED",

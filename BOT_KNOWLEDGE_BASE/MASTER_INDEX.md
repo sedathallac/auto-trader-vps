@@ -30,6 +30,10 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
   artık inc10.1 mode-aware `sl_status` kullanır (PRESENT/ABSENT/UNKNOWN, tam kapsama).
   **YAZILDI (inc11.1, 2026-11-12)**; 17 yeni test GREEN, davranışsal RED (12 yanlış-değer),
   tests/ **204 passed, 0 xfailed**.
+- `design/INCREMENT_12_integration.md` — concurrency/restart/timeout/UNKNOWN entegrasyonu.
+  **YAZILDI (inc12, 2026-11-12)**; RC-A CloseCoordinator lock (thread + cross-process
+  SQLite), RC-B `_OPEN_UNPROTECTED` flat-temizliği. 25 yeni test GREEN, davranışsal RED
+  (2 kök neden), tests/ **229 passed**.
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**

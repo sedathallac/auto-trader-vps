@@ -656,6 +656,14 @@ def ensure_sl_coverage(binance):
             log.warning(f"positionRisk hata: {positions}")
             return
         open_pos = {p["symbol"]: p for p in positions if float(p["positionAmt"]) != 0}
+        # RC-B: a reliable positionRisk read (a list) is authoritative flat
+        # confirmation. Clear any stale OPEN_UNPROTECTED alarm for a symbol that is
+        # no longer open, so an old (e.g. -2021) entry can never block new entries
+        # forever. Cleanup happens ONLY on this reliable read (an unreliable read
+        # returned above without touching the map).
+        for _sym in list(_OPEN_UNPROTECTED):
+            if _sym not in open_pos:
+                _OPEN_UNPROTECTED.pop(_sym, None)
         if not open_pos:
             log.info("SL kontrolü: açık pozisyon yok")
             return
