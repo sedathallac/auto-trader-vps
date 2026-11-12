@@ -177,13 +177,13 @@ class TestNoDirectBypass(LiveWiringBase):
         auto_trader.open_coin(binance, hb, self._coin(), coordinator=cc)
         self.assertNotEqual(hb.stopped, [], "close bypassed the coordinator handoff")
 
-    def test_fallback_direct_close_only_without_coordinator(self):
-        # coordinate_close(None, ...) is the ONLY direct-close path, used solely when
-        # no coordinator is wired (never in the live loop).
+    def test_no_coordinator_no_direct_close(self):
+        # B-1: without a coordinator there is NO direct MARKET close bypass — nothing
+        # is sent and the result is fail-closed (run_once blocks new entries too).
         binance = FakeBinance()
-        coordinate_close(None, binance, SYM, "LEGACY", side=1, amount="0.6")
-        self.assertEqual(len(binance.order_posts), 1)
-        self.assertEqual(binance.order_posts[0]["type"], "MARKET")
+        r = coordinate_close(None, binance, SYM, "LEGACY", side=1, amount="0.6")
+        self.assertEqual(binance.order_posts, [])
+        self.assertFalse(r.ok)
 
 
 class TestRunOnceWiresCoordinator(LiveWiringBase):

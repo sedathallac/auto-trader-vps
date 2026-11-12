@@ -1037,11 +1037,17 @@ def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=Non
             log.critical(f"  🚨 koordineli kapanış güvenli durdu [{reason}]: "
                          f"{r.action} — {r.reason}")
         return r
-    log.warning(f"  ⚠️ coordinator yok → eski doğrudan reduceOnly kapanış [{reason}]")
-    close_side = "SELL" if side == 1 else "BUY"
-    return binance._post("/fapi/v1/order", {
-        "symbol": symbol, "side": close_side, "type": "MARKET",
-        "quantity": str(amount), "reduceOnly": "true"})
+    # B-1: NO direct MARKET close bypass. Without the central coordinator we cannot
+    # guarantee idempotency / flat-confirmation / cross-process intent, so a raw
+    # reduce-only MARKET POST could double-close or race another process. Send
+    # NOTHING and fail closed; run_once blocks new entries when the coordinator is
+    # unavailable, and the open position keeps its exchange SL (K1=B).
+    from close_coordinator import CloseResult, CloseState
+    log.critical(f"  🚨 B-1: CloseCoordinator YOK — merkezi kapanış gönderilemiyor "
+                 f"[{reason}]; doğrudan MARKET kapanış YASAK (fail-closed).")
+    return CloseResult(False, CloseState.FAILED_SAFE, "NO_COORDINATOR",
+                       reason="no central close authority; refusing direct MARKET close",
+                       critical=True)
 
 
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
@@ -1369,6 +1375,15 @@ def run_once(dry_run=False):
                          f"engellendi (borsa SL doğrulanana dek alarm açık)")
         return
     log.info("  ✅ Koruma denetimi çalıştı; mod ONEWAY; yeni giriş izni var")
+
+    # B-1: the central close authority is mandatory for new entries. If the
+    # CloseCoordinator/CloseIntentStore could not be built, block NEW entries
+    # (fail-closed) — the SL protection check above already ran for open positions.
+    if coordinator is None:
+        log.critical("🚨 B-1: CloseCoordinator/CloseIntentStore kurulamadı — merkezi "
+                     "kapanış otoritesi YOK; yeni girişler fail-closed engellendi "
+                     "(açık pozisyonların borsa SL koruma denetimi çalıştı)")
+        return
 
     try:
         active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
