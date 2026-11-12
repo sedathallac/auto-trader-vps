@@ -1223,6 +1223,18 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         trig = round(round((price * (1 - sl_pct)) / tick) * tick, 8)
     else:
         trig = round(round((price * (1 + sl_pct)) / tick) * tick, 8)
+    # Faz2.1 (K-1/K-2) pre-open reconciliation: cancel any leftover algo SL for this
+    # symbol (an orphan from a prior/closed position) BEFORE placing the new one, so a
+    # freshly opened position can never end up with a DUPLICATE SL.
+    try:
+        for _o in binance.open_algo_orders_for(symbol):
+            _aid = _o.get("algoId")
+            if _aid:
+                binance.cancel_algo_order(_aid)
+                log.info(f"  🧹 pre-open: eski algo SL iptal (algoId={_aid}) — tek SL garantisi")
+    except Exception as e:
+        log.warning(f"  pre-open SL reconciliation hatası: {e}")
+
     sr = binance.place_algo_sl(symbol, trig, amount, side)
     algo_id = sr.get("algoId") if isinstance(sr, dict) else None
 
