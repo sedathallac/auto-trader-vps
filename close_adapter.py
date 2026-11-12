@@ -21,9 +21,19 @@ class CloseAdapterError(Exception):
     pass
 
 
-# Algo/order statuses that mean the order can no longer fill.
+# Order statuses that mean the order can no longer fill (TERMINAL). Everything
+# else — NEW, PARTIALLY_FILLED, PENDING_CANCEL, WORKING, missing/empty (UNKNOWN) —
+# is treated as NON-terminal so a pre-sent close/TP order is never assumed resolved.
 _TERMINAL = {"FILLED", "CANCELLED", "CANCELED", "EXPIRED", "TRIGGERED",
              "FINISHED", "REJECTED", "ALREADY_TERMINAL"}
+
+
+def classify_order_terminal(order):
+    """True only when the order status is terminal (FILLED/CANCELED/EXPIRED/
+    REJECTED/...). NEW, PARTIALLY_FILLED, PENDING_CANCEL and any missing/unknown
+    status return False (fail-closed) — the handoff must resolve them first."""
+    st = str((order or {}).get("algoStatus") or (order or {}).get("status") or "").upper()
+    return st in _TERMINAL
 
 
 class BinanceHBCloseAdapter:
@@ -53,22 +63,29 @@ class BinanceHBCloseAdapter:
         return HEDGE if hedge else ONEWAY
 
     def protective_orders(self, symbol) -> list:
-        r = self.binance.open_algo_orders_for(symbol)
+        """Pre-sent REGULAR orders that could double-close: HB's _close_order (an
+        in-flight / partially filled MARKET close) and _take_profit_limit_order (a
+        resting LIMIT). These live in exchange openOrders. The exchange reduceOnly
+        algo SL is the NEW authority and is intentionally NOT returned here (it is
+        kept, not cancelled). Fail-closed: raise on any API error."""
+        r = self.binance.open_orders(symbol)
         if not isinstance(r, list):
-            raise CloseAdapterError(f"open algo orders unavailable for {symbol}: {r}")
+            raise CloseAdapterError(f"open orders unavailable for {symbol}: {r}")
         return r
 
     def order_terminal(self, o) -> bool:
-        st = str(o.get("algoStatus") or o.get("status") or "").upper()
-        return st in _TERMINAL
+        return classify_order_terminal(o)
 
     def cancel_order(self, o) -> bool:
-        aid = o.get("algoId") or o.get("orderId")
-        resp = self.binance.cancel_algo_order(aid)
+        # Regular order -> DELETE /fapi/v1/order; algo order -> algo cancel.
+        if o.get("algoId"):
+            resp = self.binance.cancel_algo_order(o.get("algoId"))
+        else:
+            resp = self.binance.cancel_order(o.get("symbol"), o.get("orderId"))
         if isinstance(resp, dict):
             code = resp.get("code")
             # success, or "unknown order" (-2011) == already terminal at exchange
-            if str(code) == "200" or resp.get("algoId") or code in (-2011,):
+            if str(code) == "200" or resp.get("algoId") or resp.get("orderId") or code in (-2011,):
                 return True
         return False  # ambiguous / error -> NOT terminal -> coordinator stays safe
 

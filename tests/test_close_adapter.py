@@ -39,6 +39,9 @@ class FakeBinance:
     def open_algo_orders_for(self, symbol):
         return self._algo
 
+    def open_orders(self, symbol):
+        return getattr(self, "_open_orders", [])
+
     def cancel_algo_order(self, aid):
         return self._cancel
 
@@ -101,7 +104,8 @@ class TestAdapterMapping(unittest.TestCase):
             BinanceHBCloseAdapter(fb, FakeHB()).position_mode()
 
     def test_protective_orders_error_raises(self):
-        fb = FakeBinance(pos=0.0); fb._algo = {"code": -1, "msg": "err"}
+        # protective_orders now sources REGULAR open orders (double-close detection)
+        fb = FakeBinance(pos=0.0); fb._open_orders = {"code": -1, "msg": "err"}
         with self.assertRaises(CloseAdapterError):
             BinanceHBCloseAdapter(fb, FakeHB()).protective_orders(SYM)
 

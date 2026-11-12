@@ -188,6 +188,19 @@ class BinanceAPI:
             return r["orders"]
         return []
 
+    def open_orders(self, symbol):
+        """GET /fapi/v1/openOrders — REGULAR (non-algo) open orders for a symbol
+        (e.g. a resting take_profit LIMIT, or an in-flight / partially filled
+        close). Returns the raw response (list on success, error dict otherwise)
+        so the caller can fail closed on an error. Used to detect a pre-sent
+        _close_order / _take_profit_limit_order before the close handoff."""
+        return self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+
+    def cancel_order(self, symbol, order_id):
+        """DELETE /fapi/v1/order — cancel a REGULAR order by exchange orderId."""
+        return self._post("/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
+                          method="DELETE")
+
     def exchange_info(self):
         if not self._info or time.time() - self._info_ts > 3600:
             self._info = self._get("/fapi/v1/exchangeInfo")
