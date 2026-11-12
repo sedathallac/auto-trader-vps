@@ -45,6 +45,12 @@ class FakeBinance:
     def cancel_algo_order(self, aid):
         return self._cancel
 
+    def cancel_order(self, symbol, oid):
+        return getattr(self, "_cancel_resp", {"orderId": oid, "status": "CANCELED"})
+
+    def query_order(self, symbol, oid):
+        return getattr(self, "_query_resp", {"orderId": oid, "status": "CANCELED"})
+
     def _post(self, path, params):
         self.posts.append((path, dict(params)))
         # simulate a reduce-only / positionSide MARKET fill -> position goes flat
@@ -110,12 +116,19 @@ class TestAdapterMapping(unittest.TestCase):
             BinanceHBCloseAdapter(fb, FakeHB()).protective_orders(SYM)
 
     def test_order_terminal_and_cancel(self):
-        a = BinanceHBCloseAdapter(FakeBinance(pos=0.0), FakeHB())
-        self.assertTrue(a.order_terminal({"algoStatus": "FILLED"}))
-        self.assertFalse(a.order_terminal({"algoStatus": "NEW"}))
-        self.assertTrue(a.cancel_order({"algoId": 7}))  # cancel returns code 200
-        amb = BinanceHBCloseAdapter(FakeBinance(pos=0.0, cancel={"code": -1}), FakeHB())
-        self.assertFalse(amb.cancel_order({"algoId": 7}))  # ambiguous -> not terminal
+        # order_terminal / cancel_order now confirm via GET /fapi/v1/order (query);
+        # a cancel response alone is not proof.
+        fb = FakeBinance(pos=0.0); fb._query_resp = {"orderId": 7, "status": "FILLED"}
+        a = BinanceHBCloseAdapter(fb, FakeHB())
+        self.assertTrue(a.order_terminal({"symbol": "SOLUSDT", "orderId": 7}))
+        fb2 = FakeBinance(pos=0.0); fb2._query_resp = {"orderId": 7, "status": "NEW"}
+        self.assertFalse(BinanceHBCloseAdapter(fb2, FakeHB()).order_terminal({"symbol": "SOLUSDT", "orderId": 7}))
+        # cancel then query confirms CANCELED -> terminal
+        fb3 = FakeBinance(pos=0.0); fb3._query_resp = {"orderId": 7, "status": "CANCELED"}
+        self.assertTrue(BinanceHBCloseAdapter(fb3, FakeHB()).cancel_order({"symbol": "SOLUSDT", "orderId": 7}))
+        # cancel sent but query still NEW -> not terminal (cancel not proof)
+        fb4 = FakeBinance(pos=0.0); fb4._query_resp = {"orderId": 7, "status": "NEW"}
+        self.assertFalse(BinanceHBCloseAdapter(fb4, FakeHB()).cancel_order({"symbol": "SOLUSDT", "orderId": 7}))  # ambiguous -> not terminal
 
     def test_stop_executor_keep_position_true(self):
         hb = FakeHB(execs=[{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1"}])

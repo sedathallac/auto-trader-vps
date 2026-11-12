@@ -42,9 +42,12 @@ class TestClassifyOrderTerminal(unittest.TestCase):
         self.assertFalse(classify_order_terminal({"status": ""}))
         self.assertFalse(classify_order_terminal(None))
 
-    def test_algo_status_field(self):
-        self.assertTrue(classify_order_terminal({"algoStatus": "FILLED"}))
-        self.assertFalse(classify_order_terminal({"algoStatus": "WORKING"}))
+    def test_status_only_not_algostatus(self):
+        # classify_order_terminal now reads the REGULAR `status` field only.
+        self.assertTrue(classify_order_terminal({"status": "FILLED"}))
+        self.assertFalse(classify_order_terminal({"status": "PENDING_CANCEL"}))
+        # an algoStatus-only dict is not a regular order here -> not terminal
+        self.assertFalse(classify_order_terminal({"algoStatus": "FILLED"}))
 
 
 class MockEx:

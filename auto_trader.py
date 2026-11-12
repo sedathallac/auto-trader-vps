@@ -201,6 +201,13 @@ class BinanceAPI:
         return self._post("/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
                           method="DELETE")
 
+    def query_order(self, symbol, order_id):
+        """GET /fapi/v1/order — current status of a single REGULAR order. Used to
+        confirm a pre-sent close/TP order's real terminal state (never inferred
+        from a cancel response or an error code)."""
+        return self._get("/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
+                         signed=True)
+
     def exchange_info(self):
         if not self._info or time.time() - self._info_ts > 3600:
             self._info = self._get("/fapi/v1/exchangeInfo")
