@@ -21,6 +21,8 @@ exchange is the real BinanceHBCloseAdapter in production and a mock in tests.
 """
 from decimal import Decimal
 
+from close_adapter import SL_ABSENT, SL_PRESENT
+
 
 NOT_OPEN = "NOT_OPEN"
 MIGRATED = "MIGRATED"
@@ -104,20 +106,22 @@ class PositionMigrator:
                                    amt=Decimal("0"), mode=mode)
         side = "LONG" if amt2 > 0 else "SHORT"
 
-        # 6) verify the exchange SL by real status (not just a list membership)
+        # 6) verify the exchange SL by real tri-state status (PRESENT/ABSENT/UNKNOWN).
+        # side is passed so a HEDGE SL is matched to THIS position side.
         try:
-            sl = self.ex.sl_status(symbol)
+            sl = self.ex.sl_status(symbol, side)
         except Exception as e:
             return MigrationResult(symbol, UNKNOWN, f"sl_status failed: {e}",
                                    amt=amt2, side=side, mode=mode, critical=True)
-        if sl == UNKNOWN:
-            return MigrationResult(symbol, UNKNOWN, "SL status unverifiable",
-                                   amt=amt2, side=side, mode=mode, critical=True)
-        if sl == "PROTECTED":
+        if sl == SL_PRESENT:
             # verified SL exists -> do NOT send a second SL
             return MigrationResult(symbol, MIGRATED, "protected by exchange SL",
                                    amt=amt2, side=side, mode=mode)
-        return MigrationResult(symbol, UNPROTECTED, "no verified SL",
+        if sl == SL_ABSENT:
+            return MigrationResult(symbol, UNPROTECTED, "no verified SL",
+                                   amt=amt2, side=side, mode=mode, critical=True)
+        # SL_UNKNOWN or any unexpected value -> fail-closed HALT
+        return MigrationResult(symbol, UNKNOWN, "SL status unverifiable",
                                amt=amt2, side=side, mode=mode, critical=True)
 
 

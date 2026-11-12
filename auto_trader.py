@@ -188,6 +188,14 @@ class BinanceAPI:
             return r["orders"]
         return []
 
+    def open_algo_orders_raw(self, symbol):
+        """GET /fapi/v1/openAlgoOrders returning the RAW response, never swallowing
+        an error into []. A timeout/exception propagates; an API error dict
+        ({"code","msg"}) is returned as-is; success is a list (or {"orders":[...]}).
+        sl_status uses this to tell a real 'no SL' (ABSENT) apart from an outage
+        (UNKNOWN) — open_algo_orders_for() cannot, as it maps both to []."""
+        return self._get("/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
+
     def open_orders(self, symbol):
         """GET /fapi/v1/openOrders — REGULAR (non-algo) open orders for a symbol
         (e.g. a resting take_profit LIMIT, or an in-flight / partially filled

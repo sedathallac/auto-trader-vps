@@ -13,12 +13,13 @@ from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from migration import (PositionMigrator, migrate_all, block_new_entries,
                        NOT_OPEN, MIGRATED, UNPROTECTED, UNKNOWN, ONEWAY, HEDGE)
+from close_adapter import SL_PRESENT, SL_ABSENT, SL_UNKNOWN
 
 SYM = "SOLUSDT"
 
 
 class MockEx:
-    def __init__(self, amt, mode=ONEWAY, protective=None, sl="PROTECTED",
+    def __init__(self, amt, mode=ONEWAY, protective=None, sl=SL_PRESENT,
                  stop_raises=False):
         self._amt = list(amt) if isinstance(amt, list) else [amt]
         self._mode = mode
@@ -58,7 +59,8 @@ class MockEx:
         self.cancelled.append(o)
         return bool(o.get("cancel_ok", True))
 
-    def sl_status(self, s):
+    def sl_status(self, s, position_side=None):
+        self.sl_side = position_side
         if isinstance(self._sl, Exception):
             raise self._sl
         return self._sl
@@ -70,38 +72,38 @@ def _m(ex):
 
 class TestMigration(unittest.TestCase):
     def test_open_with_valid_sl_migrated(self):
-        r = _m(MockEx(-0.3, sl="PROTECTED"))
+        r = _m(MockEx(-0.3, sl=SL_PRESENT))
         self.assertEqual(r.state, MIGRATED)
         self.assertEqual(r.side, "SHORT")
 
     def test_open_no_sl_unprotected(self):
-        r = _m(MockEx(0.3, sl="UNPROTECTED"))
+        r = _m(MockEx(0.3, sl=SL_ABSENT))
         self.assertEqual(r.state, UNPROTECTED)
         self.assertTrue(r.critical)
 
     def test_open_sl_unknown_halts(self):
-        r = _m(MockEx(-0.3, sl="UNKNOWN"))
+        r = _m(MockEx(-0.3, sl=SL_UNKNOWN))
         self.assertEqual(r.state, UNKNOWN)
         self.assertTrue(r.critical)
 
     def test_executor_present_position_present_stops_and_migrates(self):
-        ex = MockEx(-0.3, sl="PROTECTED")
+        ex = MockEx(-0.3, sl=SL_PRESENT)
         r = PositionMigrator(ex).migrate(SYM)
         self.assertEqual(r.state, MIGRATED)
         self.assertEqual(ex.stopped, 1)  # HB neutralised keep_position=True
 
     def test_executor_lost_position_present_not_auto_safe(self):
         # executor gone (stop is a no-op in the mock) but position open + no SL
-        r = _m(MockEx(-0.3, sl="UNPROTECTED"))
+        r = _m(MockEx(-0.3, sl=SL_ABSENT))
         self.assertEqual(r.state, UNPROTECTED)  # NOT auto-assumed safe
 
     def test_local_closed_but_exchange_open(self):
         # migrate ignores local state; exchange says open -> not NOT_OPEN
-        r = _m(MockEx(-0.3, sl="PROTECTED"))
+        r = _m(MockEx(-0.3, sl=SL_PRESENT))
         self.assertNotEqual(r.state, NOT_OPEN)
 
     def test_local_open_but_exchange_flat(self):
-        r = _m(MockEx(0, sl="PROTECTED"))
+        r = _m(MockEx(0, sl=SL_PRESENT))
         self.assertEqual(r.state, NOT_OPEN)
 
     def test_oneway_and_hedge(self):
@@ -121,27 +123,27 @@ class TestMigration(unittest.TestCase):
             def protective_orders(self, s): return []
             def order_terminal(self, o): return True
             def cancel_order(self, o): return True
-            def sl_status(self, s): return "PROTECTED"
+            def sl_status(self, s, position_side=None): return SL_PRESENT
         res = migrate_all(_Multi(), ["SOLUSDT", "ETHUSDT"])
         self.assertEqual(res["SOLUSDT"].state, MIGRATED)
         self.assertEqual(res["ETHUSDT"].state, NOT_OPEN)
 
     def test_partial_fill_reread(self):
         # position -0.3 then, after order resolution, -0.2 remains
-        ex = MockEx([-0.3, -0.2], sl="PROTECTED",
+        ex = MockEx([-0.3, -0.2], sl=SL_PRESENT,
                     protective=[{"orderId": 1, "terminal": False, "cancel_ok": True}])
         r = PositionMigrator(ex).migrate(SYM)
         self.assertEqual(r.state, MIGRATED)
         self.assertEqual(r.amt, Decimal("-0.2"))  # remainder re-read
 
     def test_closed_during_resolution_not_open(self):
-        ex = MockEx([-0.3, 0], sl="PROTECTED",
+        ex = MockEx([-0.3, 0], sl=SL_PRESENT,
                     protective=[{"orderId": 1, "terminal": False, "cancel_ok": True}])
         r = PositionMigrator(ex).migrate(SYM)
         self.assertEqual(r.state, NOT_OPEN)  # a close filled during resolution
 
     def test_old_order_unresolved_unknown(self):
-        ex = MockEx(-0.3, sl="PROTECTED",
+        ex = MockEx(-0.3, sl=SL_PRESENT,
                     protective=[{"orderId": 1, "terminal": False, "cancel_ok": False}])
         r = PositionMigrator(ex).migrate(SYM)
         self.assertEqual(r.state, UNKNOWN)
@@ -156,15 +158,15 @@ class TestMigration(unittest.TestCase):
         self.assertEqual(r.state, UNKNOWN)
 
     def test_re_migration_idempotent_same_result(self):
-        ex = MockEx(-0.3, sl="PROTECTED")
+        ex = MockEx(-0.3, sl=SL_PRESENT)
         mg = PositionMigrator(ex)
         self.assertEqual(mg.migrate(SYM).state, MIGRATED)
         self.assertEqual(mg.migrate(SYM).state, MIGRATED)  # re-run -> same, no close
 
     def test_block_new_entries_when_unsafe(self):
-        safe = {"A": PositionMigrator(MockEx(0.3, sl="PROTECTED")).migrate(SYM)}
+        safe = {"A": PositionMigrator(MockEx(0.3, sl=SL_PRESENT)).migrate(SYM)}
         self.assertFalse(block_new_entries(safe))
-        unsafe = {"B": PositionMigrator(MockEx(0.3, sl="UNPROTECTED")).migrate(SYM)}
+        unsafe = {"B": PositionMigrator(MockEx(0.3, sl=SL_ABSENT)).migrate(SYM)}
         self.assertTrue(block_new_entries(unsafe))
 
 

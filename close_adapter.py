@@ -21,6 +21,15 @@ class CloseAdapterError(Exception):
     pass
 
 
+# Tri-state result of verifying the exchange reduceOnly STOP algo SL (K1=B).
+SL_PRESENT = "PRESENT"   # successful, valid query: a live protective SL exists
+SL_ABSENT = "ABSENT"     # successful, valid query: genuinely no SL for this position
+SL_UNKNOWN = "UNKNOWN"   # timeout/exception/API error/malformed/wrong symbol -> HALT
+
+# Algo-order statuses that mean the SL is still live (protecting the position).
+_SL_LIVE = {"", "NEW", "WORKING", "ACTIVE", "LIVE"}
+
+
 # REGULAR-order statuses that mean the order can no longer fill (TERMINAL).
 # NEW / PARTIALLY_FILLED / PENDING_CANCEL / WORKING / missing / unknown -> NON
 # terminal (fail-closed). Algo orders are NOT classified here.
@@ -169,22 +178,46 @@ class BinanceHBCloseAdapter:
             return False  # cancel send failed -> UNKNOWN
         return self._query_terminal(o)
 
-    def sl_status(self, symbol):
-        """Verify the exchange reduceOnly STOP algo SL (the K1=B authority) by its
-        real state. PROTECTED when a live STOP algo order exists; UNPROTECTED when
-        none; UNKNOWN when the algo-order query is unavailable. NOTE: the current
-        BinanceAPI.open_algo_orders_for() returns [] on an API error, so UNKNOWN
-        from a live API failure is not always distinguishable here -> live
-        behaviour is PARTIAL (the migrator logic is fully tested via a mock)."""
-        r = self.binance.open_algo_orders_for(symbol)
+    def sl_status(self, symbol, position_side=None):
+        """Tri-state verification of the exchange reduceOnly STOP algo SL (K1=B).
+        Uses open_algo_orders_raw() so an outage is NEVER mistaken for 'no SL':
+
+          SL_PRESENT - query succeeded, response valid, a live protective STOP algo
+                       order for THIS symbol exists (and, when position_side is
+                       given, guards THIS side; a BOTH / ONEWAY order matches).
+          SL_ABSENT  - query succeeded, response valid, no such SL -> UNPROTECTED.
+          SL_UNKNOWN - timeout / exception / API error dict / malformed payload /
+                       an order for the WRONG symbol (unverifiable match) -> HALT.
+
+        Never sends an order and never changes a stop price (read-only)."""
+        try:
+            r = self.binance.open_algo_orders_raw(symbol)
+        except Exception:
+            return SL_UNKNOWN                      # timeout / network / exception
+        if isinstance(r, dict):
+            orders = r.get("orders")
+            if not isinstance(orders, list):
+                return SL_UNKNOWN                  # error dict ({code,msg}) / malformed
+            r = orders
         if not isinstance(r, list):
-            return "UNKNOWN"
+            return SL_UNKNOWN                      # non-list, non-dict -> unverifiable
         for o in r:
+            if not isinstance(o, dict):
+                return SL_UNKNOWN                  # malformed element
+            if str(o.get("symbol") or "").upper() != symbol.upper():
+                return SL_UNKNOWN                  # wrong symbol -> cannot verify match
             typ = str(o.get("type") or o.get("algoType") or "").upper()
             st = str(o.get("algoStatus") or o.get("status") or "").upper()
-            if "STOP" in typ and st in ("", "NEW", "WORKING", "ACTIVE", "LIVE"):
-                return "PROTECTED"
-        return "UNPROTECTED"
+            if "STOP" not in typ or st not in _SL_LIVE:
+                continue
+            if o.get("reduceOnly") is False:
+                continue                           # non-reduceOnly STOP is not protective
+            if position_side:                      # HEDGE: SL must guard THIS side
+                psl = str(o.get("positionSide") or "").upper()
+                if psl and psl not in ("BOTH", position_side.upper()):
+                    continue
+            return SL_PRESENT
+        return SL_ABSENT
 
     def stop_executor(self, symbol):
         pair = symbol.replace("USDT", "-USDT")

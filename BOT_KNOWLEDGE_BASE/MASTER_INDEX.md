@@ -24,8 +24,10 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**
-- `design/INCREMENT_10_position_migration.md` — açık pozisyon güvenli migration/handoff.
-  **YAZILDI (inc10, 2026-11-12)**; `migration.py` + 17 test GREEN, davranışsal RED kanıtlı, tests/ 146 passed.
+- `design/INCREMENT_10_position_migration.md` — açık pozisyon güvenli migration/handoff
+  + `sl_status` tri-state (PRESENT/ABSENT/UNKNOWN) sertleştirme.
+  **YAZILDI (inc10, 2026-11-12)**; `migration.py` + `open_algo_orders_raw`, 17+16 test GREEN,
+  davranışsal RED kanıtlı (4+6 yanlış-değer), tests/ **162 passed**.
 - `architecture/system_overview.md` — üç bileşen. **YAZILDI**
 - `architecture/zorin_toolchain.md` — Zorin araçları. **DOĞRULANDI**
 - `architecture/SPOT_GRID_ARCHITECTURE.md` — GridC0. **YAZILDI (bu tur)**

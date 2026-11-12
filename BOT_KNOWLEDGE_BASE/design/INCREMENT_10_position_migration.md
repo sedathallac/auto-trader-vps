@@ -68,11 +68,32 @@ Zayıflatma geri alındı → tekrar `17 passed`.
   depodaki mevcut commit'li dosyalarda da var (repo'da ruff config yok). **PARTIAL**
   (stil tabanı repo geneliyle tutarlı; düzeltme gerektiren correctness yok).
 
-## Canlı doğrulama sınırı — PARTIAL
-`close_adapter.sl_status` canlıda `BinanceAPI.open_algo_orders_for()` kullanır; bu
-API hatasında `[]` döndürdüğü için "canlı API hatası" ile "gerçekten SL yok" her
-zaman ayırt edilemez → canlı davranış **PARTIAL**. Migrator mantığı mock ile tam
-test edilmiştir (VERIFIED); canlı algo-emir okuma yolu ayrı bir sertleştirme işi.
+## SL STATUS TRI-STATE SERTLEŞTİRME (inc10 ek commit, 2026-11-12)
+Kök neden: `BinanceAPI.open_algo_orders_for()` API hatasında `[]` döndürüp hatayı
+yutuyordu → "canlı API hatası" ile "gerçekten SL yok" ayırt edilemiyordu (outage,
+"SL yok" sanılıp UNPROTECTED'a düşebilirdi). Düzeltme (migration mimarisi korunur,
+`86564b5` değiştirilmez; yalnızca sl_status API belirsizliği giderilir):
+
+- YENİ `BinanceAPI.open_algo_orders_raw(symbol)` — ham cevap; hata YUTULMAZ
+  (timeout/exception propagate, hata dict'i olduğu gibi döner).
+- `close_adapter.sl_status(symbol, position_side=None)` artık tri-state döner:
+  - `SL_PRESENT` — sorgu başarılı + geçerli + bu sembole (ve verildiyse bu side'a;
+    BOTH/ONEWAY eşleşir) ait canlı koruyucu reduceOnly STOP algo emri var.
+  - `SL_ABSENT` — sorgu başarılı + geçerli + gerçekten SL yok → UNPROTECTED.
+  - `SL_UNKNOWN` — timeout / exception / API hata dict'i / bozuk payload / YANLIŞ
+    sembol (doğrulanamayan eşleşme) → HALT. Hiç emir göndermez, stop fiyatı değişmez.
+- `migration.py` eşlemesi: PRESENT→MIGRATED, ABSENT→UNPROTECTED(CRITICAL),
+  UNKNOWN/beklenmeyen→UNKNOWN(HALT). HEDGE için `side` sl_status'a geçirilir.
+- UNKNOWN → `block_new_entries` True (yeni giriş engellenir), uçtan uca test edildi.
+
+RED/GREEN: 16 yeni test GREEN. Davranışsal RED (üç sertleştirme guard'ı geçici
+zayıflatıldı → hata-dict/invalid "ABSENT", timeout/exception RAISE, yanlış sembol
+"PRESENT") → **6 test yanlış-DEĞER ile düştü**; geri alındı → GREEN.
+
+Kalan sınır — **PARTIAL (canlı)**: mantık fake'lerle tam test edildi (VERIFIED);
+gerçek Binance'e karşı KOŞULMADI (canlı emir yok). `open_algo_orders_raw` `_get`'e
+dayanır; `_get` istisnayı yakalamaz, dolayısıyla timeout/exception sl_status'un
+try/except'ine ulaşır → canlı belirsizlik kök nedeni (yutma) kaldırıldı.
 
 ## Kapsam dışı (bu increment değil)
 Gerçek SL yerleştirme, SOLUSDT gerçek-kod regresyon fikstürü (inc11),
