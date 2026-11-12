@@ -41,7 +41,12 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 - `design/INCREMENT_12_1_close_intent.md` — cross-process close-intent/idempotency
   (`close_intent.py`, aynı SQLite defteri). **YAZILDI (inc12.1, 2026-11-12)**; 21 yeni
   test GREEN (gerçek iki-process tek POST), tests/ **250 passed**. DENETİM: CloseCoordinator
-  üretim döngüsüne BAĞLI DEĞİL (kritik entegrasyon açığı — deploy bloklu).
+  üretim döngüsüne BAĞLI DEĞİL (kritik entegrasyon açığı — inc13'te giderildi).
+- `design/INCREMENT_13_live_wiring.md` — CloseCoordinator'ın GERÇEK open_coin/run_once
+  döngüsüne bağlanması; iki doğrudan market-close `coordinate_close`→`request_close`'a
+  yönlendirildi. **YAZILDI (inc13, 2026-11-12)**; 5 yeni test GREEN (canlı zincir
+  request_close'a ulaşır), davranışsal RED kanıtlı, tests/ **255 passed**. Bağımsız
+  denetim PARTIAL (öz-denetim; reisfurkan-53 çevrimdışı).
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**

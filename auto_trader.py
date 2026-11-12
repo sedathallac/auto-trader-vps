@@ -1021,7 +1021,30 @@ def _reservation_should_keep(create_result) -> bool:
     return create_result.get("outcome") == "UNKNOWN"
 
 
-def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None):
+def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=None):
+    """Route EVERY position close through the single CloseCoordinator authority
+    (inc13). In the live loop a coordinator is always wired, so there is no direct
+    market-close bypass: the close becomes one idempotent, cross-process-guarded,
+    flat-confirmed reduce-only close (HB executor stopped keep_position, pre-sent
+    orders resolved, UNKNOWN -> no blind re-POST). The direct reduce-only fallback
+    is used ONLY when no coordinator is wired (a legacy/dry caller) so a close is
+    never silently skipped."""
+    if coordinator is not None:
+        r = coordinator.request_close(symbol, reason)
+        if r.ok:
+            log.info(f"  ✅ koordineli kapanış [{reason}]: {r.action}")
+        else:
+            log.critical(f"  🚨 koordineli kapanış güvenli durdu [{reason}]: "
+                         f"{r.action} — {r.reason}")
+        return r
+    log.warning(f"  ⚠️ coordinator yok → eski doğrudan reduceOnly kapanış [{reason}]")
+    close_side = "SELL" if side == 1 else "BUY"
+    return binance._post("/fapi/v1/order", {
+        "symbol": symbol, "side": close_side, "type": "MARKET",
+        "quantity": str(amount), "reduceOnly": "true"})
+
+
+def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
     # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü
     try:
         _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
@@ -1196,14 +1219,11 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None):
 
     if not sl_verified:
         log.critical(f"  🚨 SL DOGRULANAMADI! (algoId={algo_id}). Pozisyon acil KAPATILIYOR!")
-        close_side = "SELL" if side == 1 else "BUY"
         try:
-            # Market emri ile pozisyonu kapat (reduceOnly)
-            binance._post("/fapi/v1/order", {
-                "symbol": symbol, "side": close_side, "type": "MARKET",
-                "quantity": str(amount), "reduceOnly": "true"
-            })
-            log.info("  ✅ Pozisyon piyasa emriyle kapatildi.")
+            # Single close authority (inc13): coordinated reduce-only close, not a
+            # raw market POST — idempotent + flat-confirmed + cross-process guarded.
+            coordinate_close(coordinator, binance, symbol, "SL_UNVERIFIED",
+                             side=side, amount=amount)
         except Exception as e:
             log.critical(f"  🚨🚨 ACIL KAPATMA BASARISIZ: {e} !!! MANUEL MUDAHALE GEREKLI !!!")
         
@@ -1228,11 +1248,8 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None):
                         log.info(f"  🔍 Likidasyon={liq} (%{liq_dist*100:.2}) vs SL %{sl_dist*100:.2}")
                         if sl_dist >= liq_dist * 0.7:
                             log.critical("  🚨 SL likidasyona çok yakın — ACİL KAPAT")
-                            close_side = "SELL" if side == 1 else "BUY"
-                            binance._post("/fapi/v1/order", {
-                                "symbol": symbol, "side": close_side, "type": "MARKET",
-                                "quantity": str(amount), "reduceOnly": "true"
-                            })
+                            coordinate_close(coordinator, binance, symbol,
+                                             "LIQ_TOO_CLOSE", side=side, amount=amount)
                             add_blacklist(symbol, "liq_too_close")
                             return False
                     break
@@ -1304,6 +1321,23 @@ def run_once(dry_run=False):
 
     binance = BinanceAPI(bk, bs)
     hb = HBAPI(HB_API, hu, hp)
+
+    # inc13: wire the SINGLE close authority into the live loop. Every position
+    # close routes through this CloseCoordinator (idempotent, flat-confirmed, HB
+    # autonomous closes disabled). Cross-process idempotency uses CloseIntentStore in
+    # the SAME risk ledger db as PositionReserver. On failure -> None, and
+    # coordinate_close falls back to a direct reduce-only close (never skips a close).
+    coordinator = None
+    try:
+        from close_adapter import BinanceHBCloseAdapter
+        from close_coordinator import CloseCoordinator
+        from close_intent import CloseIntentStore
+        _intent = CloseIntentStore(risk.db_file)
+        _intent.init_schema()
+        coordinator = CloseCoordinator(BinanceHBCloseAdapter(binance, hb),
+                                       intent_store=_intent)
+    except Exception as e:
+        log.critical(f"🚨 CloseCoordinator kurulamadı, fallback doğrudan kapanış: {e}")
 
     # FAZ 1.2: Günlük reset kontrolü
     today = datetime.now().date().isoformat()
@@ -1388,7 +1422,8 @@ def run_once(dry_run=False):
             log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
             break
         try:
-            if open_coin(binance, hb, c, dry_run=dry_run, risk=risk, reserver=reserver):
+            if open_coin(binance, hb, c, dry_run=dry_run, risk=risk, reserver=reserver,
+                         coordinator=coordinator):
                 ok += 1
         except Exception as e:
             log.exception(f"{c['symbol']} istisna: {e}")
