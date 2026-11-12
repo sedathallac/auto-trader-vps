@@ -26,7 +26,7 @@ reduce-only/positionSide close.
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict
 
 
 class CloseState(str, Enum):
