@@ -55,15 +55,17 @@ def check_heartbeat():
         return False
 
 
-def scan_and_kill():
+def scan_and_kill(binance=None):
     check_heartbeat()
     from auto_trader import BinanceAPI
-    bk = os.environ.get("BINANCE_KEY")
-    bs = os.environ.get("BINANCE_SECRET")
-    if not bk or not bs:
-        log.error("BINANCE_KEY/SECRET yok")
-        return
-    b = BinanceAPI(bk, bs)
+    if binance is None:
+        bk = os.environ.get("BINANCE_KEY")
+        bs = os.environ.get("BINANCE_SECRET")
+        if not bk or not bs:
+            log.error("BINANCE_KEY/SECRET yok")
+            return
+        binance = BinanceAPI(bk, bs)
+    b = binance
 
     # 1. Açık pozisyonlar
     positions = b.position_risk()
@@ -71,6 +73,18 @@ def scan_and_kill():
         log.error(f"positionRisk hata: {positions}")
         return
     open_syms = {p["symbol"] for p in positions if float(p["positionAmt"]) != 0}
+
+    # ROOT-CAUSE FIX (inc8): SL protection for OPEN positions runs INDEPENDENT of
+    # the orphan list. Previously ensure_sl_coverage was only reached at the end,
+    # so an empty to_check (open positions but no closed-symbol orphans) returned
+    # early and skipped SL coverage for open positions entirely (the SOLUSDT
+    # class). Order cleanup and position protection are now separate concerns.
+    if open_syms:
+        try:
+            from auto_trader import ensure_sl_coverage
+            ensure_sl_coverage(b)
+        except Exception as e:
+            log.exception(f"ensure_sl_coverage: {e}")
 
     # 2. Tracked listesi güncelle (açık olanları ekle)
     tracked = load_tracked() | open_syms
@@ -114,13 +128,8 @@ def scan_and_kill():
         except Exception as e:
             log.error(f"  ❌ {sym}: {e}")
     save_tracked(tracked)
-
-    # 4. SL koruması (eksikse ekle)
-    try:
-        from auto_trader import ensure_sl_coverage
-        ensure_sl_coverage(b)
-    except Exception as e:
-        log.debug(f"ensure_sl: {e}")
+    # NOTE: SL protection for open positions already ran above (inc8), independent
+    # of the orphan list, so it is not repeated here.
 
 
 def main():
