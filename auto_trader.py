@@ -1201,6 +1201,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     err = ex.get("error_count", 0) if ex else 999
     if filled < 1 or err > 0:
         log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err}")
+        # Faz2 execution robustness: stop the unfilled/errored executor
+        # (keep_position=True so any partial fill becomes a position that
+        # ensure_sl_coverage/orphan_killer will protect) and RELEASE the reserved
+        # slot. Exchange positions are always counted in the cap (used = exchange ∪
+        # reservations), so releasing never under-counts; this prevents a leaked
+        # PENDING reservation from starving MAX_OPEN_POSITIONS until reconcile's TTL.
+        try:
+            hb.stop_executor(eid, keep_position=True)
+        except Exception as e:
+            log.warning(f"  executor durdurma hatası (dolmadı): {e}")
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="not_filled")
+            log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
         add_blacklist(symbol, "dolmadı")
         return False
     log.info(f"  ✅ doldu: {filled:.2f} USDT")
