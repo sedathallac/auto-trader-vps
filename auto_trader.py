@@ -280,8 +280,17 @@ def build_executor_config(symbol, amount, lev, side):
     on a NON keep_position stop (POSITION_HOLD stops without placing a close). So
     with all four None, no SL / market-TP / limit-TP / trailing / time-limit close
     can be produced. The exchange reduceOnly STOP_MARKET algo order is the sole SL
-    authority; TP and time-limit become CloseCoordinator responsibilities
-    (CloseCoordinator.request_take_profit / request_time_limit).
+    authority.
+
+    E-1 (live exit policy — documented, not a strategy change): the ONLY live exits
+    are (1) the exchange algo SL filling autonomously, and (2) the coordinator-routed
+    emergency close (SL unverified / liquidation-adjacent). There is deliberately NO
+    TP or time-limit exit in the live loop: HB's autonomous TP/time-limit stay
+    disabled here, and NO production code calls CloseCoordinator.request_take_profit /
+    request_time_limit. Those remain available interfaces for a FUTURE increment;
+    adding a trigger is a strategy change and is OUT OF SCOPE. The tp / time-limit
+    values passed to create_executor are accepted for signature compatibility and
+    ignored (never handed to HB as barriers).
     """
     return {
         "type": "position_executor",
@@ -316,7 +325,9 @@ class HBAPI:
         K1=B: the executor is created with NO autonomous close barriers (see
         build_executor_config). sl/tp/tl are accepted for signature compatibility
         but are NOT handed to Hummingbot as barriers — the exchange algo SL is the
-        sole SL authority and TP/time-limit route through the CloseCoordinator."""
+        sole SL authority. E-1: there is no live TP/time-limit trigger (SL-only exit
+        policy); request_take_profit/request_time_limit exist for a future increment
+        but are not called in the live loop."""
         pair = symbol.replace("USDT", "-USDT")
         try:
             before = self._active_ids_for(pair)
