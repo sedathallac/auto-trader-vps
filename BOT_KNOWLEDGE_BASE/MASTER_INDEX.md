@@ -23,6 +23,15 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 - `CLOSECOORDINATOR_ACCEPTANCE_REPORT.md` — CloseCoordinator + SL/migration (inc3–inc12)
   bütünleşik kabul raporu. HEAD `21cfd7f`, **229 passed**, üretime geçilmedi. **YAZILDI (2026-11-12)**
 
+## Bağımsız denetimler
+- `REVIEWS/REVIEW_release_blockers_3d48b18_2026-11-12.md` — release blocker fix'lerinin
+  (C-1/B-1/F-1/E-1) salt-okunur bağımsız son denetimi (branch `feature/futures-release-
+  blockers`, HEAD `3d48b18`). Dört fix kod+test düzeyinde **VERIFIED**; bağımsız
+  regresyon **271 passed** (exit 0), ruff F/E9 + py_compile temiz. Kalan: C-1 canlı HB
+  order_ids şekli NO EVIDENCE (fix güvenli), B-1 `coordinate_close` docstring güncel
+  değil (minor), E-1 SL-only çıkış politikası strateji riski (kullanıcı kararı).
+  Kritik/yüksek yeni açık bulgu YOK. **(Commit edilmedi — denetim salt-okunur.)**
+
 ## Dizin yapısı ve durum
 - `findings/2026-11-11_sol_double_close.md` — SOL olayı forensic. **YAZILDI**
 - `findings/INCREMENT_11_sol_double_close_regression.md` — SOL çift-kapatma GERÇEK-KOD
