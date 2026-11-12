@@ -659,14 +659,52 @@ def ensure_sl_coverage(binance):
         if not open_pos:
             log.info("SL kontrolü: açık pozisyon yok")
             return
-        covered = set()
-        for sym in open_pos:
-            covered |= {o["symbol"] for o in binance.open_algo_orders_for(sym)}
-        missing = [s for s in open_pos if s not in covered]
+        # RC-2 fix: validate REAL protective coverage mode-aware via the inc10.1
+        # sl_status (NOT "any algo order exists"). For each open position the real
+        # positionRisk amount, ONEWAY/HEDGE mode, side, symbol, order type, side,
+        # positionSide, reduceOnly|closePosition, quantity (full coverage) and order
+        # status are evaluated together -> PRESENT / ABSENT / UNKNOWN:
+        #   PRESENT -> fully protected; do NOT send a second SL.
+        #   ABSENT (ONEWAY) -> place via the EXISTING place_algo_sl mechanism below.
+        #   UNKNOWN -> cannot verify; never place a blind SL; CRITICAL + block entries.
+        #   HEDGE without a valid existing SL -> fail-closed (no unsupported combo).
+        from close_adapter import (BinanceHBCloseAdapter,
+                                    SL_PRESENT, SL_UNKNOWN)
+        adapter = BinanceHBCloseAdapter(binance, None)  # sl_status uses only binance
+        _ok, mode = _verify_oneway(binance)             # "ONEWAY" | "HEDGE" | "UNKNOWN"
+        missing = []
+        for sym, p in open_pos.items():
+            amt = float(p["positionAmt"])
+            side = "LONG" if amt > 0 else "SHORT"
+            if mode == "UNKNOWN":
+                status = SL_UNKNOWN                      # mode unverifiable -> fail-closed
+            else:
+                status = adapter.sl_status(sym, side, mode=mode, position_amt=abs(amt))
+            if status == SL_PRESENT:
+                _OPEN_UNPROTECTED.pop(sym, None)         # fully protected -> clear alarm
+                continue
+            if status == SL_UNKNOWN:
+                _OPEN_UNPROTECTED[sym] = _OPEN_UNPROTECTED.get(sym)  # keep -2021 if any
+                log.critical(f"🚨 OPEN_UNPROTECTED {sym}: SL durumu DOĞRULANAMADI "
+                             f"(UNKNOWN) — korumasız sayıldı; yeni giriş durduruldu; "
+                             f"kör SL GÖNDERİLMEDİ")
+                continue
+            # SL_ABSENT: no valid full-coverage SL exists for this position.
+            if mode == "HEDGE":
+                _OPEN_UNPROTECTED[sym] = _OPEN_UNPROTECTED.get(sym)
+                log.critical(f"🚨 OPEN_UNPROTECTED {sym}: HEDGE modda geçerli SL yok; "
+                             f"HEDGE SL gönderme yolu YOK — fail-closed; yeni giriş "
+                             f"durduruldu; desteklenmeyen emir GÖNDERİLMEDİ")
+                continue
+            missing.append(sym)                         # ONEWAY + ABSENT -> place SL
         if not missing:
-            log.info(f"✅ SL koruması tam ({len(open_pos)} pozisyon)")
+            if _OPEN_UNPROTECTED:
+                log.warning(f"⚠️  SL doğrulanamayan/eksik (fail-closed): "
+                            f"{sorted(_OPEN_UNPROTECTED)}")
+            else:
+                log.info(f"✅ SL koruması tam ({len(open_pos)} pozisyon)")
             return
-        log.warning(f"⚠️  SL eksik: {missing}")
+        log.warning(f"⚠️  SL eksik (ONEWAY, yerleştirilecek): {missing}")
         for sym in missing:
             try:
                 # Stop uncontrolled retry: a symbol already flagged -2021 is NOT

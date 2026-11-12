@@ -25,7 +25,11 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
   regresyonu (CloseCoordinator→adapter→BinanceAPI, yalnızca `_session` mock).
   **YAZILDI (inc11, 2026-11-12)**; 12 test+1 xfail GREEN, davranışsal RED kanıtlı,
   tests/ **187 passed, 1 xfailed**. AYRI KÖK NEDEN RC-2: `ensure_sl_coverage` kapsama
-  kontrolü zayıf (sadece algo emri varlığı) → inc11.1 önerildi.
+  kontrolü zayıf (sadece algo emri varlığı) → inc11.1'de DÜZELTİLDİ.
+- `design/INCREMENT_11_1_sl_coverage_fix.md` — RC-2 düzeltmesi: `ensure_sl_coverage`
+  artık inc10.1 mode-aware `sl_status` kullanır (PRESENT/ABSENT/UNKNOWN, tam kapsama).
+  **YAZILDI (inc11.1, 2026-11-12)**; 17 yeni test GREEN, davranışsal RED (12 yanlış-değer),
+  tests/ **204 passed, 0 xfailed**.
 - `design/safe_close_architecture.md` — tek kapanış otoritesi. **YAZILDI**
 - `design/archiver_algo_order_model.md` — algo emir arşivi. **YAZILDI (tasarım)**
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**

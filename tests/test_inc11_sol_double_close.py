@@ -332,13 +332,10 @@ class TestSolDoubleClose(SolBase):
 
 
 class TestSlCoverageRootCause(unittest.TestCase):
-    """RC-2 (separate root cause, REPORTED not fixed here): ensure_sl_coverage's
-    coverage check (auto_trader.py:664) only tests that SOME algo order exists for
-    the symbol — not STOP_MARKET / side / positionSide / reduceOnly|closePosition /
-    quantity / status. An unrelated or terminal algo order makes an UNPROTECTED
-    position look covered, so no SL is placed. inc10.1 sl_status already validates
-    these; a follow-up (inc11.1) should route ensure_sl_coverage through it. No
-    scope-creep fix is applied in inc11; this records the gap behaviourally."""
+    """RC-2 — FIXED in inc11.1: ensure_sl_coverage no longer treats ANY algo order
+    as coverage; it validates mode-aware full protection via inc10.1 sl_status. The
+    inc11 finding is kept here as a locked regression (a TAKE_PROFIT algo order must
+    NOT count as an SL). Full RC-2 behaviour is covered in test_inc111_sl_coverage."""
 
     class _FakeBinanceSL:
         def __init__(self, algo):
@@ -346,30 +343,32 @@ class TestSlCoverageRootCause(unittest.TestCase):
             self.placed = []
         def position_risk(self):
             return [{"symbol": SYM, "positionAmt": "0.3", "entryPrice": "83.08"}]
+        def position_mode(self):
+            return {"dualSidePosition": False}       # ONEWAY
+        def open_algo_orders_raw(self, sym):
+            return list(self._algo)
         def open_algo_orders_for(self, sym):
             return list(self._algo)
         def filters(self, sym):
             return {"PRICE_FILTER": {"tickSize": "0.01"}}
+        def _get(self, path, params=None, signed=False):
+            return []
         def place_algo_sl(self, sym, trig, qty, side):
             self.placed.append((sym, trig, qty, side))
             return {"algoId": 1}
 
-    @unittest.expectedFailure
-    def test_nonstop_algo_order_should_not_count_as_coverage(self):
-        # Only a TAKE_PROFIT algo order exists -> the position has NO real SL, so an
-        # SL SHOULD be placed. Current code counts it as covered -> no SL placed.
-        fb = self._FakeBinanceSL([{"symbol": SYM, "type": "TAKE_PROFIT_MARKET",
-                                   "algoStatus": "WORKING"}])
-        auto_trader.ensure_sl_coverage(fb)
-        self.assertEqual(len(fb.placed), 1)   # EXPECTED-FAIL today: placed stays []
+    def setUp(self):
+        auto_trader._OPEN_UNPROTECTED.clear()
 
-    def test_documents_current_weak_behavior(self):
-        # Pin the CURRENT (weak) behavior so the regression is explicit: a non-STOP
-        # algo order is wrongly treated as coverage -> no SL is placed.
+    def tearDown(self):
+        auto_trader._OPEN_UNPROTECTED.clear()
+
+    def test_nonstop_algo_order_not_coverage_sl_placed(self):
+        # Only a TAKE_PROFIT algo order exists -> NOT a real SL -> an SL is placed.
         fb = self._FakeBinanceSL([{"symbol": SYM, "type": "TAKE_PROFIT_MARKET",
                                    "algoStatus": "WORKING"}])
         auto_trader.ensure_sl_coverage(fb)
-        self.assertEqual(fb.placed, [])       # RC-2: unprotected but seen as covered
+        self.assertEqual(len(fb.placed), 1)          # RC-2 fixed: no longer "covered"
 
 
 if __name__ == "__main__":
