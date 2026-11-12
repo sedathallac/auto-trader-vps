@@ -19,6 +19,10 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 | Spot Grid (`/opt/gridc0`) | **EVET (CANLI, düzeltildi)** | Yüksek; paket+30 test+Decimal | B1.8 LIVE; 16 açık emir (BTC+ETH); testler koşulmadı |
 | Hummingbot (container) | Futures için aracı | dev-2.18.0 | ONEWAY reduceOnly'siz kapanış |
 
+## Bütünleşik kabul
+- `CLOSECOORDINATOR_ACCEPTANCE_REPORT.md` — CloseCoordinator + SL/migration (inc3–inc12)
+  bütünleşik kabul raporu. HEAD `21cfd7f`, **229 passed**, üretime geçilmedi. **YAZILDI (2026-11-12)**
+
 ## Dizin yapısı ve durum
 - `findings/2026-11-11_sol_double_close.md` — SOL olayı forensic. **YAZILDI**
 - `findings/INCREMENT_11_sol_double_close_regression.md` — SOL çift-kapatma GERÇEK-KOD
