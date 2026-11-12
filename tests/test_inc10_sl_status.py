@@ -15,16 +15,20 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from close_adapter import (BinanceHBCloseAdapter, SL_PRESENT, SL_ABSENT, SL_UNKNOWN)
-from migration import migrate_all, block_new_entries, UNKNOWN
+from migration import migrate_all, block_new_entries, UNKNOWN, HEDGE
 
 SYM = "SOLUSDT"
 PAIR = "SOL-USDT"
 
 
-def _stop(symbol="SOLUSDT", status="WORKING", typ="STOP_MARKET",
-          reduce_only=True, position_side="BOTH"):
-    return {"symbol": symbol, "type": typ, "algoStatus": status,
-            "reduceOnly": reduce_only, "positionSide": position_side}
+def _stop(symbol="SOLUSDT", status="WORKING", typ="STOP_MARKET", reduce_only=True,
+          position_side="BOTH", quantity="1.0", close_position=False, side=None):
+    o = {"symbol": symbol, "type": typ, "algoStatus": status,
+         "reduceOnly": reduce_only, "positionSide": position_side,
+         "quantity": quantity, "closePosition": close_position}
+    if side is not None:
+        o["side"] = side
+    return o
 
 
 class RawBinance:
@@ -39,8 +43,9 @@ class RawBinance:
         return self._raw
 
 
-def _sl(raw, position_side=None):
-    return BinanceHBCloseAdapter(RawBinance(raw), hb=None).sl_status(SYM, position_side)
+def _sl(raw, position_side=None, mode="ONEWAY", position_amt="0.3"):
+    return BinanceHBCloseAdapter(RawBinance(raw), hb=None).sl_status(
+        SYM, position_side, mode=mode, position_amt=position_amt)
 
 
 class TestSlStatusTriState(unittest.TestCase):
@@ -83,14 +88,17 @@ class TestSlStatusTriState(unittest.TestCase):
         self.assertEqual(_sl([_stop(position_side="BOTH")], position_side="LONG"),
                          SL_PRESENT)
 
-    # HEDGE: the SL must guard THIS side.
+    # HEDGE: the SL must guard THIS side with the closePosition form.
     def test_hedge_matching_side_present(self):
-        self.assertEqual(_sl([_stop(position_side="SHORT")], position_side="SHORT"),
-                         SL_PRESENT)
+        o = _stop(position_side="SHORT", side="BUY", reduce_only=False,
+                  close_position=True)
+        self.assertEqual(_sl([o], position_side="SHORT", mode=HEDGE), SL_PRESENT)
 
     def test_hedge_wrong_side_absent(self):
         # a LONG-side SL does not protect the SHORT position -> no match -> ABSENT
-        self.assertEqual(_sl([_stop(position_side="LONG")], position_side="SHORT"),
+        o = _stop(position_side="LONG", side="SELL", reduce_only=False,
+                  close_position=True)
+        self.assertEqual(_sl([o], position_side="SHORT", mode=HEDGE),
                          SL_ABSENT)
 
     def test_non_reduce_only_stop_not_protective(self):

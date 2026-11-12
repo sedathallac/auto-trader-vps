@@ -109,7 +109,7 @@ class PositionMigrator:
         # 6) verify the exchange SL by real tri-state status (PRESENT/ABSENT/UNKNOWN).
         # side is passed so a HEDGE SL is matched to THIS position side.
         try:
-            sl = self.ex.sl_status(symbol, side)
+            sl = self.ex.sl_status(symbol, side, mode=mode, position_amt=abs(amt2))
         except Exception as e:
             return MigrationResult(symbol, UNKNOWN, f"sl_status failed: {e}",
                                    amt=amt2, side=side, mode=mode, critical=True)

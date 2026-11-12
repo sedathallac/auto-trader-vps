@@ -29,6 +29,14 @@ SL_UNKNOWN = "UNKNOWN"   # timeout/exception/API error/malformed/wrong symbol ->
 # Algo-order statuses that mean the SL is still live (protecting the position).
 _SL_LIVE = {"", "NEW", "WORKING", "ACTIVE", "LIVE"}
 
+# Protective STOP side for a given position side (close direction).
+_PROTECTIVE_SIDE = {"LONG": "SELL", "SHORT": "BUY"}
+
+
+def _truthy(v):
+    """Binance sends booleans as bool or the strings 'true'/'false'."""
+    return v is True or str(v).strip().lower() == "true"
+
 
 # REGULAR-order statuses that mean the order can no longer fill (TERMINAL).
 # NEW / PARTIALLY_FILLED / PENDING_CANCEL / WORKING / missing / unknown -> NON
@@ -178,18 +186,29 @@ class BinanceHBCloseAdapter:
             return False  # cancel send failed -> UNKNOWN
         return self._query_terminal(o)
 
-    def sl_status(self, symbol, position_side=None):
-        """Tri-state verification of the exchange reduceOnly STOP algo SL (K1=B).
-        Uses open_algo_orders_raw() so an outage is NEVER mistaken for 'no SL':
+    def sl_status(self, symbol, position_side=None, mode=None, position_amt=None):
+        """Mode-aware tri-state verification of the exchange STOP algo SL (K1=B),
+        validated against the REAL Binance ONEWAY/HEDGE order contract. Uses
+        open_algo_orders_raw() so an outage is NEVER mistaken for 'no SL'.
 
-          SL_PRESENT - query succeeded, response valid, a live protective STOP algo
-                       order for THIS symbol exists (and, when position_side is
-                       given, guards THIS side; a BOTH / ONEWAY order matches).
-          SL_ABSENT  - query succeeded, response valid, no such SL -> UNPROTECTED.
+          SL_PRESENT - query ok + valid + a LIVE STOP_MARKET algo order that FULLY
+                       protects THIS position under its mode (see below).
+          SL_ABSENT  - query ok + valid + no order gives full valid coverage.
           SL_UNKNOWN - timeout / exception / API error dict / malformed payload /
                        an order for the WRONG symbol (unverifiable match) -> HALT.
 
-        Never sends an order and never changes a stop price (read-only)."""
+        Valid full-coverage protection (nothing else is accepted):
+          ONEWAY  - positionSide BOTH or absent, close-direction `side`, and EITHER
+                    closePosition=true, OR reduceOnly=true with quantity >= the full
+                    position amount (partial quantity is NOT full coverage).
+          HEDGE   - positionSide == THIS side, close-direction `side`, STOP_MARKET,
+                    closePosition=true, and reduceOnly NOT true (Binance rejects
+                    reduceOnly in hedge mode -> such a combo is not a valid SL).
+
+        mode defaults to ONEWAY (production places ONEWAY reduceOnly STOP_MARKET via
+        place_algo_sl). position_amt (abs) is required to confirm reduceOnly coverage;
+        without it a reduceOnly-with-quantity order cannot be confirmed as full.
+        Read-only: never sends an order, never changes a stop price."""
         try:
             r = self.binance.open_algo_orders_raw(symbol)
         except Exception:
@@ -201,6 +220,15 @@ class BinanceHBCloseAdapter:
             r = orders
         if not isinstance(r, list):
             return SL_UNKNOWN                      # non-list, non-dict -> unverifiable
+
+        is_hedge = (mode == HEDGE)
+        pos_side = position_side.upper() if position_side else None
+        want_side = _PROTECTIVE_SIDE.get(pos_side) if pos_side else None
+        try:
+            want_qty = abs(Decimal(str(position_amt))) if position_amt is not None else None
+        except Exception:
+            want_qty = None
+
         for o in r:
             if not isinstance(o, dict):
                 return SL_UNKNOWN                  # malformed element
@@ -209,14 +237,43 @@ class BinanceHBCloseAdapter:
             typ = str(o.get("type") or o.get("algoType") or "").upper()
             st = str(o.get("algoStatus") or o.get("status") or "").upper()
             if "STOP" not in typ or st not in _SL_LIVE:
-                continue
-            if o.get("reduceOnly") is False:
-                continue                           # non-reduceOnly STOP is not protective
-            if position_side:                      # HEDGE: SL must guard THIS side
-                psl = str(o.get("positionSide") or "").upper()
-                if psl and psl not in ("BOTH", position_side.upper()):
+                continue                           # not a STOP, or terminal -> not protective
+            o_side = str(o.get("side") or "").upper()
+            if want_side and o_side and o_side != want_side:
+                continue                           # wrong close direction -> not protective
+            o_pside = str(o.get("positionSide") or "").upper()
+            reduce_only = _truthy(o.get("reduceOnly"))
+            close_pos = _truthy(o.get("closePosition"))
+
+            if is_hedge:
+                # HEDGE: positionSide must guard THIS side; closePosition covers full;
+                # reduceOnly is invalid in hedge mode -> reject the combo.
+                if pos_side and o_pside != pos_side:
                     continue
-            return SL_PRESENT
+                if reduce_only:
+                    continue                       # unsupported ONEWAY-style combo in hedge
+                if not close_pos:
+                    continue                       # partial/quantity SL not accepted in hedge
+                return SL_PRESENT
+            else:
+                # ONEWAY: positionSide BOTH or absent.
+                if o_pside and o_pside != "BOTH":
+                    continue
+                if close_pos:
+                    return SL_PRESENT              # closePosition closes the whole position
+                if reduce_only:
+                    if want_qty is None:
+                        continue                   # coverage unverifiable -> not confirmed full
+                    try:
+                        o_qty = abs(Decimal(str(o.get("quantity")
+                                                 or o.get("origQty") or "0")))
+                    except Exception:
+                        continue
+                    if o_qty >= want_qty and o_qty > 0:
+                        return SL_PRESENT          # full-position reduceOnly coverage
+                    continue                       # insufficient quantity -> not full
+                # neither closePosition nor reduceOnly -> not a protective SL
+                continue
         return SL_ABSENT
 
     def stop_executor(self, symbol):

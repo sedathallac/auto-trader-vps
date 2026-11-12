@@ -26,8 +26,9 @@ Son güncelleme: 2026-11-12 · Uygulama ortamı: Zorin (`~/auto_trader`), `featu
 - `design/K1_DECISION_exchange_sl_authority.md` — K1=B kararı (borsa SL tek otorite). **YAZILDI**
 - `design/INCREMENT_10_position_migration.md` — açık pozisyon güvenli migration/handoff
   + `sl_status` tri-state (PRESENT/ABSENT/UNKNOWN) sertleştirme.
-  **YAZILDI (inc10, 2026-11-12)**; `migration.py` + `open_algo_orders_raw`, 17+16 test GREEN,
-  davranışsal RED kanıtlı (4+6 yanlış-değer), tests/ **162 passed**.
+  **YAZILDI (inc10 + inc10.1, 2026-11-12)**; `migration.py` + `open_algo_orders_raw` +
+  mode-aware (ONEWAY/HEDGE) tam-koruma doğrulaması. 17+16+13 test GREEN, davranışsal
+  RED kanıtlı (4+6+6 yanlış-değer), tests/ **175 passed**.
 - `architecture/system_overview.md` — üç bileşen. **YAZILDI**
 - `architecture/zorin_toolchain.md` — Zorin araçları. **DOĞRULANDI**
 - `architecture/SPOT_GRID_ARCHITECTURE.md` — GridC0. **YAZILDI (bu tur)**

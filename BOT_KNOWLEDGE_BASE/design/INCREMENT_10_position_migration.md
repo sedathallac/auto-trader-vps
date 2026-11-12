@@ -95,6 +95,41 @@ gerçek Binance'e karşı KOŞULMADI (canlı emir yok). `open_algo_orders_raw` `
 dayanır; `_get` istisnayı yakalamaz, dolayısıyla timeout/exception sl_status'un
 try/except'ine ulaşır → canlı belirsizlik kök nedeni (yutma) kaldırıldı.
 
+## MODE-AWARE SL VALIDATION (inc10.1 ek commit, 2026-11-12)
+Korunan HEAD: `569c5ec`. Amaç: tri-state sınıflandırmayı gerçek Binance
+ONEWAY/HEDGE emir sözleşmesine uydurmak ve PRESENT'i **tam koruma** şartına bağlamak.
+
+Kaynak koddan çıkarılan gerçek sözleşme (tahmin değil):
+- `place_algo_sl()` tek SL yerleştirme metodu → `POST /fapi/v1/algoOrder`,
+  `algoType=CONDITIONAL`, `type=STOP_MARKET`, `side=SELL`(long)/`BUY`(short),
+  `triggerPrice`, **`quantity=abs(positionAmt)` (tam pozisyon)**, `reduceOnly=true`.
+  `positionSide`/`closePosition` GÖNDERİLMİYOR → üretim **ONEWAY reduceOnly STOP_MARKET**.
+- `ensure_sl_coverage()` kapsama tespiti şu an zayıf (sadece "sembole ait herhangi
+  bir algo emri var mı"); tip/side/quantity/reduceOnly doğrulamıyor. inc10.1 bu
+  boşluğu `sl_status` düzeyinde kapatır.
+
+`sl_status(symbol, position_side, mode, position_amt)` artık mode-aware; PRESENT
+yalnızca pozisyonun TAMAMI geçerli biçimde korunuyorsa:
+- **ONEWAY**: positionSide BOTH/yok, kapanış yönünde `side`, VE (`closePosition=true`
+  YA DA `reduceOnly=true` + `quantity >= tam pozisyon`). Kısmi quantity → tam değil.
+- **HEDGE**: positionSide == bu side, kapanış yönünde `side`, `STOP_MARKET`,
+  `closePosition=true`, `reduceOnly` true DEĞİL (hedge'de reduceOnly Binance
+  tarafından reddedilir → geçersiz kombinasyon kabul edilmez).
+Yanlış sembol→UNKNOWN; yanlış side/positionSide→PRESENT değil; yetersiz/eksik
+quantity→tam koruma yok; terminal algo→PRESENT değil; API hata/timeout→UNKNOWN;
+geçerli sorgu+uygun SL yok→ABSENT. Migrator step-6 `mode` ve `abs(amt2)` geçirir.
+
+RED/GREEN: 12 zorunlu senaryo (+1 eksik-quantity) GREEN (13 test). Davranışsal RED:
+mode-aware blok pre-10.1 gevşek kontrole ("canlı reduceOnly STOP = PRESENT")
+düşürüldü → **6 test yanlış-DEĞER ile düştü** (HEDGE reduceOnly kombinasyonu, yanlış
+side, yanlış positionSide, yetersiz/eksik quantity → yanlış PRESENT; geçersiz HEDGE
+SL → yanlış MIGRATED). Geri alındı → GREEN. tests/ **175 passed** (162→+13).
+Ruff F,E9 temiz; py_compile temiz.
+
+NOT (PARTIAL): `place_algo_sl` üretimde yalnızca ONEWAY reduceOnly biçimini GÖNDERİR;
+sl_status HEDGE closePosition biçimini de DOĞRULAR (ör. elle/dışarıdan konan SL),
+ama HEDGE SL GÖNDERME yolu üretimde yok (ayrı iş). Canlı Binance'e karşı koşulmadı.
+
 ## Kapsam dışı (bu increment değil)
 Gerçek SL yerleştirme, SOLUSDT gerçek-kod regresyon fikstürü (inc11),
 eşzamanlılık/restart entegrasyonu (inc12). Bunlar ayrı onay bekler.

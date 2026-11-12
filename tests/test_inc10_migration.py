@@ -59,8 +59,10 @@ class MockEx:
         self.cancelled.append(o)
         return bool(o.get("cancel_ok", True))
 
-    def sl_status(self, s, position_side=None):
+    def sl_status(self, s, position_side=None, mode=None, position_amt=None):
         self.sl_side = position_side
+        self.sl_mode = mode
+        self.sl_amt = position_amt
         if isinstance(self._sl, Exception):
             raise self._sl
         return self._sl
@@ -123,7 +125,7 @@ class TestMigration(unittest.TestCase):
             def protective_orders(self, s): return []
             def order_terminal(self, o): return True
             def cancel_order(self, o): return True
-            def sl_status(self, s, position_side=None): return SL_PRESENT
+            def sl_status(self, s, position_side=None, mode=None, position_amt=None): return SL_PRESENT
         res = migrate_all(_Multi(), ["SOLUSDT", "ETHUSDT"])
         self.assertEqual(res["SOLUSDT"].state, MIGRATED)
         self.assertEqual(res["ETHUSDT"].state, NOT_OPEN)
