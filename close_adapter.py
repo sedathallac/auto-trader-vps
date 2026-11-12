@@ -169,6 +169,23 @@ class BinanceHBCloseAdapter:
             return False  # cancel send failed -> UNKNOWN
         return self._query_terminal(o)
 
+    def sl_status(self, symbol):
+        """Verify the exchange reduceOnly STOP algo SL (the K1=B authority) by its
+        real state. PROTECTED when a live STOP algo order exists; UNPROTECTED when
+        none; UNKNOWN when the algo-order query is unavailable. NOTE: the current
+        BinanceAPI.open_algo_orders_for() returns [] on an API error, so UNKNOWN
+        from a live API failure is not always distinguishable here -> live
+        behaviour is PARTIAL (the migrator logic is fully tested via a mock)."""
+        r = self.binance.open_algo_orders_for(symbol)
+        if not isinstance(r, list):
+            return "UNKNOWN"
+        for o in r:
+            typ = str(o.get("type") or o.get("algoType") or "").upper()
+            st = str(o.get("algoStatus") or o.get("status") or "").upper()
+            if "STOP" in typ and st in ("", "NEW", "WORKING", "ACTIVE", "LIVE"):
+                return "PROTECTED"
+        return "UNPROTECTED"
+
     def stop_executor(self, symbol):
         pair = symbol.replace("USDT", "-USDT")
         execs = self.hb.active_executors()
