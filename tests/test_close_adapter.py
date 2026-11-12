@@ -45,11 +45,11 @@ class FakeBinance:
     def cancel_algo_order(self, aid):
         return self._cancel
 
-    def cancel_order(self, symbol, oid):
-        return getattr(self, "_cancel_resp", {"orderId": oid, "status": "CANCELED"})
+    def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
+        return getattr(self, "_cancel_resp", {"orderId": order_id, "status": "CANCELED"})
 
-    def query_order(self, symbol, oid):
-        return getattr(self, "_query_resp", {"orderId": oid, "status": "CANCELED"})
+    def query_order(self, symbol, order_id=None, orig_client_order_id=None):
+        return getattr(self, "_query_resp", {"orderId": order_id, "status": "CANCELED"})
 
     def _post(self, path, params):
         self.posts.append((path, dict(params)))

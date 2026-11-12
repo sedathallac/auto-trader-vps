@@ -61,11 +61,12 @@ class BinanceHBCloseAdapter:
         hedge = (v.strip().lower() == "true") if isinstance(v, str) else bool(v)
         return HEDGE if hedge else ONEWAY
 
-    def _hb_order_ids(self, symbol) -> set:
+    def _hb_order_ids(self, symbol):
         """Client order ids tracked by THIS symbol's HB executor (_open_order /
         _close_order / _take_profit_limit_order, via get_custom_info.order_ids).
-        Raises on an unavailable executor list (fail-closed). Empty set when no
-        executor exists for the pair."""
+        Raises on an unavailable executor list (API error -> fail-closed). Returns
+        a set when the executor is found (possibly empty), or None when NO executor
+        exists for the pair (unknown attribution)."""
         pair = symbol.replace("USDT", "-USDT")
         execs = self.hb.active_executors()
         if not isinstance(execs, list):
@@ -75,45 +76,68 @@ class BinanceHBCloseAdapter:
                 info = e.get("custom_info") or {}
                 ids = info.get("order_ids")
                 return set(ids) if isinstance(ids, list) else set()
-        return set()
+        return None
 
     def protective_orders(self, symbol) -> list:
-        """ONLY this position's pre-sent HB close/TP orders — the exchange
-        openOrders whose clientOrderId matches the HB executor's tracked order ids.
-        Unrelated normal orders are NEVER returned (so never cancelled). If open
-        orders exist but the HB mapping is unavailable, the handoff is UNKNOWN ->
-        raise (fail-closed); we never bulk-cancel unrelated orders. The reduceOnly
-        algo SL (the NEW authority) is a different endpoint and not included."""
+        """The orders tracked by THIS symbol's HB executor. get_custom_info.order_ids
+        is [self._open_order, self._close_order, self._take_profit_limit_order]
+        client ids (proven from dev-2.18.0 source) — a flat list with NO role label,
+        so the ENTRY open order is included and must be resolved too (a still-live
+        entry blocks the handoff; it is NOT pre-judged a close/TP). Each tracked id
+        is returned as its live exchange order (matched by clientOrderId in
+        openOrders) or as a stub {symbol, clientOrderId} so order_terminal can query
+        it by origClientOrderId even when it is no longer resting. Unrelated open
+        orders are NEVER returned (never cancelled). If the HB executor list is
+        unavailable the handoff is UNKNOWN -> raise (fail-closed)."""
         orders = self.binance.open_orders(symbol)
         if not isinstance(orders, list):
             raise CloseAdapterError(
                 f"openOrders [GET /fapi/v1/openOrders] unavailable for {symbol}: {orders}")
-        if not orders:
+        hb_ids = self._hb_order_ids(symbol)  # raises if the executor list is unavailable
+        if hb_ids is None:
+            # No HB executor for this pair. If there are open orders we cannot
+            # attribute them -> UNKNOWN handoff (fail-closed); unrelated orders are
+            # never bulk-cancelled. No open orders -> nothing to resolve.
+            if orders:
+                raise CloseAdapterError(
+                    f"{len(orders)} open order(s) for {symbol} but no HB executor "
+                    f"-> UNKNOWN handoff (fail-closed; unrelated orders untouched)")
             return []
-        hb_ids = self._hb_order_ids(symbol)
         if not hb_ids:
-            raise CloseAdapterError(
-                f"{len(orders)} open order(s) for {symbol} but HB order mapping "
-                f"unavailable -> UNKNOWN handoff (fail-closed; unrelated orders untouched)")
-        return [o for o in orders if o.get("clientOrderId") in hb_ids]
+            return []  # executor tracks no orders; unrelated orders left untouched
+        by_coid = {o.get("clientOrderId"): o for o in orders if o.get("clientOrderId")}
+        result = []
+        for coid in hb_ids:
+            if coid in by_coid:
+                o = dict(by_coid[coid]); o.setdefault("symbol", symbol)
+                result.append(o)
+            else:
+                result.append({"symbol": symbol, "clientOrderId": coid})  # query stub
+        return result
 
     def _query_terminal(self, o) -> bool:
-        """Terminal ONLY when GET /fapi/v1/order reliably confirms it. Timeout,
-        exception, error code (incl. -2011/-2013), missing/mismatched order ->
-        False (UNKNOWN, fail-closed). A FILLED order is terminal here; whether the
+        """Terminal ONLY when GET /fapi/v1/order reliably confirms it, with the
+        queried order's symbol / orderId / clientOrderId cross-checked. Timeout,
+        exception, any error code (incl. -2011/-2013 order-not-found), a missing or
+        mismatched identity field -> False (UNKNOWN, fail-closed). A missing order
+        is never auto-terminal. FILLED is terminal for the ORDER; whether the
         POSITION closed is confirmed separately via positionRisk (K2)."""
-        symbol, oid = o.get("symbol"), o.get("orderId")
-        if symbol is None or oid is None:
+        symbol = o.get("symbol")
+        oid = o.get("orderId")
+        coid = o.get("clientOrderId")
+        if symbol is None or (oid is None and coid is None):
             return False
         try:
-            q = self.binance.query_order(symbol, oid)
+            q = self.binance.query_order(symbol, order_id=oid, orig_client_order_id=coid)
         except Exception:
             return False
-        if not isinstance(q, dict) or q.get("code") is not None:
+        if not isinstance(q, dict) or q.get("code") is not None or q.get("status") is None:
             return False
-        if "orderId" not in q or q.get("status") is None:
+        if q.get("symbol") not in (None, symbol):
             return False
-        if str(q.get("orderId")) != str(oid):
+        if oid is not None and str(q.get("orderId")) != str(oid):
+            return False
+        if coid is not None and q.get("clientOrderId") not in (None, coid):
             return False
         return classify_order_terminal(q)
 
@@ -121,14 +145,16 @@ class BinanceHBCloseAdapter:
         return self._query_terminal(o)
 
     def cancel_order(self, o) -> bool:
-        """Cancel a REGULAR close/TP order (DELETE /fapi/v1/order), then CONFIRM its
-        final state with a status query — a successful cancel response alone is NOT
-        proof of resolution."""
-        symbol, oid = o.get("symbol"), o.get("orderId")
-        if symbol is None or oid is None:
+        """Cancel a REGULAR tracked order (DELETE /fapi/v1/order by orderId or
+        origClientOrderId), then CONFIRM its final state with a status query — a
+        successful cancel response alone is NOT proof of resolution."""
+        symbol = o.get("symbol")
+        oid = o.get("orderId")
+        coid = o.get("clientOrderId")
+        if symbol is None or (oid is None and coid is None):
             return False
         try:
-            self.binance.cancel_order(symbol, oid)
+            self.binance.cancel_order(symbol, order_id=oid, orig_client_order_id=coid)
         except Exception:
             return False  # cancel send failed -> UNKNOWN
         return self._query_terminal(o)

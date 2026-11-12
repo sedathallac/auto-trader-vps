@@ -196,17 +196,27 @@ class BinanceAPI:
         _close_order / _take_profit_limit_order before the close handoff."""
         return self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
 
-    def cancel_order(self, symbol, order_id):
-        """DELETE /fapi/v1/order — cancel a REGULAR order by exchange orderId."""
-        return self._post("/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
-                          method="DELETE")
+    def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
+        """DELETE /fapi/v1/order — cancel a REGULAR order by exchange orderId or by
+        origClientOrderId (the HB client order id)."""
+        params = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if orig_client_order_id is not None:
+            params["origClientOrderId"] = orig_client_order_id
+        return self._post("/fapi/v1/order", params, method="DELETE")
 
-    def query_order(self, symbol, order_id):
-        """GET /fapi/v1/order — current status of a single REGULAR order. Used to
-        confirm a pre-sent close/TP order's real terminal state (never inferred
-        from a cancel response or an error code)."""
-        return self._get("/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
-                         signed=True)
+    def query_order(self, symbol, order_id=None, orig_client_order_id=None):
+        """GET /fapi/v1/order — current status of a single REGULAR order, by
+        exchange orderId or by origClientOrderId (the HB client order id). Used to
+        confirm a pre-sent close/TP order's real terminal state even when it is no
+        longer in openOrders — never inferred from a cancel response or error code."""
+        params = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if orig_client_order_id is not None:
+            params["origClientOrderId"] = orig_client_order_id
+        return self._get("/fapi/v1/order", params, signed=True)
 
     def exchange_info(self):
         if not self._info or time.time() - self._info_ts > 3600:

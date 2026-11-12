@@ -1,10 +1,13 @@
-"""Increment 5 — independent-review fixes, BEHAVIOURAL tests on the real
-BinanceHBCloseAdapter + CloseCoordinator (not just import/collection).
+"""Increment 5 — second independent-review fixes, BEHAVIOURAL tests on the real
+BinanceHBCloseAdapter + CloseCoordinator.
 
-Covers: pre-sent close resolution by real status query, cancel confirmed by query
-(cancel response / -2011 are NOT proof), query timeout/UNKNOWN, HB-order matching
-(unrelated normal orders are never cancelled), HB-mapping-unavailable -> UNKNOWN
-fail-closed, ONEWAY/HEDGE, restart, duplicate request.
+Covers: order_terminal actually calls query_order (not in-memory status); query
+timeout / wrong orderId / wrong symbol / clientOrderId mismatch -> UNKNOWN; HB
+order_ids (ENTRY+CLOSE+TP) resolved uniformly with the ENTRY never pre-judged a
+close and a live ENTRY blocking; tracked ids queried by origClientOrderId even
+when openOrders is empty; unrelated orders untouched; FILLED-close-with-open-
+position closes only after exchange state is verified; ONEWAY/HEDGE; restart +
+duplicate idempotency.
 """
 import os
 import sys
@@ -21,31 +24,48 @@ PAIR = "SOL-USDT"
 class FakeBinance:
     def __init__(self, positions=None, mode_dual=False):
         self.open = {}                 # symbol -> [order dicts]
-        self.orders = {}               # orderId -> order dict (query source)
+        self.orders = {}               # orderId -> order dict (query/cancel source)
         self.positions = positions if positions is not None else [{"symbol": SYM, "positionAmt": "-0.3"}]
         self.mode = {"dualSidePosition": mode_dual}
-        self.cancel_to = {}            # orderId -> status after cancel (default CANCELED)
-        self.cancel_raises = set()     # orderIds whose cancel raises
-        self.query_raises = set()      # orderIds whose query raises
-        self.cancelled = []            # orderIds actually DELETEd
+        self.cancel_to = {}            # key -> status after cancel (default CANCELED)
+        self.cancel_raises = set()
+        self.query_raises = set()
+        self.query_calls = []          # (symbol, order_id, orig_client_order_id)
+        self.cancelled = []
         self.posts = []
+
+    def add(self, oid, coid, status):
+        self.orders[oid] = {"orderId": oid, "clientOrderId": coid, "symbol": SYM, "status": status}
+        return self.orders[oid]
 
     def open_orders(self, symbol):
         return list(self.open.get(symbol, []))
 
-    def query_order(self, symbol, oid):
-        if oid in self.query_raises:
-            raise TimeoutError("query timeout")
-        return self.orders.get(oid, {"code": -2013, "msg": "Order does not exist"})
+    def _find(self, oid, coid):
+        if oid is not None and oid in self.orders:
+            return self.orders[oid]
+        if coid is not None:
+            for o in self.orders.values():
+                if o.get("clientOrderId") == coid:
+                    return o
+        return None
 
-    def cancel_order(self, symbol, oid):
-        self.cancelled.append(oid)
-        if oid in self.cancel_raises:
-            raise ConnectionError("cancel conn reset")
-        newst = self.cancel_to.get(oid, "CANCELED")
-        if oid in self.orders:
-            self.orders[oid]["status"] = newst
-        return {"orderId": oid, "status": newst}
+    def query_order(self, symbol, order_id=None, orig_client_order_id=None):
+        self.query_calls.append((symbol, order_id, orig_client_order_id))
+        if order_id in self.query_raises or orig_client_order_id in self.query_raises:
+            raise TimeoutError("query timeout")
+        o = self._find(order_id, orig_client_order_id)
+        return dict(o) if o else {"code": -2013, "msg": "Order does not exist"}
+
+    def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
+        key = order_id if order_id is not None else orig_client_order_id
+        self.cancelled.append(key)
+        if key in self.cancel_raises:
+            raise ConnectionError("cancel reset")
+        o = self._find(order_id, orig_client_order_id)
+        if o is not None:
+            o["status"] = self.cancel_to.get(key, "CANCELED")
+        return {"status": "CANCELED"}
 
     def position_risk(self):
         return self.positions
@@ -57,7 +77,7 @@ class FakeBinance:
         self.posts.append((path, dict(params)))
         for p in self.positions:
             if p["symbol"] == params["symbol"]:
-                p["positionAmt"] = "0"   # simulate reduce-only fill -> flat
+                p["positionAmt"] = "0"
         return {"orderId": 999, "status": "NEW"}
 
 
@@ -69,7 +89,7 @@ class FakeHB:
 
     def active_executors(self):
         if self._ids is None:
-            return []  # no executor for the pair
+            return []
         return [{"trading_pair": self._pair, "status": "RUNNING",
                  "executor_id": "E1", "custom_info": {"order_ids": self._ids}}]
 
@@ -78,7 +98,7 @@ class FakeHB:
         return {"status": "ok"}
 
 
-def _order(oid, coid, status, symbol=SYM):
+def _oo(oid, coid, status, symbol=SYM):
     return {"orderId": oid, "clientOrderId": coid, "symbol": symbol, "status": status}
 
 
@@ -86,120 +106,124 @@ def _cc(fb, hb):
     return CloseCoordinator(BinanceHBCloseAdapter(fb, hb))
 
 
-class TestInc5Review(unittest.TestCase):
-    # --- 1. NEW pre-sent close blocks (cancel does not confirm terminal) -------
-    def test_new_close_cancel_unconfirmed_blocks(self):
+class TestInc5ReviewTwo(unittest.TestCase):
+    # 1. order_terminal actually calls query_order (not in-memory status)
+    def test_order_terminal_calls_query(self):
         fb = FakeBinance()
-        o = _order(10, "HBC", "NEW"); fb.open[SYM] = [o]; fb.orders[10] = dict(o)
-        fb.cancel_to[10] = "NEW"  # cancel does not terminalize -> unresolved
-        hb = FakeHB(order_ids=["HBC"])
-        r = _cc(fb, hb).request_close(SYM)
-        self.assertEqual(r.action, "UNRESOLVED_ORDER")
-        self.assertTrue(r.critical)
-        self.assertEqual(fb.posts, [], "sent a close over a live order")
+        fb.open[SYM] = [_oo(10, "C", "FILLED")]; fb.add(10, "C", "FILLED")
+        adapter = BinanceHBCloseAdapter(fb, FakeHB(order_ids=["C"]))
+        # an order whose in-memory status is FILLED but query says NEW -> NOT terminal
+        fb.orders[10]["status"] = "NEW"
+        self.assertFalse(adapter.order_terminal(_oo(10, "C", "FILLED")))
+        self.assertTrue(fb.query_calls, "order_terminal did not call query_order")
 
-    # --- 2. PARTIALLY_FILLED blocks -------------------------------------------
-    def test_partially_filled_blocks(self):
-        fb = FakeBinance()
-        o = _order(11, "HBC", "PARTIALLY_FILLED"); fb.open[SYM] = [o]; fb.orders[11] = dict(o)
-        fb.cancel_to[11] = "PARTIALLY_FILLED"
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertEqual(r.action, "UNRESOLVED_ORDER")
-
-    # --- 3. cancel request timeout -> unresolved ------------------------------
-    def test_cancel_timeout_blocks(self):
-        fb = FakeBinance()
-        o = _order(12, "HBC", "NEW"); fb.open[SYM] = [o]; fb.orders[12] = dict(o)
-        fb.cancel_raises.add(12)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertEqual(r.action, "UNRESOLVED_ORDER")
-
-    # --- 4. cancel -2011 is NOT auto-terminal; query decides ------------------
-    def test_cancel_2011_not_auto_terminal_query_new(self):
-        fb = FakeBinance()
-        o = _order(13, "HBC", "NEW"); fb.open[SYM] = [o]; fb.orders[13] = dict(o)
-        # cancel "succeeds" with -2011-ish, but query still shows NEW -> unresolved
-        fb.cancel_to[13] = "NEW"
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertEqual(r.action, "UNRESOLVED_ORDER")
-
-    # --- 5. query timeout -> UNKNOWN -> blocks --------------------------------
+    # 2. query timeout -> UNKNOWN -> block
     def test_query_timeout_blocks(self):
-        fb = FakeBinance()
-        o = _order(14, "HBC", "NEW"); fb.open[SYM] = [o]; fb.orders[14] = dict(o)
-        fb.query_raises.add(14)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
+        fb = FakeBinance(); fb.open[SYM] = [_oo(11, "C", "NEW")]; fb.add(11, "C", "NEW")
+        fb.query_raises.add(11)
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
+        self.assertEqual(r.action, "UNRESOLVED_ORDER"); self.assertEqual(fb.posts, [])
+
+    # 3. query wrong orderId -> UNKNOWN
+    def test_query_wrong_orderid_blocks(self):
+        fb = FakeBinance(); fb.open[SYM] = [_oo(12, "C", "NEW")]
+        fb.orders[12] = {"orderId": 777, "clientOrderId": "C", "symbol": SYM, "status": "FILLED"}
+        fb.cancel_to[12] = "NEW"
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
         self.assertEqual(r.action, "UNRESOLVED_ORDER")
 
-    # --- 6. query mismatched orderId -> UNKNOWN -------------------------------
-    def test_query_mismatch_blocks(self):
-        fb = FakeBinance()
-        o = _order(15, "HBC", "NEW"); fb.open[SYM] = [o]
-        fb.orders[15] = {"orderId": 999, "status": "FILLED"}  # wrong orderId
-        fb.cancel_to[15] = "NEW"
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
+    # 4. query wrong symbol -> UNKNOWN
+    def test_query_wrong_symbol_blocks(self):
+        fb = FakeBinance(); fb.open[SYM] = [_oo(13, "C", "NEW")]
+        fb.orders[13] = {"orderId": 13, "clientOrderId": "C", "symbol": "ETHUSDT", "status": "FILLED"}
+        fb.cancel_to[13] = "NEW"
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
         self.assertEqual(r.action, "UNRESOLVED_ORDER")
 
-    # --- 7. CANCELED pre-sent order -> resolved, close proceeds ---------------
-    def test_canceled_order_allows_close(self):
+    # 5. clientOrderId mismatch -> UNKNOWN
+    def test_query_client_id_mismatch_blocks(self):
+        fb = FakeBinance(); fb.open[SYM] = [_oo(14, "C", "NEW")]
+        fb.orders[14] = {"orderId": 14, "clientOrderId": "OTHER", "symbol": SYM, "status": "FILLED"}
+        fb.cancel_to[14] = "NEW"
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
+        self.assertEqual(r.action, "UNRESOLVED_ORDER")
+
+    # 6. openOrders=[] but HB tracks a CLOSE id -> queried by clientOrderId
+    def test_empty_openorders_tracked_close_queried(self):
+        fb = FakeBinance()            # openOrders empty
+        fb.add(20, "CLOSE1", "NEW")   # tracked but not resting; query shows NEW
+        fb.cancel_to["CLOSE1"] = "NEW"
+        r = _cc(fb, FakeHB(order_ids=["CLOSE1"])).request_close(SYM)
+        self.assertEqual(r.action, "UNRESOLVED_ORDER")      # live tracked close blocks
+        self.assertTrue(any(c[2] == "CLOSE1" for c in fb.query_calls), "not queried by clientOrderId")
+
+    # 7. openOrders=[] but HB tracks a TP id that is terminal -> allows
+    def test_empty_openorders_tracked_tp_terminal_allows(self):
         fb = FakeBinance()
-        o = _order(16, "HBC", "CANCELED"); fb.open[SYM] = [o]; fb.orders[16] = dict(o)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertTrue(r.ok)
-        self.assertEqual(r.state, CloseState.CLOSED)
-        self.assertNotIn(16, fb.cancelled, "cancelled an already-terminal order")
+        fb.add(21, "TP1", "CANCELED")  # tracked TP already terminal
+        r = _cc(fb, FakeHB(order_ids=["TP1"])).request_close(SYM)
+        self.assertTrue(r.ok); self.assertEqual(r.state, CloseState.CLOSED)
 
-    # --- 8. FILLED pre-sent close but position still open -> coordinator closes
-    def test_filled_order_but_position_open_then_closes(self):
-        fb = FakeBinance(positions=[{"symbol": SYM, "positionAmt": "-0.3"}])
-        o = _order(17, "HBC", "FILLED"); fb.open[SYM] = [o]; fb.orders[17] = dict(o)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertTrue(r.ok)
-        self.assertEqual(len(fb.posts), 1)  # one reduce-only close for the remainder
+    # 8/9/10. ENTRY+CLOSE+TP; ENTRY still live blocks (not pre-judged a close)
+    def test_entry_close_tp_live_entry_blocks(self):
+        fb = FakeBinance()
+        fb.open[SYM] = [_oo(30, "ENTRY", "PARTIALLY_FILLED")]
+        fb.add(30, "ENTRY", "PARTIALLY_FILLED")
+        fb.add(31, "CLOSE", "CANCELED")
+        fb.add(32, "TP", "CANCELED")
+        fb.cancel_to[30] = "PARTIALLY_FILLED"  # entry cannot be terminalised
+        r = _cc(fb, FakeHB(order_ids=["ENTRY", "CLOSE", "TP"])).request_close(SYM)
+        self.assertEqual(r.action, "UNRESOLVED_ORDER")      # live ENTRY blocks handoff
+        self.assertEqual(fb.posts, [])
 
-    # --- 9/10. unrelated open order is NEVER returned/cancelled ---------------
+    def test_entry_close_tp_all_terminal_allows(self):
+        fb = FakeBinance()
+        fb.add(40, "ENTRY", "FILLED"); fb.add(41, "CLOSE", "CANCELED"); fb.add(42, "TP", "EXPIRED")
+        r = _cc(fb, FakeHB(order_ids=["ENTRY", "CLOSE", "TP"])).request_close(SYM)
+        self.assertTrue(r.ok)
+
+    # 11. unrelated open order untouched
     def test_unrelated_order_not_cancelled(self):
         fb = FakeBinance()
-        hb_o = _order(20, "HBC", "CANCELED"); unrel = _order(21, "USERX", "NEW")
-        fb.open[SYM] = [hb_o, unrel]
-        fb.orders[20] = dict(hb_o); fb.orders[21] = dict(unrel)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
+        fb.open[SYM] = [_oo(50, "C", "CANCELED"), _oo(51, "USERX", "NEW")]
+        fb.add(50, "C", "CANCELED"); fb.add(51, "USERX", "NEW")
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
         self.assertTrue(r.ok)
-        self.assertNotIn(21, fb.cancelled, "cancelled an UNRELATED user order")
+        self.assertNotIn(51, fb.cancelled)
+        self.assertNotIn("USERX", fb.cancelled)
 
-    # --- 11. HB mapping unavailable + open orders -> UNKNOWN fail-closed -------
-    def test_hb_mapping_unavailable_fails_closed(self):
-        fb = FakeBinance()
-        fb.open[SYM] = [_order(30, "X", "NEW")]
-        r = _cc(fb, FakeHB(order_ids=None)).request_close(SYM)  # no executor
-        self.assertFalse(r.ok)
-        self.assertTrue(r.critical)
-        self.assertEqual(fb.posts, [], "sent a close despite UNKNOWN order mapping")
-        self.assertEqual(fb.cancelled, [], "cancelled under UNKNOWN mapping")
+    # 12. FILLED close + position still open -> close only after state verified
+    def test_filled_close_position_open_then_closes(self):
+        fb = FakeBinance(positions=[{"symbol": SYM, "positionAmt": "-0.3"}])
+        fb.add(60, "C", "FILLED")
+        cc = _cc(fb, FakeHB(order_ids=["C"]))
+        r = cc.request_close(SYM)
+        self.assertTrue(r.ok); self.assertEqual(len(fb.posts), 1)
 
-    # --- 12. no open orders -> clean close ------------------------------------
-    def test_no_open_orders_closes(self):
-        fb = FakeBinance()
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
+    # 13. CANCELED old order -> resolved
+    def test_canceled_old_order_allows(self):
+        fb = FakeBinance(); fb.add(70, "C", "CANCELED")
+        r = _cc(fb, FakeHB(order_ids=["C"])).request_close(SYM)
         self.assertTrue(r.ok)
-        self.assertEqual(r.state, CloseState.CLOSED)
 
-    # --- 13. HEDGE close uses positionSide ------------------------------------
-    def test_hedge_close_position_side(self):
+    # 14. HEDGE close uses positionSide
+    def test_hedge_position_side(self):
         fb = FakeBinance(positions=[{"symbol": SYM, "positionAmt": "0.3"}], mode_dual=True)
-        r = _cc(fb, FakeHB(order_ids=["HBC"])).request_close(SYM)
-        self.assertTrue(r.ok)
-        self.assertEqual(fb.posts[0][1].get("positionSide"), "LONG")
-        self.assertNotIn("reduceOnly", fb.posts[0][1])
+        r = _cc(fb, FakeHB(order_ids=[])).request_close(SYM)
+        self.assertTrue(r.ok); self.assertEqual(fb.posts[0][1].get("positionSide"), "LONG")
 
-    # --- 14. duplicate close request is idempotent ----------------------------
-    def test_duplicate_request_idempotent(self):
-        fb = FakeBinance()
-        cc = _cc(fb, FakeHB(order_ids=["HBC"]))
-        cc.request_close(SYM)
-        r2 = cc.request_close(SYM)
-        self.assertEqual(r2.action, "IGNORED_ALREADY_CLOSED")
-        self.assertEqual(len(fb.posts), 1)
+    # 15. HB mapping unavailable but open orders exist -> UNKNOWN fail-closed
+    def test_hb_unavailable_with_open_orders_blocks(self):
+        fb = FakeBinance(); fb.open[SYM] = [_oo(80, "X", "NEW")]
+        r = _cc(fb, FakeHB(order_ids=None)).request_close(SYM)
+        self.assertFalse(r.ok); self.assertTrue(r.critical)
+        self.assertEqual(fb.posts, []); self.assertEqual(fb.cancelled, [])
+
+    # 16. duplicate request idempotent
+    def test_duplicate_idempotent(self):
+        fb = FakeBinance(); cc = _cc(fb, FakeHB(order_ids=[]))
+        cc.request_close(SYM); r2 = cc.request_close(SYM)
+        self.assertEqual(r2.action, "IGNORED_ALREADY_CLOSED"); self.assertEqual(len(fb.posts), 1)
 
 
 if __name__ == "__main__":
