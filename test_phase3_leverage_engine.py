@@ -156,8 +156,9 @@ def test_red_insufficient_history_fallback(tmp_path):
     assert not st.reliable
     assert st.q == pytest.approx(LEV_ENGINE_CONFIG["q_fallback"])
     assert st.f_star == 0.0
-    # fallback -> Kelly tavanı L'yi tabana indirir (muhafazakâr)
-    assert scientific_leverage(0.02, st, 0.0) == pytest.approx(LEV_ENGINE_CONFIG["lo"])
+    # cold-start: veri yokken tabana ÇÖKMEZ, 2x-3x bandında kalır
+    lev = scientific_leverage(0.02, st, 0.0)
+    assert LEV_ENGINE_CONFIG["cold_start_lev_lo"] <= lev <= LEV_ENGINE_CONFIG["cold_start_lev_hi"]
 
 
 def test_green_no_losses_caps_payoff(tmp_path):
@@ -167,3 +168,28 @@ def test_green_no_losses_caps_payoff(tmp_path):
     assert st.p == pytest.approx(1.0)
     assert st.b == pytest.approx(LEV_ENGINE_CONFIG["b_cap"])
     assert st.f_star == pytest.approx(1.0)  # (10*1 - 0)/10
+
+
+# ------------------------------------------------------------ Cold-start (n=0)
+def test_green_cold_start_size_and_leverage_near_legacy():
+    """GREEN: reliable=False → S 12-15 USDT, L 2x-3x (eski sisteme yakın başlangıç)."""
+    cold = _stats(q=0.5, f_star=0.0, n=0, reliable=False)
+    cfg = LEV_ENGINE_CONFIG
+    for atr in (0.0035, 0.01, 0.02, 0.05):
+        s = scientific_position_size(2500, 0.015, atr, cold, 5.5, 25.0)
+        lev = scientific_leverage(atr, cold, 0.0)
+        assert cfg["cold_start_min_notional"] <= s <= cfg["cold_start_max_notional"]
+        assert cfg["cold_start_lev_lo"] <= lev <= cfg["cold_start_lev_hi"]
+
+
+def test_green_cold_start_respects_max_notional():
+    """GREEN: cold-start S, çağıranın max_notional'ını aşmaz (min'e rağmen)."""
+    cold = _stats(q=0.5, f_star=0.0, n=0, reliable=False)
+    assert scientific_position_size(2500, 0.015, 0.02, cold, 5.5, 10.0) == 10.0
+
+
+def test_green_reliable_no_edge_still_floors():
+    """GREEN: reliable=True ve kenar yok → eski muhafazakâr davranış (cold-start bandı YOK)."""
+    st = _stats(q=0.5, f_star=0.0, reliable=True)
+    assert scientific_leverage(0.01, st, 0.0) == pytest.approx(LEV_ENGINE_CONFIG["lo"])
+    assert scientific_position_size(1000, 0.015, 0.03, st, 5.5, 25.0) == 5.5

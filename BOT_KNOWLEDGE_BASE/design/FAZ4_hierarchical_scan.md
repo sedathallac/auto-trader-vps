@@ -42,3 +42,7 @@ Durum: **ONAYLANDI** (yönetici kararları §5'te) · Uygulama: `scan_engine.py`
 - `scan_engine.py` (saf, test edilebilir): `MetricCache`, `Tier`/`TIERS`, `volatility_score`, `Q_WEIGHTS`, `due_tiers`, `compute_quality_scores`.
 - `auto_trader.py` (ince adaptör): `HIERARCHICAL_SCAN` flag, `_SCAN_CACHE`/`_SCAN_LAST_RUN`, `run_tiered_scan` (binance + cache ile ham metrik toplar → `compute_quality_scores`), `run_once` içinde compare/on entegrasyonu.
 - Testler: cache hit/miss/TTL, tier due/not-due, Q monotonluğu + normalize sınırları, volatilite orta-bant, `off`'ta davranış değişmezliği.
+
+## 6. Q-Skoru Onayı ve Production Durumu (2026-11-13)
+- Q-skoru sıralaması yönetici tarafından ONAYLANDI.
+- Production'da `HIERARCHICAL_SCAN=off` KALIR (eski `scan_top` devam eder); kod varsayılanı `off`, testle kilitli (`test_default_flag_off`).

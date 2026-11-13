@@ -30,7 +30,10 @@ tavanlanır:
     kelly_ceiling = lo + (hi − lo) · edge              # kenar yoksa tavan = lo
     r_eff         = min( r , f_used )                  # sizing riski Kelly ile sınırlı
 
-Kenar yok (f*≤0) → L tabana (lo) iner, r_eff=0 → S minimuma clip'lenir. Fail-safe.
+COLD-START (reliable=False, n<min_sample): Kelly yerine cold_start bantları geçerli
+(S: 12–15 USDT, L: 2x–3x) → veri yokken eski sisteme yakın başlangıç.
+
+Kenar yok (f*≤0, reliable=True) → L tabana (lo) iner, r_eff=0 → S minimuma clip'lenir. Fail-safe.
 
 GÜVENLİK: Bu modül SAF hesaplamadır; borsaya hiçbir şey göndermez. auto_trader'daki
 üç-durumlu bayrak (off | compare | on) VARSAYILAN 'off' olduğundan, entegrasyon canlı
@@ -53,6 +56,13 @@ LEV_ENGINE_CONFIG = {
     "min_sample": 20,      # altında güvenilmez → fallback
     "b_cap": 10.0,         # payoff oranı üst sınırı (kayıpsız örnekte patlamayı önler)
     "q_fallback": 0.5,     # yetersiz geçmişte nötr güven
+    # Cold-start (reliable=False): Kelly tavanı/r_eff geçmiş yokken tabana çöker (f*=0).
+    # Eski sisteme yakın başlangıç için S ve L bu bantlara clip'lenir. reliable=True
+    # olunca bu bantlar DEVRE DIŞI, formül Kelly'ye göre kendini ayarlar.
+    "cold_start_min_notional": 12.0,   # S tabanı (USDT)
+    "cold_start_max_notional": 15.0,   # S tavanı (USDT)
+    "cold_start_lev_lo": 2.0,          # L tabanı
+    "cold_start_lev_hi": 3.0,          # L tavanı
 }
 
 
@@ -126,6 +136,8 @@ def scientific_leverage(sigma: float, stats: SignalStats, drawdown: float,
         return lo
     d = max(float(drawdown or 0.0), 0.0)
     l_raw = float(cfg["c"]) * (1.0 / sigma) * stats.q / (1.0 + d)
+    if not stats.reliable:
+        return _clip(l_raw, float(cfg["cold_start_lev_lo"]), min(hi, float(cfg["cold_start_lev_hi"])))
     hi_eff = min(hi, kelly_ceiling(stats, cfg))
     return _clip(l_raw, lo, hi_eff)
 
@@ -138,6 +150,11 @@ def scientific_position_size(balance: float, r: float, sigma: float,
     σ≤0 veya bakiye≤0 → min_notional (fail-safe)."""
     if sigma is None or sigma <= 0 or balance <= 0:
         return float(min_notional)
+    if not stats.reliable:
+        s_raw = balance * float(r) * stats.q / sigma
+        s_hi = min(float(max_notional), float(cfg["cold_start_max_notional"]))
+        s_lo = min(max(float(min_notional), float(cfg["cold_start_min_notional"])), s_hi)
+        return _clip(s_raw, s_lo, s_hi)
     f_used = float(cfg["kelly_fraction"]) * max(stats.f_star, 0.0)
     r_eff = min(float(r), f_used)
     s_raw = balance * r_eff * stats.q / sigma
