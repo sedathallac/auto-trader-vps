@@ -207,6 +207,7 @@ class Candles:
     c: list
     v: list
     t: list      # açılış zamanı (ms)
+    tb: list = field(default_factory=list)   # taker-buy base hacmi (klines[9]); yoksa boş
 
     def __len__(self):
         return len(self.c)
@@ -219,9 +220,10 @@ def parse_klines(rows, drop_unclosed=True):
     if drop_unclosed:
         rows = rows[:-1]
     try:
+        tb = [float(r[9]) for r in rows] if all(len(r) > 9 for r in rows) else []
         return Candles([float(r[1]) for r in rows], [float(r[2]) for r in rows],
                        [float(r[3]) for r in rows], [float(r[4]) for r in rows],
-                       [float(r[5]) for r in rows], [int(r[0]) for r in rows])
+                       [float(r[5]) for r in rows], [int(r[0]) for r in rows], tb)
     except (ValueError, TypeError, IndexError):
         return None
 
@@ -360,22 +362,14 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None) -> Verdict:
-    """side_dir: +1 LONG / −1 SHORT. main=15m Candles; trend_cds={'1h':Candles,'4h':Candles}.
-    Eksik veri → fail-closed. YALNIZ allow/deny üretir."""
-    if main is None or len(main) < 60 or not trend_cds or any(v is None for v in trend_cds.values()):
-        return Verdict(False, "veri eksik (fail-closed)")
-    trends = []
-    for tf, cd in trend_cds.items():
-        t = trend_reading(cd, tf)
-        if t is None:
-            return Verdict(False, f"{tf} trend verisi yetersiz (fail-closed)")
-        trends.append(t)
-    adx_main = adx_last(main.h, main.l, main.c)
-    regime = regime_from_adx(adx_main, cfg)
+def compute_readings(main: Candles):
+    """15m Candles → tüm teyit sinyalleri (saf)."""
+    return exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
 
-    readings = exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
 
+def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None) -> Verdict:
+    """KARAR mantığı (veri toplamadan bağımsız; canlı confirm() ve offline backtest AYNI kodu kullanır).
+    p_fake_fn(signal_name, regime) → (p_fake, calibrated)."""
     # 1) REJİM VETO — güçlü trende karşı mean-reversion
     against = trend_against_strength(trends, side_dir)
     adx_max = max(t["adx"] for t in trends)
@@ -389,7 +383,7 @@ def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg
     for r in readings:
         if r.direction != side_dir or r.strength < _cfg(cfg, "confirm_min_strength"):
             continue
-        p_fake, cal = (store.p_fake(r.name, regime, cfg) if store is not None else (0.5, False))
+        p_fake, cal = p_fake_fn(r.name, regime)
         score = (1.0 - p_fake) * r.strength
         if r.family not in best or score > best[r.family][0]:
             best[r.family] = (score, r, p_fake, cal)
@@ -411,6 +405,24 @@ def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg
                            + f" {_cfg(cfg, 'confirm_min_p_real'):.2f}"),
                    p_real, regime, False, {f: b[1].name for f, b in best.items()},
                    readings, against, calibrated_all)
+
+
+def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None) -> Verdict:
+    """side_dir: +1 LONG / −1 SHORT. main=15m Candles; trend_cds={'1h':Candles,'4h':Candles}.
+    Eksik veri → fail-closed. YALNIZ allow/deny üretir."""
+    if main is None or len(main) < 60 or not trend_cds or any(v is None for v in trend_cds.values()):
+        return Verdict(False, "veri eksik (fail-closed)")
+    trends = []
+    for tf, cd in trend_cds.items():
+        t = trend_reading(cd, tf)
+        if t is None:
+            return Verdict(False, f"{tf} trend verisi yetersiz (fail-closed)")
+        trends.append(t)
+    regime = regime_from_adx(adx_last(main.h, main.l, main.c), cfg)
+    readings = exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
+    p_fake_fn = (lambda name, reg: store.p_fake(name, reg, cfg)) if store is not None \
+        else (lambda name, reg: (0.5, False))
+    return evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg)
 
 
 # ===================================================================== istatistik araçları
@@ -531,6 +543,30 @@ class SignalStore:
                           "strength,entry_ts,entry_price,horizon,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                           (time.time(), symbol, reading.name, reading.family, regime, reading.direction,
                            reading.strength, int(entry_ts), float(entry_price), int(horizon), source))
+                c.commit()
+                return True
+            finally:
+                c.close()
+        except Exception:
+            return False
+
+    def record_resolved(self, symbol, reading, regime, entry_ts, entry_price, horizon,
+                        real, fwd_ret, persist_bars, source="offline"):
+        """Offline backtest satırı (zaten çözülmüş). Aynı (symbol,signal,direction,entry_ts) tekrar yazılmaz."""
+        try:
+            c = self._conn()
+            try:
+                dup = c.execute("SELECT 1 FROM signal_outcomes WHERE symbol=? AND signal=? AND direction=? "
+                                "AND entry_ts=? AND source=?", (symbol, reading.name, reading.direction,
+                                                                int(entry_ts), source)).fetchone()
+                if dup:
+                    return False
+                c.execute("INSERT INTO signal_outcomes (recorded_at,symbol,signal,family,regime,direction,"
+                          "strength,entry_ts,entry_price,horizon,source,resolved,real,fwd_ret,persist_bars) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+                          (time.time(), symbol, reading.name, reading.family, regime, reading.direction,
+                           reading.strength, int(entry_ts), float(entry_price), int(horizon), source,
+                           int(bool(real)), float(fwd_ret), int(persist_bars)))
                 c.commit()
                 return True
             finally:

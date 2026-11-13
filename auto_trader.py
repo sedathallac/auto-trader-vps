@@ -1381,11 +1381,16 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
                 _sig, _edge = _we.WhaleSignal(), None
             else:
                 _sig = _we.compute_signal(_wi, _WHALE_TRACKER, RISK_CONFIG)
+                # Offline backtest kalibrasyonu (OOS skill>0 ise) → p_win; yoksa cold-start formülü.
+                _pw = (_we.pwin_from_calibration(_sd * _sig.components.get("cvd", 0.0),
+                                                 _we.load_pwin_calibration(_we.WHALE_PWIN_CALIBRATION))
+                       if _sig.quality_ok else None)
                 _edge = _we.expected_edge(
                     _sd, _sig, sl_pct=sl_pct, tp_pct=tp_pct, atr_pct=atr_pct,
                     drawdown=float(getattr(risk, "current_drawdown", 0.0) or 0.0),
                     notional=RISK_CONFIG["max_notional"], bids=_wi["bids"], asks=_wi["asks"],
                     fee_rt=RISK_CONFIG["fee_pct_round_trip"], funding_rate=_wi.get("funding"),
+                    p_win_calibrated=_pw, calibrated=_pw is not None,
                     cfg=RISK_CONFIG) if _sig.quality_ok else None
             _allow, _why = _we.evaluate_filter(_sd, _sig, _edge, RISK_CONFIG)
             log.info(f"  🐋 Faz5[{WHALE_HUNTING}]: dir={_sig.direction:+d} güç={_sig.strength:.2f} "

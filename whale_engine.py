@@ -359,3 +359,39 @@ def record_metrics(db_file, symbol, mode, side_dir, signal, edge, allow, reason)
         return True
     except Exception:
         return False
+
+
+# ----------------------------------------------------------------- p_win kalibrasyonu (offline backtest çıktısı)
+WHALE_PWIN_CALIBRATION = str(Path.home() / "whale_pwin_calibration.json")
+PWIN_EDGES = (-1.0, -0.4, -0.15, 0.15, 0.4, 1.0)
+
+
+def pwin_bucket(align, edges=PWIN_EDGES):
+    """align ∈ [-1,1] (işlem yönüyle hizalı taker akışı) → kova indeksi."""
+    a = _clip(align, edges[0], edges[-1])
+    for i in range(len(edges) - 1):
+        if a < edges[i + 1] or i == len(edges) - 2:
+            return i
+    return len(edges) - 2
+
+
+def load_pwin_calibration(path=WHALE_PWIN_CALIBRATION):
+    """confirm_backtest çıktısı JSON; yok/bozuk → None (kalibrasyonsuz cold-start devam eder)."""
+    import json
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get("buckets") else None
+    except Exception:
+        return None
+
+
+def pwin_from_calibration(align, calib, min_n=100):
+    """Kalibre p_win. YALNIZ OOS Brier skill > 0 (overfit değil) ve kovada n ≥ min_n ise; aksi → None."""
+    if not calib or float(calib.get("oos_brier_skill", 0.0)) <= 0.0:
+        return None
+    edges = calib.get("edges") or PWIN_EDGES
+    b = calib["buckets"][pwin_bucket(align, edges)]
+    if int(b.get("n", 0)) < min_n:
+        return None
+    return float(b["p_win"])

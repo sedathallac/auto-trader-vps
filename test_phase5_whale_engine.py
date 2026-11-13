@@ -276,6 +276,7 @@ class _FakeBinance:
 
 
 def _patch_open_coin(monkeypatch, fake):
+    monkeypatch.setattr(we, "WHALE_PWIN_CALIBRATION", "/nonexistent/whale_pwin.json")   # cold-start izolasyonu
     monkeypatch.setattr(auto_trader, "HB_OFFLINE", True)
     monkeypatch.setattr(auto_trader, "SCIENTIFIC_SIZING", "off")
     monkeypatch.setattr(auto_trader, "check_liquidity", lambda b, s: (True, "ok"))
