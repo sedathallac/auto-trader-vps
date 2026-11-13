@@ -44,6 +44,11 @@ HB_OFFLINE = os.getenv("HB_OFFLINE", "0").strip().lower() in ("1", "true", "yes"
 # compare=yeni scan_tiered Q-sıralaması loglanır ama eski scan_top kullanılır,
 # on=tiered tarama kullanılır (kalibrasyon sonrası). Varsayılan 'off'.
 HIERARCHICAL_SCAN = os.getenv("HIERARCHICAL_SCAN", "off").strip().lower()
+# Faz 5: balina avcılığı bayrağı. off=canlı davranış değişmez (ek API çağrısı YOK),
+# compare=sinyal+E[kâr] loglanır/whale_metrics'e yazılır ama karar ESKİ mantıkla verilir,
+# on=yalnız FİLTRE (sahte/kalitesiz girişi REDDEDER; asla giriş tetiklemez). Varsayılan 'off'.
+WHALE_HUNTING = os.getenv("WHALE_HUNTING", "off").strip().lower()
+_WHALE_TRACKER = None       # whale_engine.WhaleTracker (tembel init; duvar kalıcılığı/OI Δ)
 # Faz 4: --loop sürecinde run_once çağrıları arasında yaşayan cache + tier zamanlama.
 _SCAN_CACHE = None          # scan_engine.MetricCache (tembel init)
 _SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
@@ -75,6 +80,10 @@ RISK_CONFIG = {
     "tp_min_pct": 0.015,
     "tp_max_pct": 0.15,
 }
+
+# Faz 5: balina eşikleri RISK_CONFIG içinde (muhafazakâr başlangıç, ⚠️ CALIBRATION-REQUIRED).
+from whale_engine import WHALE_DEFAULTS as _WHALE_DEFAULTS
+RISK_CONFIG.update(_WHALE_DEFAULTS)
 
 # --- Korelasyon Limiti ---
 MAX_PER_SECTOR = 2
@@ -1319,6 +1328,43 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  📏 Slipaj=%{slippage_pct*100:.2}")
     else:
         slippage_pct = 0.0
+
+    # === Faz 5: balina FİLTRESİ ('off' → atlanır, ek API çağrısı yok) ===
+    # compare: logla + whale_metrics'e yaz, karar değişmez. on: yalnız REDDEDEBİLİR.
+    if WHALE_HUNTING in ("compare", "on"):
+        try:
+            import whale_engine as _we
+            global _WHALE_TRACKER
+            if _WHALE_TRACKER is None:
+                _WHALE_TRACKER = _we.WhaleTracker()
+            _sd = 1 if side == 1 else -1
+            _wi = _we.fetch_whale_inputs(binance, symbol)
+            if _wi is None:
+                _sig, _edge = _we.WhaleSignal(), None
+            else:
+                _sig = _we.compute_signal(_wi, _WHALE_TRACKER, RISK_CONFIG)
+                _edge = _we.expected_edge(
+                    _sd, _sig, sl_pct=sl_pct, tp_pct=tp_pct, atr_pct=atr_pct,
+                    drawdown=float(getattr(risk, "current_drawdown", 0.0) or 0.0),
+                    notional=RISK_CONFIG["max_notional"], bids=_wi["bids"], asks=_wi["asks"],
+                    fee_rt=RISK_CONFIG["fee_pct_round_trip"], funding_rate=_wi.get("funding"),
+                    cfg=RISK_CONFIG) if _sig.quality_ok else None
+            _allow, _why = _we.evaluate_filter(_sd, _sig, _edge, RISK_CONFIG)
+            log.info(f"  🐋 Faz5[{WHALE_HUNTING}]: dir={_sig.direction:+d} güç={_sig.strength:.2f} "
+                     f"spoof={_sig.spoof_suspect} | "
+                     + (f"p_win={_edge.p_win:.3f} E[kâr]={_edge.e_profit*100:.3f}% "
+                        f"maliyet={_edge.cost*100:.3f}% RP={_edge.risk_premium*100:.3f}% "
+                        f"E_net={_edge.e_net*100:.3f}%" if _edge else "edge=yok")
+                     + f" | {'GEÇER' if _allow else 'RED'}: {_why}")
+            _we.record_metrics(_we.WHALE_DB, symbol, WHALE_HUNTING, _sd, _sig, _edge, _allow, _why)
+            if WHALE_HUNTING == "on" and not _allow:
+                log.info(f"  atlandı: balina filtresi ({_why})")
+                return False
+        except Exception as _e:
+            if WHALE_HUNTING == "on":
+                log.warning(f"  Faz5 balina filtresi hatası, fail-closed (giriş yok): {_e}")
+                return False
+            log.warning(f"  Faz5 whale_engine hatası (compare, karar etkilenmedi): {_e}")
 
     # Bakiye
     balance = binance.get_available_balance("USDT")
