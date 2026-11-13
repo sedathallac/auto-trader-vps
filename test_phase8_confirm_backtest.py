@@ -65,7 +65,7 @@ def candles_from(rows):
 @pytest.fixture(scope="module")
 def series():
     end = aligned_end()
-    r15 = make_rows(9000, seed=3, end_ms=end)
+    r15 = make_rows(9008, seed=3, end_ms=end)   # 16'nın katı → 4h sınırlarına hizalı
     return {"end": end, "15m": r15, "1h": aggregate(r15, "1h"), "4h": aggregate(r15, "4h")}
 
 
@@ -134,6 +134,19 @@ def test_cache_prevents_second_network_call(series, tmp_path):
 def full_events(series):
     return cb.replay_events("X", candles_from(series["15m"]), candles_from(series["1h"]),
                             candles_from(series["4h"]), horizon=8, stride=8)
+
+
+def test_synthetic_series_aligned_for_all_timeframes(series):
+    """Fixture sağlamlığı: 1h/4h toplulaştırma boş kalmamalı (c4h=None hatasının kök nedeni buydu)."""
+    assert len(series["1h"]) > 2000 and len(series["4h"]) > 500
+    assert int(series["4h"][0][0]) % cb.TF_MS["4h"] == 0
+
+
+def test_replay_returns_empty_when_a_timeframe_is_missing(series):
+    c15, c1h = candles_from(series["15m"]), candles_from(series["1h"])
+    assert cb.replay_events("X", c15, c1h, None) == []
+    assert cb.replay_events("X", c15, None, c1h) == []
+    assert cb.replay_events("X", None, c1h, c1h) == []
 
 
 def test_replay_produces_candidates_following_bot_side_rule(full_events):

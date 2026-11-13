@@ -125,6 +125,8 @@ def replay_events(symbol, c15, c1h, c4h, *, horizon=8, stride=4, sim=None, cfg=N
     giriş fiyatı SONRAKİ mumun açılışı; sonuç sonraki `horizon` mum.
     Dönen her olay: ts, side, regime, readings, trends, real, fwd, persist, sl, cvd, entry."""
     sim = {**SIM_DEFAULTS, **(sim or {})}
+    if c15 is None or c1h is None or c4h is None:
+        return []                                  # eksik TF verisi → olay yok (fail-closed, çökme yok)
     n = len(c15)
     ends1 = [t + TF_MS["1h"] for t in c1h.t]
     ends4 = [t + TF_MS["4h"] for t in c4h.t]
