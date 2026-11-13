@@ -690,7 +690,14 @@ def protect_then_gate(binance, reserver, drift, stale):
                          f"released={len(_rc.released)} kept={len(_rc.kept)}")
     except Exception as e:
         log.warning(f"rezervasyon reconcile hatası: {e}")
-    mode_ok, mode = _verify_oneway(binance)
+    if HB_OFFLINE:
+        # HB_OFFLINE = emir YOK (veri toplama). ONEWAY doğrulaması YALNIZ yeni-giriş kapısında atlanır; geçersiz/IP-kısıtlı
+        # anahtarla (-2015) mod UNKNOWN olup compare verisini engellemesin. _verify_oneway'in kendisi DEĞİŞMEDİ:
+        # ensure_sl_coverage / SL doğrulaması gerçek modu kullanmaya devam eder (yanlış mod varsayımıyla SL gönderilmez).
+        log.info("🔌 HB_OFFLINE: ONEWAY kontrolü yeni-giriş kapısında atlandı (varsayılan: ONEWAY)")
+        mode_ok, mode = True, "ONEWAY"
+    else:
+        mode_ok, mode = _verify_oneway(binance)
     unprotected = should_block_new_entries()
     allow = new_entry_allowed(drift=drift, stale=stale, mode_ok=mode_ok,
                               unprotected=unprotected)

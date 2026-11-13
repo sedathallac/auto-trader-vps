@@ -94,5 +94,44 @@ class TestProtectThenGate(unittest.TestCase):
         self.assertFalse(allow)
 
 
+class TestHbOfflineOnewayGateBypass(unittest.TestCase):
+    """HB_OFFLINE=1: ONEWAY doğrulaması yalnız yeni-giriş kapısında atlanır; varsayılan (0) davranış değişmez."""
+    def setUp(self):
+        self._saved = (at.HB_OFFLINE, at.ensure_sl_coverage, at._verify_oneway, at._exchange_open_symbols)
+        at.ensure_sl_coverage = lambda b: None
+        at._exchange_open_symbols = lambda b: set()
+        self.verify_calls = []
+        at._verify_oneway = lambda b: (self.verify_calls.append(1), (False, "UNKNOWN"))[1]   # -2015 benzeri
+        at._OPEN_UNPROTECTED.clear()
+
+    def tearDown(self):
+        at.HB_OFFLINE, at.ensure_sl_coverage, at._verify_oneway, at._exchange_open_symbols = self._saved
+        at._OPEN_UNPROTECTED.clear()
+
+    def test_offline_assumes_oneway_without_calling_exchange(self):
+        at.HB_OFFLINE = True
+        allow, r = at.protect_then_gate(binance=object(), reserver=_FakeReserver(), drift=False, stale=False)
+        self.assertTrue(allow); self.assertEqual((r["mode"], r["mode_ok"]), ("ONEWAY", True))
+        self.assertEqual(self.verify_calls, [])
+
+    def test_offline_still_blocked_by_stale_or_unprotected(self):
+        at.HB_OFFLINE = True
+        self.assertFalse(at.protect_then_gate(object(), _FakeReserver(), drift=False, stale=True)[0])
+        at._OPEN_UNPROTECTED["X"] = None
+        self.assertFalse(at.protect_then_gate(object(), _FakeReserver(), drift=False, stale=False)[0])
+
+    def test_default_off_unknown_mode_still_fails_closed(self):
+        at.HB_OFFLINE = False
+        allow, r = at.protect_then_gate(binance=object(), reserver=_FakeReserver(), drift=False, stale=False)
+        self.assertFalse(allow); self.assertEqual(r["mode"], "UNKNOWN"); self.assertEqual(self.verify_calls, [1])
+
+    def test_verify_oneway_itself_unchanged_under_offline(self):
+        at.HB_OFFLINE = True
+        class B:
+            def position_mode(self): raise RuntimeError("-2015")
+        at._verify_oneway = self._saved[2]
+        self.assertEqual(at._verify_oneway(B()), (False, "UNKNOWN"))
+
+
 if __name__ == "__main__":
     unittest.main()
