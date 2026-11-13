@@ -49,6 +49,10 @@ HIERARCHICAL_SCAN = os.getenv("HIERARCHICAL_SCAN", "off").strip().lower()
 # on=yalnız FİLTRE (sahte/kalitesiz girişi REDDEDER; asla giriş tetiklemez). Varsayılan 'off'.
 WHALE_HUNTING = os.getenv("WHALE_HUNTING", "off").strip().lower()
 _WHALE_TRACKER = None       # whale_engine.WhaleTracker (tembel init; duvar kalıcılığı/OI Δ)
+# Faz 6: strateji/indikatör teyit katmanı bayrağı. off=canlı davranış değişmez (ek API çağrısı YOK),
+# compare=teyit/p_real loglanır + signal_outcomes.db'ye yazılır ama karar ESKİ mantıkla verilir,
+# on=yalnız FİLTRE (trend veto / teyit yetersiz / p_real düşük girişi REDDEDER; asla giriş tetiklemez).
+STRATEGY_CONFIRMATION = os.getenv("STRATEGY_CONFIRMATION", "off").strip().lower()
 # Faz 4: --loop sürecinde run_once çağrıları arasında yaşayan cache + tier zamanlama.
 _SCAN_CACHE = None          # scan_engine.MetricCache (tembel init)
 _SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
@@ -84,6 +88,9 @@ RISK_CONFIG = {
 # Faz 5: balina eşikleri RISK_CONFIG içinde (muhafazakâr başlangıç, ⚠️ CALIBRATION-REQUIRED).
 from whale_engine import WHALE_DEFAULTS as _WHALE_DEFAULTS
 RISK_CONFIG.update(_WHALE_DEFAULTS)
+# Faz 6: teyit eşikleri (muhafazakâr; min_p_real=0.65 yönetici kararı, ⚠️ CALIBRATION-REQUIRED).
+from strategy_engine import CONFIRM_DEFAULTS as _CONFIRM_DEFAULTS
+RISK_CONFIG.update(_CONFIRM_DEFAULTS)
 
 # --- Korelasyon Limiti ---
 MAX_PER_SECTOR = 2
@@ -1321,6 +1328,37 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
     tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
     log.info(f"  📊 ATR=%{atr_pct*100:.2} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
+
+    # === Faz 6: strateji teyit FİLTRESİ ('off' → atlanır, ek API çağrısı yok) ===
+    # 15m ana TF; 1h/4h yalnız trend VETO'su. compare: logla + signal_outcomes; on: yalnız REDDEDEBİLİR.
+    if STRATEGY_CONFIRMATION in ("compare", "on"):
+        try:
+            import strategy_engine as _se
+            _sd6 = 1 if side == 1 else -1
+            _lim = RISK_CONFIG["confirm_kline_limit"]
+            _main6 = _se.fetch_candles(binance, symbol, RISK_CONFIG["confirm_tf_main"], _lim)
+            _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
+                    for tf in RISK_CONFIG["confirm_tf_veto"]}
+            _store6 = _se.SignalStore(_se.SIGNAL_DB)
+            if _main6 is not None:
+                _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
+            _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
+            log.info(f"  🧪 Faz6[{STRATEGY_CONFIRMATION}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
+                     f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
+                     f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
+            if _main6 is not None:
+                for _r6 in _v6.readings:
+                    if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
+                        _store6.record_event(symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
+                                             RISK_CONFIG["confirm_horizon"])
+            if STRATEGY_CONFIRMATION == "on" and not _v6.allow:
+                log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
+                return False
+        except Exception as _e:
+            if STRATEGY_CONFIRMATION == "on":
+                log.warning(f"  Faz6 teyit hatası, fail-closed (giriş yok): {_e}")
+                return False
+            log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
 
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
