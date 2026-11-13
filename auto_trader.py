@@ -1138,12 +1138,20 @@ def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=Non
 
 
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
-    # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü
-    try:
-        _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-    except Exception as e:
-        log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
-        return False
+    # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
+    # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
+    if HB_OFFLINE:
+        dry_run = True
+    # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü (HB_OFFLINE'da HB'siz;
+    # yoksa bu ilk hb.active_executors() çağrısı offline'da patlar ve compare log'a ulaşılamaz).
+    if HB_OFFLINE:
+        _cur = set()
+    else:
+        try:
+            _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
+        except Exception as e:
+            log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
+            return False
     if len(_cur) >= MAX_OPEN_POSITIONS:
         log.info(f"  C6: limit dolu ({len(_cur)}/{MAX_OPEN_POSITIONS}), atlanıyor")
         return False
