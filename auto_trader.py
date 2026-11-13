@@ -40,6 +40,13 @@ SCIENTIFIC_SIZING = os.getenv("SCIENTIFIC_SIZING", "off").strip().lower()
 # zorlanır (GERÇEK EMİR YOK), böylece Faz3[compare] kalibrasyon logları HB olmadan
 # toplanabilir. Varsayılan KAPALI → production davranışı DEĞİŞMEZ.
 HB_OFFLINE = os.getenv("HB_OFFLINE", "0").strip().lower() in ("1", "true", "yes", "on")
+# Faz 4: hiyerarşik tarama bayrağı. off=mevcut scan_top (production değişmez),
+# compare=yeni scan_tiered Q-sıralaması loglanır ama eski scan_top kullanılır,
+# on=tiered tarama kullanılır (kalibrasyon sonrası). Varsayılan 'off'.
+HIERARCHICAL_SCAN = os.getenv("HIERARCHICAL_SCAN", "off").strip().lower()
+# Faz 4: --loop sürecinde run_once çağrıları arasında yaşayan cache + tier zamanlama.
+_SCAN_CACHE = None          # scan_engine.MetricCache (tembel init)
+_SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
@@ -954,6 +961,119 @@ def scan_top(binance, n, blacklist=None):
     return cands[:n]
 
 
+def _depth_liquidity(binance, symbol, bps=10):
+    """Order-book derinliği: mid ± bps bandındaki toplam notional (bid+ask). None=hata."""
+    try:
+        ob = binance.order_book(symbol, limit=20)
+        bids = [(float(p), float(q)) for p, q in ob.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in ob.get("asks", [])]
+        if not bids or not asks:
+            return None
+        mid = (bids[0][0] + asks[0][0]) / 2.0
+        band = mid * bps / 10000.0
+        liq = (sum(p * q for p, q in bids if p >= mid - band)
+               + sum(p * q for p, q in asks if p <= mid + band))
+        return liq
+    except Exception:
+        return None
+
+
+def _volume_confirmation(binance, symbol, interval="15m", lookback=20):
+    """Hacim-teyidi: son mum hacmi / önceki `lookback` mum ortalaması (spike oranı).
+    >1 = artan ilgi (hareketi teyit). None=veri yok/hata (çağıran nötr'e düşer)."""
+    try:
+        kl = binance._get("/fapi/v1/klines",
+                          {"symbol": symbol, "interval": interval, "limit": lookback + 1})
+        if not isinstance(kl, list) or len(kl) < lookback + 1:
+            return None
+        vols = [float(k[5]) for k in kl]      # klines index 5 = base volume
+        prev = vols[:-1]
+        avg = sum(prev) / len(prev) if prev else 0.0
+        return (vols[-1] / avg) if avg > 0 else None
+    except Exception:
+        return None
+
+
+def run_tiered_scan(binance, blacklist=None):
+    """Faz 4: vadesi gelen katmanları çalıştırıp birleşik havuzu Q'ya göre döndürür.
+
+    Tek paylaşılan ticker snapshot + per-symbol ATR/depth/hacim cache'i (TTL'li) ile
+    rate-limit korunur; metrik toplama katman evreniyle sınırlıdır. Saf skor/zamanlama
+    scan_engine'de. Bu tick'te vadesi gelen katman yoksa [] döner. Dönen öğeler orijinal
+    ticker alanlarını + 'Q'/'vol_score' içerir (open_coin ile drop-in uyumlu)."""
+    from scan_engine import MetricCache, due_tiers, compute_quality_scores
+    global _SCAN_CACHE
+    if _SCAN_CACHE is None:
+        _SCAN_CACHE = MetricCache()
+    cache = _SCAN_CACHE
+    blacklist = blacklist or set()
+    now = time.time()
+
+    due = due_tiers(now, _SCAN_LAST_RUN)
+    if not due:
+        return []
+
+    # Paylaşılan ticker snapshot (tek ağır çağrı, TTL 60s)
+    tickers = cache.get_or_fetch("tickers", 60, binance.tickers)
+    if not isinstance(tickers, list):
+        return []
+    base = []
+    for d in tickers:
+        try:
+            s = d["symbol"]
+            if not s.endswith("USDT") or s in blacklist:
+                continue
+            vol = float(d["quoteVolume"])
+            chg = abs(float(d["priceChangePercent"]))
+            if vol >= MIN_VOLUME_USDT and MIN_PCT_CHANGE <= chg <= MAX_PCT_CHANGE:
+                base.append(d)
+        except (KeyError, ValueError):
+            continue
+    base.sort(key=lambda d: float(d["quoteVolume"]), reverse=True)
+
+    # Vadesi gelenlerin en büyük evrenini kullan; hot vadeyse gerçek depth kullan.
+    tier = max(due, key=lambda t: t.universe)
+    use_depth = any(t.liquidity_mode == "depth" for t in due)
+    universe = base[:tier.universe]
+
+    raw = []
+    for d in universe:
+        sym = d["symbol"]
+        try:
+            qv = float(d["quoteVolume"])
+            mom = abs(float(d["priceChangePercent"]))
+            atr = cache.get(f"atr:{sym}", 300)
+            if atr is None:
+                atr = calculate_atr(binance, sym)
+                if atr is not None:
+                    cache.put(f"atr:{sym}", atr)
+            if use_depth:
+                liq = cache.get(f"liq:{sym}", 300)
+                if liq is None:
+                    liq = _depth_liquidity(binance, sym)
+                    if liq is not None:
+                        cache.put(f"liq:{sym}", liq)
+                if liq is None:
+                    liq = qv  # depth hatası → proxy'ye düş
+            else:
+                liq = qv
+            vc = cache.get(f"vc:{sym}", 300)
+            if vc is None:
+                vc = _volume_confirmation(binance, sym)
+                if vc is not None:
+                    cache.put(f"vc:{sym}", vc)
+            if vc is None:
+                vc = 1.0  # teyit yok → nötr
+            raw.append({**d, "liquidity": liq, "momentum": mom,
+                        "atr_pct": atr, "volume_conf": vc})
+        except Exception as e:
+            log.debug(f"  Faz4 metrik hatası {sym}: {e}")
+
+    for t in due:
+        _SCAN_LAST_RUN[t.name] = now
+    return compute_quality_scores(raw)
+
+
 def calculate_position_size(balance_usdt, coin):
     """
     Risk-bazlı dinamik pozisyon boyutu.
@@ -1620,6 +1740,23 @@ def run_once(dry_run=False):
     log.info(f"Blacklist: {sorted(bl.keys())}")
 
     picks = scan_top(binance, TOP_N * 3, blacklist=set(bl.keys()))
+
+    # Faz 4: hiyerarşik tarama (flag arkasında; 'off' → bu blok atlanır, davranış değişmez).
+    if HIERARCHICAL_SCAN in ("compare", "on"):
+        try:
+            tiered = run_tiered_scan(binance, blacklist=set(bl.keys()))
+            if tiered:
+                log.info(
+                    f"  🧭 Faz4[{HIERARCHICAL_SCAN}]: tiered(top5 Q)="
+                    f"{[(t['symbol'], round(t['Q'], 3)) for t in tiered[:5]]} | "
+                    f"scan_top={[p['symbol'] for p in picks[:5]]}")
+                if HIERARCHICAL_SCAN == "on":
+                    picks = tiered
+            else:
+                log.info(f"  🧭 Faz4[{HIERARCHICAL_SCAN}]: bu tick'te vadesi gelen katman yok")
+        except Exception as e:
+            log.warning(f"  Faz4 tiered scan hatası (scan_top'a düşülüyor): {e}")
+
     if not picks:
         log.warning("hiç aday yok")
         return
