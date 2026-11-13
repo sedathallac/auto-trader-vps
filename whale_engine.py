@@ -172,13 +172,16 @@ def _in_visible_range(price, levels, side):
     return lo <= price <= hi
 
 
-def analyze_wall_samples(samples, cfg=None):
+def analyze_wall_samples(samples, cfg=None, detail=None):
     """samples: [{'t': saniye, 'bids': [(p,q)..], 'asks': [(p,q)..]}] eskiden yeniye.
     Döner (kalıcı_bid_duvarları, kalıcı_ask_duvarları, spoof).
       kalıcı = TÜM örneklerde duvar olan fiyatlar;
       spoof  = İLK örnekte duvar olan bir fiyat seviyesi SON örnekte yok (veya notional'i ilkinin
                whale_spoof_vanish_frac kesrinin altında) VE son-ilk süre ≥ whale_spoof_window_s VE seviye son
-               örneğin görünen derinlik aralığında. <2 örnek / kısa pencere → spoof=False (iddia yok)."""
+               örneğin görünen derinlik aralığında. <2 örnek / kısa pencere → spoof=False (iddia yok).
+    detail (liste verilirse): kaybolan her duvar için tanı kaydı eklenir — {side, price, dist_bps (ilk örnek
+    mid'ine uzaklık), first_notional, last_notional, elapsed_s}. Eşik ayarı (ör. en iyi seviye/touch duvarlarını
+    saymama) tahminle değil bu kayıtla yapılır."""
     if not samples:
         return [], [], False
     mult, min_notional = _cfg(cfg, "whale_wall_mult"), _cfg(cfg, "whale_wall_min_notional")
@@ -191,11 +194,17 @@ def analyze_wall_samples(samples, cfg=None):
         persistent[side] = sorted(set.intersection(*per_sample)) if per_sample else []
         if long_enough:
             first_map, last_map = _level_map(first[side]), _level_map(last[side])
+            mid0 = (first["bids"][0][0] + first["asks"][0][0]) / 2.0 if first["bids"] and first["asks"] else None
             for p in per_sample[0]:
                 if not _in_visible_range(p, last[side], side):
                     continue
                 if last_map.get(p, 0.0) < frac * first_map[p]:
                     spoof = True
+                    if detail is not None and len(detail) < 5:
+                        detail.append({"side": "bid" if side == "bids" else "ask", "price": p,
+                                       "dist_bps": (abs(p - mid0) / mid0 * 1e4) if mid0 else None,
+                                       "first_notional": first_map[p], "last_notional": last_map.get(p, 0.0),
+                                       "elapsed_s": last["t"] - first["t"]})
     return persistent["bids"], persistent["asks"], spoof
 
 
@@ -233,7 +242,9 @@ def compute_signal(inputs, tracker, cfg=None) -> WhaleSignal:
 
         # Duvar kalıcılığı + spoof: yalnız aynı çağrıdaki kısa aralıklı örneklerden. Örnek yoksa (tek defter)
         # kalıcılık/spoof iddiası YOK (spoof=False varsayılan).
-        bw_p, aw_p, spoof = analyze_wall_samples(inputs.get("book_samples") or [], cfg)
+        _samples = inputs.get("book_samples") or []
+        spoof_detail = []
+        bw_p, aw_p, spoof = analyze_wall_samples(_samples, cfg, detail=spoof_detail)
         wall_score = (1.0 if bw_p else 0.0) - (1.0 if aw_p else 0.0)
 
         oi_d = tracker.oi_delta(sym, inputs.get("oi"))
@@ -255,7 +266,9 @@ def compute_signal(inputs, tracker, cfg=None) -> WhaleSignal:
                  "ask_wall_px": (min(aw_p) if aw_p else None), "bid_wall_px": (max(bw_p) if bw_p else None),
                  "gap_up_bps": (gaps_up[0][2] if gaps_up else None),
                  "gap_dn_bps": (gaps_dn[0][2] if gaps_dn else None),
-                 "mid": mid}
+                 "mid": mid,
+                 "spoof_detail": spoof_detail, "book_samples_n": len(_samples),
+                 "book_window_s": (_samples[-1]["t"] - _samples[0]["t"]) if len(_samples) >= 2 else 0.0}
         return WhaleSignal(direction, strength if direction else 0.0, True, comps, spoof)
     except Exception:
         return WhaleSignal()

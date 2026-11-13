@@ -207,3 +207,41 @@ def test_compare_probe_records_whale_metrics_and_never_orders(monkeypatch, tmp_p
     assert forbidden == []
     rows = sqlite3.connect(db).execute("SELECT mode, allow FROM whale_metrics").fetchall()
     assert rows == [("compare", 0)]
+
+
+# ============================ C) SPOOF TANI KAYDI (components_json) ============================
+def test_spoof_detail_records_distance_and_notional_of_vanished_wall():
+    s = [_sample(0.0), _sample(5.0), _sample(10.0, with_wall=False)]
+    detail = []
+    _, _, spoof = we.analyze_wall_samples(s, detail=detail)
+    assert spoof is True and len(detail) == 1
+    d = detail[0]
+    mid = (s[0]["bids"][0][0] + s[0]["asks"][0][0]) / 2
+    assert d["side"] == "bid" and d["price"] == WALL_PX
+    assert d["dist_bps"] == pytest.approx(abs(WALL_PX - mid) / mid * 1e4, abs=0.1)
+    assert d["first_notional"] == pytest.approx(WALL_PX * 60000.0, rel=1e-6)
+    assert d["last_notional"] == pytest.approx(WALL_PX * 100.0)        # level is back to its ordinary size
+    assert d["last_notional"] < 0.2 * d["first_notional"] and d["elapsed_s"] == 10.0
+
+
+def test_signal_components_carry_spoof_detail_and_are_json_serializable(tmp_path, monkeypatch):
+    import json
+    ck = _Clock()
+    wi = we.fetch_whale_inputs(_BookBinance(_books(True, True, False)), "XUSDT", clock=ck.now, sleep=ck.sleep)
+    sig = we.compute_signal(wi, WhaleTracker())
+    det = sig.components["spoof_detail"]
+    assert sig.spoof_suspect and len(det) == 1 and det[0]["side"] == "bid"
+    assert sig.components["book_window_s"] == 10.0 and sig.components["book_samples_n"] == 3
+    json.dumps(sig.components, default=str)
+    stable = we.compute_signal(we.fetch_whale_inputs(_BookBinance(_books(True, True, True)), "XUSDT",
+                                                     clock=_Clock().now, sleep=_Clock().sleep), WhaleTracker())
+    assert stable.components["spoof_detail"] == []
+    db = str(tmp_path / "w.db")
+    we.record_metrics(db, "XUSDT", "compare", 1, sig, None, False, "x")
+    raw = sqlite3.connect(db).execute("SELECT components_json FROM whale_metrics").fetchone()[0]
+    assert json.loads(raw)["spoof_detail"][0]["dist_bps"] >= 0
+
+
+def test_single_book_has_no_spoof_detail_claim():
+    sig = we.compute_signal(_single(True), WhaleTracker())
+    assert sig.components["spoof_detail"] == [] and sig.components["book_samples_n"] == 0
