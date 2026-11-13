@@ -85,18 +85,17 @@ def test_vwap_slippage_grows_with_size_and_none_when_depth_short():
     assert we.vwap_slippage(asks, 1e9) is None
 
 
-def test_wall_persistence_and_spoof_detection():
-    t = [0.0]
-    tr = WhaleTracker(clock=lambda: t[0])
-    wall = [(99.9, 5_000_000.0)]
-    p, spoof = tr.update_walls("X", "bid", wall, 30.0)
-    assert p == [] and not spoof                                 # yeni duvar kalıcı değil
-    t[0] = 31.0
-    p, spoof = tr.update_walls("X", "bid", wall, 30.0)
-    assert p == [99.9] and not spoof                             # kalıcı
-    t[0] = 40.0
-    p, spoof = tr.update_walls("X", "bid", [], 30.0)
-    assert spoof                                                 # kalıcı duvar kayboldu = spoof
+def test_wall_persistence_and_spoof_use_short_interval_samples_not_cross_call_memory():
+    """Faz 9: duvar kalıcılığı/spoof artık aynı çağrıdaki 5 sn aralıklı örneklerden (ayrıntılı testler:
+    test_phase9_spoof_and_probe.py). Tracker çağrılar arası duvar hafızası TUTMAZ."""
+    assert not hasattr(WhaleTracker(), "update_walls")
+    wall = [(98.855, 5_000_000.0 / 98.855)]
+    book = lambda t, w: {"t": t, "bids": sorted(w + [(99.0 - 0.01 * i, 10.0) for i in range(30)], reverse=True),
+                         "asks": [(100.1 + 0.01 * i, 10.0) for i in range(30)]}
+    bid_p, ask_p, spoof = we.analyze_wall_samples([book(0, wall), book(5, wall), book(10, wall)])
+    assert bid_p == [98.855] and not spoof                        # 3 örnekte de duvar → kalıcı
+    bid_p, ask_p, spoof = we.analyze_wall_samples([book(0, wall), book(5, wall), book(10, [])])
+    assert spoof                                                 # 10 sn içinde kayboldu = spoof
 
 
 def test_oi_delta_first_sample_none():

@@ -25,7 +25,12 @@ WHALE_DEFAULTS = {
     "whale_obi_band_bps": 25,          # OBI bandı (mid ± bps)
     "whale_wall_mult": 8.0,            # duvar: kademe ≥ k × medyan kademe
     "whale_wall_min_notional": 250_000.0,
-    "whale_wall_persist_s": 30.0,      # duvar kalıcılığı (spoof filtresi)
+    # Spoof: AYNI aday için kısa aralıkla alınan N order-book örneği (15 dk'lık tarama aralığında duvar kaybı
+    # spoof kanıtı DEĞİLDİR). Spoof = ilk örnekte var, ≥spoof_window_s sonra aynı fiyat seviyesinde yok.
+    "whale_book_samples": 3,
+    "whale_sample_interval_s": 5.0,
+    "whale_spoof_window_s": 10.0,
+    "whale_spoof_vanish_frac": 0.2,    # seviye notional'i ilk örneğin bu kesrinin altına düştüyse "yok"
     "whale_gap_z": 3.0,                # likidite boşluğu z-skoru eşiği
     "whale_big_trade_notional": 100_000.0,   # "balina işlemi" mutlak eşiği
     "whale_dir_min_score": 0.15,       # altında yön = 0
@@ -153,31 +158,55 @@ def vwap_slippage(levels, notional):
     return abs(cost / qty - best) / best
 
 
+# ----------------------------------------------------------------- spoof: kısa aralıklı örnekler
+def _level_map(levels):
+    return {round(p, 8): p * q for p, q in levels}
+
+
+def _in_visible_range(price, levels, side):
+    """Fiyat, bu örnekte görünen derinlik aralığının içinde mi? Dışındaysa 'yok' sonucu çıkarılamaz."""
+    if not levels:
+        return False
+    prices = [p for p, _ in levels]
+    lo, hi = min(prices), max(prices)
+    return lo <= price <= hi
+
+
+def analyze_wall_samples(samples, cfg=None):
+    """samples: [{'t': saniye, 'bids': [(p,q)..], 'asks': [(p,q)..]}] eskiden yeniye.
+    Döner (kalıcı_bid_duvarları, kalıcı_ask_duvarları, spoof).
+      kalıcı = TÜM örneklerde duvar olan fiyatlar;
+      spoof  = İLK örnekte duvar olan bir fiyat seviyesi SON örnekte yok (veya notional'i ilkinin
+               whale_spoof_vanish_frac kesrinin altında) VE son-ilk süre ≥ whale_spoof_window_s VE seviye son
+               örneğin görünen derinlik aralığında. <2 örnek / kısa pencere → spoof=False (iddia yok)."""
+    if not samples:
+        return [], [], False
+    mult, min_notional = _cfg(cfg, "whale_wall_mult"), _cfg(cfg, "whale_wall_min_notional")
+    window, frac = _cfg(cfg, "whale_spoof_window_s"), _cfg(cfg, "whale_spoof_vanish_frac")
+    persistent, spoof = {}, False
+    first, last = samples[0], samples[-1]
+    long_enough = len(samples) >= 2 and (last["t"] - first["t"]) >= window
+    for side in ("bids", "asks"):
+        per_sample = [{round(p, 8) for p, _ in find_walls(sm[side], mult, min_notional)} for sm in samples]
+        persistent[side] = sorted(set.intersection(*per_sample)) if per_sample else []
+        if long_enough:
+            first_map, last_map = _level_map(first[side]), _level_map(last[side])
+            for p in per_sample[0]:
+                if not _in_visible_range(p, last[side], side):
+                    continue
+                if last_map.get(p, 0.0) < frac * first_map[p]:
+                    spoof = True
+    return persistent["bids"], persistent["asks"], spoof
+
+
 # ----------------------------------------------------------------- kalıcılık izleyici
 class WhaleTracker:
-    """Duvar kalıcılığı ve OI deltası için sembol-bazlı hafıza (çağrılar arası yaşar)."""
+    """Çağrılar arası hafıza: yalnız OI deltası. (Duvar kalıcılığı/spoof artık çağrılar arası değil, aynı çağrı
+    içindeki kısa aralıklı order-book örneklerinden hesaplanır — bkz. analyze_wall_samples.)"""
 
     def __init__(self, clock=time.time):
         self._clock = clock
-        self._walls = {}   # (sym, side, price) -> first_seen
-        self._seen_persistent = {}  # (sym, side, price) -> True (kalıcı görülmüş)
         self._oi = {}      # sym -> (oi, ts)
-
-    def update_walls(self, symbol, side, walls, persist_s):
-        """Kalıcı (≥persist_s) duvarları ve kaybolan kalıcı duvar (spoof) bayrağını döndürür."""
-        now = self._clock()
-        cur = {(symbol, side, round(p, 8)) for p, _ in walls}
-        persistent, spoof = [], False
-        for k in cur:
-            first = self._walls.setdefault(k, now)
-            if now - first >= persist_s:
-                persistent.append(k[2])
-                self._seen_persistent[k] = True
-        for k in [k for k in self._walls if k[0] == symbol and k[1] == side and k not in cur]:
-            if self._seen_persistent.pop(k, False) or (now - self._walls[k]) >= persist_s:
-                spoof = True
-            del self._walls[k]
-        return persistent, spoof
 
     def oi_delta(self, symbol, oi_now):
         """Önceki örneğe göre (oi_now−prev)/prev; ilk örnek → None."""
@@ -202,12 +231,9 @@ def compute_signal(inputs, tracker, cfg=None) -> WhaleSignal:
         if obi is None or cvd is None:
             return WhaleSignal()
 
-        persist = _cfg(cfg, "whale_wall_persist_s")
-        bw = find_walls(bids, _cfg(cfg, "whale_wall_mult"), _cfg(cfg, "whale_wall_min_notional"))
-        aw = find_walls(asks, _cfg(cfg, "whale_wall_mult"), _cfg(cfg, "whale_wall_min_notional"))
-        bw_p, bw_spoof = tracker.update_walls(sym, "bid", bw, persist)
-        aw_p, aw_spoof = tracker.update_walls(sym, "ask", aw, persist)
-        spoof = bw_spoof or aw_spoof
+        # Duvar kalıcılığı + spoof: yalnız aynı çağrıdaki kısa aralıklı örneklerden. Örnek yoksa (tek defter)
+        # kalıcılık/spoof iddiası YOK (spoof=False varsayılan).
+        bw_p, aw_p, spoof = analyze_wall_samples(inputs.get("book_samples") or [], cfg)
         wall_score = (1.0 if bw_p else 0.0) - (1.0 if aw_p else 0.0)
 
         oi_d = tracker.oi_delta(sym, inputs.get("oi"))
@@ -299,13 +325,28 @@ def evaluate_filter(side_dir, signal, edge, cfg=None):
 
 
 # ----------------------------------------------------------------- veri toplama (public GET)
-def fetch_whale_inputs(binance, symbol):
-    """Public REST (rate-limit dostu: depth(100)=5 + aggTrades=20 + OI=1 + premiumIndex=1).
-    Herhangi bir hata → None (fail-closed). Yalnız Faz 4 'Hot' adayları için çağrılmalı."""
+def fetch_whale_inputs(binance, symbol, cfg=None, clock=None, sleep=None):
+    """Public REST. Aday başına `whale_book_samples` (3) order-book örneği, `whale_sample_interval_s` (5 sn) arayla;
+    son örnek OBI/maliyet için kullanılır. İlk örnek alınamazsa None (fail-closed); sonraki bir örnek alınamazsa
+    eldekilerle devam edilir (spoof iddiası olmadan). Ek: aggTrades + OI + premiumIndex."""
+    clock = clock or time.time
+    sleep = sleep or time.sleep
+    n = max(1, int(_cfg(cfg, "whale_book_samples")))
+    gap = float(_cfg(cfg, "whale_sample_interval_s"))
     try:
-        ob = binance.order_book(symbol, limit=100)
-        if not isinstance(ob, dict) or "bids" not in ob:
-            return None
+        samples = []
+        for i in range(n):
+            if i:
+                sleep(gap)
+            try:
+                ob = binance.order_book(symbol, limit=100)
+                if not isinstance(ob, dict) or "bids" not in ob:
+                    raise ValueError("bad order book")
+                samples.append({"t": clock(), "bids": parse_levels(ob["bids"]), "asks": parse_levels(ob["asks"])})
+            except Exception:
+                if not samples:
+                    return None
+                break
         trades = binance._get("/fapi/v1/aggTrades", {"symbol": symbol, "limit": 500})
         if not isinstance(trades, list):
             return None
@@ -313,7 +354,8 @@ def fetch_whale_inputs(binance, symbol):
         oi_val = float(oi["openInterest"]) if isinstance(oi, dict) and "openInterest" in oi else None
         pi = binance._get("/fapi/v1/premiumIndex", {"symbol": symbol})
         funding = float(pi["lastFundingRate"]) if isinstance(pi, dict) and "lastFundingRate" in pi else None
-        return {"symbol": symbol, "bids": parse_levels(ob["bids"]), "asks": parse_levels(ob["asks"]),
+        last = samples[-1]
+        return {"symbol": symbol, "bids": last["bids"], "asks": last["asks"], "book_samples": samples,
                 "trades": trades, "oi": oi_val, "funding": funding}
     except Exception:
         return None

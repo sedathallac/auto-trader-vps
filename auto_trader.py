@@ -60,6 +60,12 @@ STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
 TOP_N = 2
+# Faz 9: WHALE_HUNTING=compare iken bu kadar aday DEĞERLENDİRİLİR (ilk TOP_N open_coin ile; kalanı compare_probe ile
+# YALNIZ loglanır — emir/blacklist/rezervasyon yok). 0 veya TOP_N altı → ek aday yok.
+try:
+    TOP_N_COMPARE = max(0, min(50, int(os.getenv("TOP_N_COMPARE", "20"))))
+except ValueError:
+    TOP_N_COMPARE = 20
 MAX_OPEN_POSITIONS = max(0, int(os.getenv("MAX_OPEN_POSITIONS", "0")))  # 0 = EMERGENCY (yeni giris durdu)
 
 RISK_CONFIG = {
@@ -1280,6 +1286,113 @@ def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=Non
                        critical=True)
 
 
+def _faz6_confirm(binance, symbol, side, sl_pct, mode):
+    """Faz 6 teyit. compare: logla + signal_outcomes'a yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
+    Döner: True = devam, False = reddet (yalnız mode=='on')."""
+    try:
+        import strategy_engine as _se
+        _sd6 = 1 if side == 1 else -1
+        _lim = RISK_CONFIG["confirm_kline_limit"]
+        _main6 = _se.fetch_candles(binance, symbol, RISK_CONFIG["confirm_tf_main"], _lim)
+        _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
+                for tf in RISK_CONFIG["confirm_tf_veto"]}
+        _store6 = _se.SignalStore(_se.SIGNAL_DB)
+        if _main6 is not None:
+            _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
+        _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
+        log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
+                 f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
+                 f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
+        if _main6 is not None:
+            for _r6 in _v6.readings:
+                if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
+                    _store6.record_event(symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
+                                         RISK_CONFIG["confirm_horizon"])
+        if mode == "on" and not _v6.allow:
+            log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
+            return False
+    except Exception as _e:
+        if mode == "on":
+            log.warning(f"  Faz6 teyit hatası, fail-closed (giriş yok): {_e}")
+            return False
+        log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
+    return True
+
+
+def _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, mode):
+    """Faz 5 balina. compare: logla + whale_metrics'e yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
+    Döner: True = devam, False = reddet (yalnız mode=='on')."""
+    try:
+        import whale_engine as _we
+        global _WHALE_TRACKER
+        if _WHALE_TRACKER is None:
+            _WHALE_TRACKER = _we.WhaleTracker()
+        _sd = 1 if side == 1 else -1
+        _wi = _we.fetch_whale_inputs(binance, symbol, cfg=RISK_CONFIG)
+        if _wi is None:
+            _sig, _edge = _we.WhaleSignal(), None
+        else:
+            _sig = _we.compute_signal(_wi, _WHALE_TRACKER, RISK_CONFIG)
+            # Offline backtest kalibrasyonu (OOS skill>0 ise) → p_win; yoksa cold-start formülü.
+            _pw = (_we.pwin_from_calibration(_sd * _sig.components.get("cvd", 0.0),
+                                             _we.load_pwin_calibration(_we.WHALE_PWIN_CALIBRATION))
+                   if _sig.quality_ok else None)
+            _edge = _we.expected_edge(
+                _sd, _sig, sl_pct=sl_pct, tp_pct=tp_pct, atr_pct=atr_pct,
+                drawdown=float(getattr(risk, "current_drawdown", 0.0) or 0.0),
+                notional=RISK_CONFIG["max_notional"], bids=_wi["bids"], asks=_wi["asks"],
+                fee_rt=RISK_CONFIG["fee_pct_round_trip"], funding_rate=_wi.get("funding"),
+                p_win_calibrated=_pw, calibrated=_pw is not None,
+                cfg=RISK_CONFIG) if _sig.quality_ok else None
+        _allow, _why = _we.evaluate_filter(_sd, _sig, _edge, RISK_CONFIG)
+        log.info(f"  🐋 Faz5[{mode}]: dir={_sig.direction:+d} güç={_sig.strength:.2f} "
+                 f"spoof={_sig.spoof_suspect} | "
+                 + (f"p_win={_edge.p_win:.3f} E[kâr]={_edge.e_profit*100:.3f}% "
+                    f"maliyet={_edge.cost*100:.3f}% RP={_edge.risk_premium*100:.3f}% "
+                    f"E_net={_edge.e_net*100:.3f}%" if _edge else "edge=yok")
+                 + f" | {'GEÇER' if _allow else 'RED'}: {_why}")
+        _we.record_metrics(_we.WHALE_DB, symbol, mode, _sd, _sig, _edge, _allow, _why)
+        if mode == "on" and not _allow:
+            log.info(f"  atlandı: balina filtresi ({_why})")
+            return False
+    except Exception as _e:
+        if mode == "on":
+            log.warning(f"  Faz5 balina filtresi hatası, fail-closed (giriş yok): {_e}")
+            return False
+        log.warning(f"  Faz5 whale_engine hatası (compare, karar etkilenmedi): {_e}")
+    return True
+
+
+def compare_probe(binance, coin, risk=None):
+    """YALNIZ-LOG aday değerlendirmesi (WHALE_HUNTING=compare): Faz 6 + Faz 5 compare verisini toplar. Emir yok,
+    blacklist yazmaz, rezervasyon/HB yok, hiçbir şeyi reddetmez. Döner: değerlendirildi mi."""
+    symbol = coin["symbol"]
+    side, side_name = decide_side(coin)
+    if side is None:
+        log.info(f"  🔎 probe {symbol}: yön belirsiz (%{float(coin['priceChangePercent']):+.2f}) — atlandı")
+        return False
+    atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
+    if atr_pct is None:
+        atr_pct = 0.02
+    sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
+    tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
+    log.info(f"→ 🔎 probe {symbol} yön={side_name} (yalnız compare verisi; emir YOK)")
+    if STRATEGY_CONFIRMATION in ("compare", "on"):
+        _faz6_confirm(binance, symbol, side, sl_pct, "compare")
+    if WHALE_HUNTING in ("compare", "on"):
+        _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, "compare")
+    return True
+
+
+def select_candidates(picks, active, bl, top_n, total_n):
+    """(ana adaylar, probe adayları). Ana = ilk top_n uygun aday (open_coin); probe = sonraki (total_n - top_n)."""
+    eligible = [c for c in picks
+                if c["symbol"].replace("USDT", "-USDT") not in active and c["symbol"] not in bl]
+    main = eligible[:top_n]
+    probes = eligible[top_n:max(top_n, total_n)]
+    return main, probes
+
+
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
     # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
     # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
@@ -1337,35 +1450,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     log.info(f"  📊 ATR=%{atr_pct*100:.2} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
 
     # === Faz 6: strateji teyit FİLTRESİ ('off' → atlanır, ek API çağrısı yok) ===
-    # 15m ana TF; 1h/4h yalnız trend VETO'su. compare: logla + signal_outcomes; on: yalnız REDDEDEBİLİR.
     if STRATEGY_CONFIRMATION in ("compare", "on"):
-        try:
-            import strategy_engine as _se
-            _sd6 = 1 if side == 1 else -1
-            _lim = RISK_CONFIG["confirm_kline_limit"]
-            _main6 = _se.fetch_candles(binance, symbol, RISK_CONFIG["confirm_tf_main"], _lim)
-            _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
-                    for tf in RISK_CONFIG["confirm_tf_veto"]}
-            _store6 = _se.SignalStore(_se.SIGNAL_DB)
-            if _main6 is not None:
-                _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
-            _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
-            log.info(f"  🧪 Faz6[{STRATEGY_CONFIRMATION}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
-                     f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
-                     f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
-            if _main6 is not None:
-                for _r6 in _v6.readings:
-                    if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
-                        _store6.record_event(symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
-                                             RISK_CONFIG["confirm_horizon"])
-            if STRATEGY_CONFIRMATION == "on" and not _v6.allow:
-                log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
-                return False
-        except Exception as _e:
-            if STRATEGY_CONFIRMATION == "on":
-                log.warning(f"  Faz6 teyit hatası, fail-closed (giriş yok): {_e}")
-                return False
-            log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
+        if not _faz6_confirm(binance, symbol, side, sl_pct, STRATEGY_CONFIRMATION):
+            return False
 
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
@@ -1375,46 +1462,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         slippage_pct = 0.0
 
     # === Faz 5: balina FİLTRESİ ('off' → atlanır, ek API çağrısı yok) ===
-    # compare: logla + whale_metrics'e yaz, karar değişmez. on: yalnız REDDEDEBİLİR.
     if WHALE_HUNTING in ("compare", "on"):
-        try:
-            import whale_engine as _we
-            global _WHALE_TRACKER
-            if _WHALE_TRACKER is None:
-                _WHALE_TRACKER = _we.WhaleTracker()
-            _sd = 1 if side == 1 else -1
-            _wi = _we.fetch_whale_inputs(binance, symbol)
-            if _wi is None:
-                _sig, _edge = _we.WhaleSignal(), None
-            else:
-                _sig = _we.compute_signal(_wi, _WHALE_TRACKER, RISK_CONFIG)
-                # Offline backtest kalibrasyonu (OOS skill>0 ise) → p_win; yoksa cold-start formülü.
-                _pw = (_we.pwin_from_calibration(_sd * _sig.components.get("cvd", 0.0),
-                                                 _we.load_pwin_calibration(_we.WHALE_PWIN_CALIBRATION))
-                       if _sig.quality_ok else None)
-                _edge = _we.expected_edge(
-                    _sd, _sig, sl_pct=sl_pct, tp_pct=tp_pct, atr_pct=atr_pct,
-                    drawdown=float(getattr(risk, "current_drawdown", 0.0) or 0.0),
-                    notional=RISK_CONFIG["max_notional"], bids=_wi["bids"], asks=_wi["asks"],
-                    fee_rt=RISK_CONFIG["fee_pct_round_trip"], funding_rate=_wi.get("funding"),
-                    p_win_calibrated=_pw, calibrated=_pw is not None,
-                    cfg=RISK_CONFIG) if _sig.quality_ok else None
-            _allow, _why = _we.evaluate_filter(_sd, _sig, _edge, RISK_CONFIG)
-            log.info(f"  🐋 Faz5[{WHALE_HUNTING}]: dir={_sig.direction:+d} güç={_sig.strength:.2f} "
-                     f"spoof={_sig.spoof_suspect} | "
-                     + (f"p_win={_edge.p_win:.3f} E[kâr]={_edge.e_profit*100:.3f}% "
-                        f"maliyet={_edge.cost*100:.3f}% RP={_edge.risk_premium*100:.3f}% "
-                        f"E_net={_edge.e_net*100:.3f}%" if _edge else "edge=yok")
-                     + f" | {'GEÇER' if _allow else 'RED'}: {_why}")
-            _we.record_metrics(_we.WHALE_DB, symbol, WHALE_HUNTING, _sd, _sig, _edge, _allow, _why)
-            if WHALE_HUNTING == "on" and not _allow:
-                log.info(f"  atlandı: balina filtresi ({_why})")
-                return False
-        except Exception as _e:
-            if WHALE_HUNTING == "on":
-                log.warning(f"  Faz5 balina filtresi hatası, fail-closed (giriş yok): {_e}")
-                return False
-            log.warning(f"  Faz5 whale_engine hatası (compare, karar etkilenmedi): {_e}")
+        if not _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, WHALE_HUNTING):
+            return False
 
     # Bakiye
     balance = binance.get_available_balance("USDT")
@@ -1837,7 +1887,8 @@ def run_once(dry_run=False):
     log.info(f"Aktif: {sorted(active) if active else 'yok'}")
     log.info(f"Blacklist: {sorted(bl.keys())}")
 
-    picks = scan_top(binance, TOP_N * 3, blacklist=set(bl.keys()))
+    picks = scan_top(binance, max(TOP_N * 3, (TOP_N_COMPARE * 2) if WHALE_HUNTING == "compare" else 0),
+                     blacklist=set(bl.keys()))
 
     # Faz 4: hiyerarşik tarama (flag arkasında; 'off' → bu blok atlanır, davranış değişmez).
     if HIERARCHICAL_SCAN in ("compare", "on"):
@@ -1859,13 +1910,20 @@ def run_once(dry_run=False):
         log.warning("hiç aday yok")
         return
 
-    candidates = [c for c in picks
-                  if c["symbol"].replace("USDT", "-USDT") not in active
-                  and c["symbol"] not in bl][:TOP_N]
+    ok, n_main, n_probe = process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, coordinator)
+    if n_main == 0:
+        return
+    log.info(f"Bitti: {ok}/{n_main}" + (f" (+{n_probe} compare probe)" if n_probe else ""))
+
+
+def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, coordinator):
+    """Ana adaylar open_coin ile (HB_OFFLINE'da dry-run), WHALE_HUNTING=compare iken ek adaylar compare_probe ile
+    (yalnız log). Döner (başarılı_open_coin, ana_sayısı, probe_sayısı)."""
+    total_n = TOP_N_COMPARE if WHALE_HUNTING == "compare" else TOP_N
+    candidates, probes = select_candidates(picks, active, bl, TOP_N, total_n)
     if not candidates:
         log.info("yeni aday yok")
-        return
-
+        return 0, 0, 0
     ok = 0
     for c in candidates:
         # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et
@@ -1889,7 +1947,14 @@ def run_once(dry_run=False):
         except Exception as e:
             log.exception(f"{c['symbol']} istisna: {e}")
             add_blacklist(c["symbol"], "istisna")
-    log.info(f"Bitti: {ok}/{len(candidates)}")
+    n_probe = 0
+    for c in probes:
+        try:
+            if compare_probe(binance, c, risk=risk):
+                n_probe += 1
+        except Exception as e:                       # probe asla taramayı/emir akışını etkilemez
+            log.warning(f"  🔎 probe {c.get('symbol')} hatası (yok sayıldı): {e}")
+    return ok, len(candidates), n_probe
 
 
 def main():
