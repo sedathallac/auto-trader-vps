@@ -1716,7 +1716,7 @@ def run_once(dry_run=False):
         except Exception as e:
             log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
             active = set()
-    if len(active) >= MAX_OPEN_POSITIONS:
+    if not HB_OFFLINE and len(active) >= MAX_OPEN_POSITIONS:
         log.info(f"Maks pozisyon limiti ({MAX_OPEN_POSITIONS}) dolu → yeni açmıyorum")
         return
 
@@ -1779,7 +1779,7 @@ def run_once(dry_run=False):
             except Exception as e:
                 log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
                 break
-        if len(_cur_active) >= MAX_OPEN_POSITIONS:
+        if not HB_OFFLINE and len(_cur_active) >= MAX_OPEN_POSITIONS:
             log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
             break
         try:
