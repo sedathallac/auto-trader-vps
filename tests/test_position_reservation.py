@@ -49,14 +49,20 @@ class TestNaiveCheckThenActIsUnsafe(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            barrier = threading.Barrier(4)
+            # Deterministic interleaving (no sleep): every thread finishes its CHECK before any thread does its ACT.
+            # The old version widened the TOCTOU window with time.sleep(0.02), a race against the scheduler: under
+            # CPU contention a late thread ran its check after the others had already inserted, saw the cap reached
+            # and the test failed (25/25 on a loaded host). The second barrier makes the unsafe window exact.
+            start = threading.Barrier(4)
+            all_checked = threading.Barrier(4)
 
             def naive_open(symbol):
                 c = sqlite3.connect(db, timeout=5)
-                barrier.wait()  # maximize overlap of the check window
+                start.wait(timeout=30)
                 used = c.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
-                if used < MAX:                       # check
-                    time.sleep(0.02)                 # the TOCTOU window
+                admitted = used < MAX                # check
+                all_checked.wait(timeout=30)         # <- TOCTOU window: all checks done, no act yet
+                if admitted:
                     try:
                         c.execute("INSERT INTO positions (symbol) VALUES (?)", (symbol,))  # act
                         c.commit()
