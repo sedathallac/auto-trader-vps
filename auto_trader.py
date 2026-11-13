@@ -1427,22 +1427,24 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     _new_lev = None  # 'on' modunda aşağıdaki kaldıraç bloğunda kullanılır
     if SCIENTIFIC_SIZING in ("compare", "on"):
         try:
-            from leverage_engine import (signal_stats_from_ledger, scientific_leverage,
-                                         scientific_position_size, margin_for)
+            from leverage_engine import signal_stats_from_ledger, unified_sizing
             _dd = float(getattr(risk, "current_drawdown", 0.0) or 0.0)
             _stats = signal_stats_from_ledger(SL_LEDGER_DB)
-            _new_s = scientific_position_size(
-                balance, RISK_CONFIG["risk_per_trade_pct"], atr_pct, _stats,
-                MIN_NOTIONAL_USDT, MAX_NOTIONAL_USDT)
-            _new_lev = scientific_leverage(atr_pct, _stats, _dd)
+            # Faz 7: Faz 3 çıktısı RiskEngine değişmezleriyle birleştirilir (S≤risk_notional,
+            # L≤tasfiye-güvenli tavan, margin≤bütçe). risk_guards kapalıysa yalnız sert tavanlar.
+            _risk_n = (target_notional
+                       if (RISK_CONFIG.get("risk_guards_enabled", False) and risk is not None) else None)
+            _u = unified_sizing(balance, atr_pct, sl_pct + slippage_pct, _dd, _stats, RISK_CONFIG,
+                                MIN_NOTIONAL_USDT, MAX_NOTIONAL_USDT, risk_notional=_risk_n)
+            _new_s, _new_lev = _u.notional, float(_u.leverage)
             _old_lev = (calculate_dynamic_leverage(atr_pct)
                         if RISK_CONFIG.get("risk_guards_enabled", False) else LEVERAGE)
             log.info(
                 f"  🔬 Faz3[{SCIENTIFIC_SIZING}]: q={_stats.q:.2f} "
                 f"(n={_stats.n}, f*={_stats.f_star:.3f}, reliable={_stats.reliable}) | "
-                f"S: eski={target_notional:.2f} → yeni={_new_s:.2f} | "
-                f"L: eski={_old_lev} → yeni={_new_lev:.2f} | "
-                f"margin≈{margin_for(_new_s, _new_lev):.2f} USDT")
+                f"S: eski={target_notional:.2f} → yeni={_new_s:.2f} (faz3={_u.s_faz3:.2f}) | "
+                f"L: eski={_old_lev} → yeni={_u.leverage} (faz3={_u.l_faz3:.2f}) | "
+                f"margin≈{_u.margin:.2f} USDT | sınırlar={_u.caps or '-'}")
             if SCIENTIFIC_SIZING == "on":
                 target_notional = _new_s
         except Exception as _e:

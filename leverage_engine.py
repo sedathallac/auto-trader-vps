@@ -39,6 +39,7 @@ GÜVENLİK: Bu modül SAF hesaplamadır; borsaya hiçbir şey göndermez. auto_t
 üç-durumlu bayrak (off | compare | on) VARSAYILAN 'off' olduğundan, entegrasyon canlı
 davranışı değiştirmez; 'compare' eski↔yeni değerleri yan yana loglar.
 """
+import math
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,3 +165,56 @@ def scientific_position_size(balance: float, r: float, sigma: float,
 def margin_for(notional: float, leverage: float) -> float:
     """Birleştirme tutarlılığı: margin = S / L (L>0)."""
     return notional / leverage if leverage > 0 else float("inf")
+
+
+# ----------------------------------------------------------------------------
+# Faz 7 — birleşik boyutlandırma: Faz 3 (S, L) × RiskEngine (sabit riskler)
+# ----------------------------------------------------------------------------
+def liquidation_safe_leverage_cap(sl_pct, buffer=2.0, maint=0.005, lo=1.0):
+    """Tasfiye mesafesi (≈ 1/L − bakım marjı) SL mesafesinin en az `buffer` katı olacak şekilde
+    kaldıraç tavanı: L_max = 1 / (buffer·sl + maint). SL tasfiyeden ÖNCE tetiklenmeli."""
+    if sl_pct is None or sl_pct <= 0:
+        return float(lo)
+    return max(float(lo), 1.0 / (buffer * float(sl_pct) + maint))
+
+
+@dataclass
+class UnifiedSizing:
+    notional: float       # nihai S (USDT)
+    leverage: int         # nihai L (tam sayı; borsaya bu gider)
+    margin: float         # S / L
+    s_faz3: float         # sınırlar uygulanmadan önce Faz 3 çıktısı
+    l_faz3: float
+    caps: list            # hangi sınırlar devreye girdi: risk_engine | liquidation | margin
+
+
+def unified_sizing(balance, sigma, sl_pct, drawdown, stats, risk_cfg,
+                   min_notional, max_notional, risk_notional=None, cfg=LEV_ENGINE_CONFIG):
+    """Faz 3 formülünü RiskEngine değişmezleriyle birleştirir (risk her zaman önceliklidir):
+
+      1) S  ≤ risk_notional  (RiskEngine.approve_trade: risk_per_trade·Kelly/(SL+fee) üst sınırı)
+         → Faz 3 yalnız KÜÇÜLTEBİLİR, RiskEngine'in kayıp-bütçesini aşamaz.
+      2) L  ≤ 1/(2·SL + bakım)  (SL, tasfiyeden önce tetiklenir); tam sayıya AŞAĞI yuvarlanır
+         (yukarı yuvarlama tasfiye tavanını delebilirdi).
+      3) margin = S/L ≤ max_total_margin_pct · bakiye  (tek işlem tüm marjin bütçesini yemez);
+         aşılırsa S küçültülür.
+    risk_notional=None (risk_guards kapalı) → yalnız sert tavanlar (min/max_notional) geçerli."""
+    s3 = scientific_position_size(balance, risk_cfg["risk_per_trade_pct"], sigma, stats,
+                                  min_notional, max_notional, cfg)
+    l3 = scientific_leverage(sigma, stats, drawdown, cfg)
+    caps = []
+    s = s3
+    if risk_notional is not None and risk_notional < s:
+        s = float(risk_notional)
+        caps.append("risk_engine")
+    l_cap = liquidation_safe_leverage_cap(sl_pct)
+    lev = max(1, int(round(l3)))
+    lev_ceiling = max(1, int(math.floor(l_cap)))
+    if lev > lev_ceiling:
+        lev = lev_ceiling
+        caps.append("liquidation")
+    max_margin = float(risk_cfg.get("max_total_margin_pct", 0.4)) * max(float(balance), 0.0)
+    if s / lev > max_margin:
+        s = lev * max_margin
+        caps.append("margin")
+    return UnifiedSizing(s, lev, s / lev, s3, l3, caps)
