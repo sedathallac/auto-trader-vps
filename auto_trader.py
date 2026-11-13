@@ -1272,7 +1272,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         except Exception as e:
             log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
             return False
-    if len(_cur) >= MAX_OPEN_POSITIONS:
+    if not HB_OFFLINE and len(_cur) >= MAX_OPEN_POSITIONS:
         log.info(f"  C6: limit dolu ({len(_cur)}/{MAX_OPEN_POSITIONS}), atlanıyor")
         return False
     symbol = coin["symbol"]
