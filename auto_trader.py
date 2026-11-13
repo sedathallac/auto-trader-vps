@@ -35,6 +35,11 @@ LEVERAGE = 3
 # compare=eski↔yeni yan yana loglanır (eski kullanılır), on=yeni formül kullanılır
 # (önce kalibrasyon + dry-run şart). Varsayılan 'off'.
 SCIENTIFIC_SIZING = os.getenv("SCIENTIFIC_SIZING", "off").strip().lower()
+# HB_OFFLINE: Hummingbot API (port 8000) olmadan çalıştırma — test/kalibrasyon bypass'ı.
+# Aktifken reconcile_positions ve sync_risk_engine HB'ye gitmez; open_coin dry-run'a
+# zorlanır (GERÇEK EMİR YOK), böylece Faz3[compare] kalibrasyon logları HB olmadan
+# toplanabilir. Varsayılan KAPALI → production davranışı DEĞİŞMEZ.
+HB_OFFLINE = os.getenv("HB_OFFLINE", "0").strip().lower() in ("1", "true", "yes", "on")
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
@@ -414,6 +419,9 @@ def sync_risk_engine(risk, hb, binance=None):
     If positionRisk errors/timeouts, is stale/missing, or the position is not
     zero (partial close), the close is NOT recorded — it stays UNKNOWN/open and a
     CRITICAL alarm is raised (fail-closed)."""
+    if HB_OFFLINE:
+        log.info("🔌 HB_OFFLINE: sync_risk_engine atlandı (HB API'ye gidilmedi)")
+        return
     import sqlite3 as _sq
     from datetime import timezone as _tz
 
@@ -492,6 +500,9 @@ def sync_risk_engine(risk, hb, binance=None):
 def reconcile_positions(binance, hb):
     """Borsa pozisyonları ile Hummingbot executor'larını karşılaştır"""
     log.info("🔍 State Reconciliation...")
+    if HB_OFFLINE:
+        log.info("🔌 HB_OFFLINE: reconciliation atlandı (HB'siz; drift yok sayıldı)")
+        return True
     try:
         exchange_positions = binance.position_risk()
         if not isinstance(exchange_positions, list):
@@ -1508,6 +1519,9 @@ def run_once(dry_run=False):
 
     binance = BinanceAPI(bk, bs)
     hb = HBAPI(HB_API, hu, hp)
+    if HB_OFFLINE:
+        log.warning("🔌 HB_OFFLINE aktif — Hummingbot API atlanıyor; open_coin dry-run'a "
+                    "zorlanacak (gerçek emir YOK). Kalibrasyon/log toplama modu.")
 
     # inc13: wire the SINGLE close authority into the live loop. Every position
     # close routes through this CloseCoordinator (idempotent, flat-confirmed, HB
@@ -1566,11 +1580,14 @@ def run_once(dry_run=False):
                      "(açık pozisyonların borsa SL koruma denetimi çalıştı)")
         return
 
-    try:
-        active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-    except Exception as e:
-        log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
-        active = set()
+    if HB_OFFLINE:
+        active = set()  # HB_OFFLINE: HB'siz; aktif executor yok sayılır (kalibrasyon modu)
+    else:
+        try:
+            active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
+        except Exception as e:
+            log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
+            active = set()
     if len(active) >= MAX_OPEN_POSITIONS:
         log.info(f"Maks pozisyon limiti ({MAX_OPEN_POSITIONS}) dolu → yeni açmıyorum")
         return
@@ -1609,17 +1626,22 @@ def run_once(dry_run=False):
     ok = 0
     for c in candidates:
         # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et
-        try:
-            _cur_active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-        except Exception as e:
-            log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
-            break
+        if HB_OFFLINE:
+            _cur_active = set()  # HB_OFFLINE: kalibrasyon modu, limit kontrolü HB'siz
+        else:
+            try:
+                _cur_active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
+            except Exception as e:
+                log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
+                break
         if len(_cur_active) >= MAX_OPEN_POSITIONS:
             log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
             break
         try:
-            if open_coin(binance, hb, c, dry_run=dry_run, risk=risk, reserver=reserver,
-                         coordinator=coordinator):
+            # HB_OFFLINE: open_coin dry-run'a zorlanır — compare log üretilir ama GERÇEK
+            # EMİR GÖNDERİLMEZ (HB'siz güvenli kalibrasyon/log toplama).
+            if open_coin(binance, hb, c, dry_run=(dry_run or HB_OFFLINE), risk=risk,
+                         reserver=reserver, coordinator=coordinator):
                 ok += 1
         except Exception as e:
             log.exception(f"{c['symbol']} istisna: {e}")
