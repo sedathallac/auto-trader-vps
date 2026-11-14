@@ -237,6 +237,66 @@ def fetch_candles(binance, symbol, tf, limit=250):
         return None
 
 
+def fetch_candles_from(binance, symbol, tf, start_ts, limit=1000, max_rows=10000):
+    """Verilen mum açılış zamanından bugüne kadar kapanmış mumları sayfalayarak alır.
+
+    Bekleyen eski sinyallerin, sembol uzun süre aday listesinden çıkmış olsa bile
+    250 mumluk son pencereye takılıp kalmasını önler. Son açık mum parse_klines
+    tarafından yine atılır. Her API çağrısı en fazla 1000 mum ister.
+    """
+    interval_ms = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000,
+        "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000,
+        "4h": 14_400_000, "6h": 21_600_000,
+        "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000, "3d": 259_200_000,
+        "1w": 604_800_000,
+    }
+    if tf not in interval_ms or limit <= 0 or max_rows <= 0:
+        return None
+
+    cursor = int(start_ts) + interval_ms[tf]
+    rows = []
+
+    try:
+        while len(rows) < max_rows:
+            page_limit = min(int(limit), 1000, max_rows - len(rows))
+            batch = binance._get(
+                "/fapi/v1/klines",
+                {
+                    "symbol": symbol,
+                    "interval": tf,
+                    "startTime": cursor,
+                    "limit": page_limit,
+                },
+            )
+            if not isinstance(batch, list) or not batch:
+                break
+
+            fresh = [r for r in batch if int(r[0]) >= cursor]
+            if not fresh:
+                break
+
+            fresh = fresh[:page_limit]
+            rows.extend(fresh)
+
+            if len(fresh) < page_limit:
+                break
+
+            next_cursor = int(fresh[-1][0]) + interval_ms[tf]
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+
+        if not rows:
+            return None
+
+        return parse_klines(rows, drop_unclosed=True)
+    except Exception:
+        return None
+
+
 # ===================================================================== sinyal okumaları
 @dataclass
 class SignalReading:
@@ -486,15 +546,34 @@ def kaplan_meier(durations, observed):
 
 
 def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_pct):
-    """real ⇔ H sonunda getiri > maliyet VE ufukta SL aşılmadı. (real, fwd_ret, persist_bars) döner.
-    persist_bars: yönde kapanışın ilk kez giriş fiyatının KARŞI tarafına geçtiği mum (yoksa horizon)."""
+    """Sekiz kapanmış gelecek mumdan teorik sonuç üretir.
+
+    sl_pct yoksa yalnızca fwd_ret ve persist_bars hesaplanır.
+    real=None bırakılır; bilinmeyen geçmiş stop mesafesi uydurulmaz.
+    """
     n = min(horizon, len(fut_c))
-    if n < horizon:
+    if n < horizon or direction not in (-1, 1) or entry <= 0:
         return None
+
     fwd = direction * (fut_c[horizon - 1] - entry) / entry
-    mae = min(direction * ((fut_l[i] if direction > 0 else fut_h[i]) - entry) / entry for i in range(n))
-    persist = next((i + 1 for i in range(n) if direction * (fut_c[i] - entry) < 0), horizon)
-    return (fwd > cost and mae > -sl_pct), fwd, persist
+    persist = next(
+        (i + 1 for i in range(n)
+         if direction * (fut_c[i] - entry) < 0),
+        horizon,
+    )
+
+    if sl_pct is None:
+        return None, fwd, persist
+
+    stop_pct = float(sl_pct)
+    if not math.isfinite(stop_pct) or stop_pct <= 0:
+        return None
+
+    mae = min(
+        direction * ((fut_l[i] if direction > 0 else fut_h[i]) - entry) / entry
+        for i in range(n)
+    )
+    return (fwd > cost and mae > -stop_pct), fwd, persist
 
 
 # ===================================================================== signal_outcomes (AYRI sqlite)
@@ -516,12 +595,13 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS signal_outcomes (
     resolved INTEGER NOT NULL DEFAULT 0,
     real INTEGER,
     fwd_ret REAL,
-    persist_bars INTEGER
+    persist_bars INTEGER,
+    sl_pct REAL
 )"""
 
 
 class SignalStore:
-    """signal_outcomes.db — risk_ledger.db'ye DOKUNMAZ. Tüm hatalar sessizce yutulur (filtre kritik yol değil)."""
+    """Sinyal sonuçları için ayrı SQLite deposu; risk_ledger.db'ye dokunmaz."""
 
     def __init__(self, path=SIGNAL_DB):
         self.path = str(path)
@@ -529,20 +609,48 @@ class SignalStore:
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=5)
         c.execute(_SCHEMA)
+
+        # Eski araştırma DB'sini silmeden, geriye uyumlu ek kolon migrasyonu.
+        columns = {
+            row[1] for row in c.execute("PRAGMA table_info(signal_outcomes)")
+        }
+        if "sl_pct" not in columns:
+            c.execute("ALTER TABLE signal_outcomes ADD COLUMN sl_pct REAL")
+
+        c.commit()
         return c
 
-    def record_event(self, symbol, reading, regime, entry_ts, entry_price, horizon, source="live"):
+    def record_event(self, symbol, reading, regime, entry_ts, entry_price,
+                     horizon, source="live", sl_pct=None):
         try:
+            stop_pct = None if sl_pct is None else float(sl_pct)
+            if stop_pct is not None and (
+                not math.isfinite(stop_pct) or stop_pct <= 0
+            ):
+                return False
+
             c = self._conn()
             try:
-                dup = c.execute("SELECT 1 FROM signal_outcomes WHERE symbol=? AND signal=? AND direction=? "
-                                "AND entry_ts=?", (symbol, reading.name, reading.direction, entry_ts)).fetchone()
+                dup = c.execute(
+                    "SELECT 1 FROM signal_outcomes "
+                    "WHERE symbol=? AND signal=? AND direction=? AND entry_ts=?",
+                    (symbol, reading.name, reading.direction, entry_ts),
+                ).fetchone()
                 if dup:
                     return False
-                c.execute("INSERT INTO signal_outcomes (recorded_at,symbol,signal,family,regime,direction,"
-                          "strength,entry_ts,entry_price,horizon,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                          (time.time(), symbol, reading.name, reading.family, regime, reading.direction,
-                           reading.strength, int(entry_ts), float(entry_price), int(horizon), source))
+
+                c.execute(
+                    "INSERT INTO signal_outcomes "
+                    "(recorded_at,symbol,signal,family,regime,direction,strength,"
+                    "entry_ts,entry_price,horizon,source,sl_pct) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        time.time(), symbol, reading.name, reading.family,
+                        regime, reading.direction, reading.strength,
+                        int(entry_ts), float(entry_price), int(horizon),
+                        source, stop_pct,
+                    ),
+                )
                 c.commit()
                 return True
             finally:
@@ -550,23 +658,41 @@ class SignalStore:
         except Exception:
             return False
 
-    def record_resolved(self, symbol, reading, regime, entry_ts, entry_price, horizon,
-                        real, fwd_ret, persist_bars, source="offline"):
-        """Offline backtest satırı (zaten çözülmüş). Aynı (symbol,signal,direction,entry_ts) tekrar yazılmaz."""
+    def record_resolved(self, symbol, reading, regime, entry_ts, entry_price,
+                        horizon, real, fwd_ret, persist_bars,
+                        source="offline", sl_pct=None):
+        """Önceden hesaplanmış sonuç satırı. Stop bilgisi varsa posterior için kullanılabilir."""
         try:
+            stop_pct = None if sl_pct is None else float(sl_pct)
+            if stop_pct is not None and (
+                not math.isfinite(stop_pct) or stop_pct <= 0
+            ):
+                return False
+
             c = self._conn()
             try:
-                dup = c.execute("SELECT 1 FROM signal_outcomes WHERE symbol=? AND signal=? AND direction=? "
-                                "AND entry_ts=? AND source=?", (symbol, reading.name, reading.direction,
-                                                                int(entry_ts), source)).fetchone()
+                dup = c.execute(
+                    "SELECT 1 FROM signal_outcomes "
+                    "WHERE symbol=? AND signal=? AND direction=? AND entry_ts=? AND source=?",
+                    (symbol, reading.name, reading.direction, int(entry_ts), source),
+                ).fetchone()
                 if dup:
                     return False
-                c.execute("INSERT INTO signal_outcomes (recorded_at,symbol,signal,family,regime,direction,"
-                          "strength,entry_ts,entry_price,horizon,source,resolved,real,fwd_ret,persist_bars) "
-                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
-                          (time.time(), symbol, reading.name, reading.family, regime, reading.direction,
-                           reading.strength, int(entry_ts), float(entry_price), int(horizon), source,
-                           int(bool(real)), float(fwd_ret), int(persist_bars)))
+
+                c.execute(
+                    "INSERT INTO signal_outcomes "
+                    "(recorded_at,symbol,signal,family,regime,direction,strength,"
+                    "entry_ts,entry_price,horizon,source,resolved,real,fwd_ret,"
+                    "persist_bars,sl_pct) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)",
+                    (
+                        time.time(), symbol, reading.name, reading.family,
+                        regime, reading.direction, reading.strength,
+                        int(entry_ts), float(entry_price), int(horizon), source,
+                        int(bool(real)), float(fwd_ret), int(persist_bars),
+                        stop_pct,
+                    ),
+                )
                 c.commit()
                 return True
             finally:
@@ -574,33 +700,93 @@ class SignalStore:
         except Exception:
             return False
 
-    def resolve_pending(self, symbol, cd: Candles, cost, sl_pct):
-        """Bu sembolün çözülmemiş olaylarını (entry_ts mumundan sonra horizon kadar KAPANMIŞ mum varsa) çözer."""
-        done = 0
+    def pending_symbol_ranges(self):
+        """Bekleyen her sembol ve o semboldeki en eski olayın mum açılış zamanı."""
+        c = self._conn()
+        try:
+            return [
+                (str(symbol), int(first_ts))
+                for symbol, first_ts in c.execute(
+                    "SELECT symbol, MIN(entry_ts) FROM signal_outcomes "
+                    "WHERE resolved=0 GROUP BY symbol ORDER BY MIN(entry_ts)"
+                ).fetchall()
+                if first_ts is not None
+            ]
+        finally:
+            c.close()
+
+    def resolve_pending_detailed(self, symbol, cd: Candles, cost):
+        """Sembolün bütün bekleyen olaylarını kendi kayıtlı stop mesafesiyle çözer.
+
+        Eski kayıtlarda sl_pct NULL ise fiyat metrikleri kaydedilir,
+        real=NULL olur. Bu satırlar başarı/başarısızlık posterior'una katılmaz.
+        """
+        stats = {
+            "resolved": 0,
+            "scored": 0,
+            "unscored": 0,
+            "waiting": 0,
+            "error": None,
+        }
+        c = None
         try:
             c = self._conn()
-            try:
-                rows = c.execute("SELECT id,direction,entry_ts,entry_price,horizon FROM signal_outcomes "
-                                 "WHERE symbol=? AND resolved=0", (symbol,)).fetchall()
-                for id_, d, ts, px, hz in rows:
-                    idx = [i for i, t in enumerate(cd.t) if t > ts]
-                    if len(idx) < hz:
-                        continue
-                    sl = idx[:hz]
-                    res = outcome_from_bars(d, px, [cd.h[i] for i in sl], [cd.l[i] for i in sl],
-                                            [cd.c[i] for i in sl], hz, cost, sl_pct)
-                    if res is None:
-                        continue
-                    real, fwd, persist = res
-                    c.execute("UPDATE signal_outcomes SET resolved=1, real=?, fwd_ret=?, persist_bars=? "
-                              "WHERE id=?", (int(real), fwd, persist, id_))
-                    done += 1
-                c.commit()
-            finally:
+            rows = c.execute(
+                "SELECT id,direction,entry_ts,entry_price,horizon,sl_pct "
+                "FROM signal_outcomes WHERE symbol=? AND resolved=0",
+                (symbol,),
+            ).fetchall()
+
+            for row_id, direction, entry_ts, entry_price, horizon, stop_pct in rows:
+                future = [i for i, candle_ts in enumerate(cd.t) if candle_ts > entry_ts]
+                if len(future) < horizon:
+                    stats["waiting"] += 1
+                    continue
+
+                indexes = future[:horizon]
+                result = outcome_from_bars(
+                    direction,
+                    entry_price,
+                    [cd.h[i] for i in indexes],
+                    [cd.l[i] for i in indexes],
+                    [cd.c[i] for i in indexes],
+                    horizon,
+                    cost,
+                    stop_pct,
+                )
+                if result is None:
+                    stats["waiting"] += 1
+                    continue
+
+                real, fwd_ret, persist_bars = result
+                c.execute(
+                    "UPDATE signal_outcomes "
+                    "SET resolved=1,real=?,fwd_ret=?,persist_bars=? WHERE id=?",
+                    (None if real is None else int(real),
+                     fwd_ret, persist_bars, row_id),
+                )
+                stats["resolved"] += 1
+                if real is None:
+                    stats["unscored"] += 1
+                else:
+                    stats["scored"] += 1
+
+            c.commit()
+        except Exception as exc:
+            stats["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        finally:
+            if c is not None:
                 c.close()
-        except Exception:
-            pass
-        return done
+
+        return stats
+
+    def resolve_pending(self, symbol, cd: Candles, cost, sl_pct=None):
+        """Geriye uyumluluk: sonuç her olayın DB'de saklanan sl_pct değeriyle hesaplanır.
+
+        sl_pct parametresi eski çağrılar için korunmuştur; geçmiş kayda güncel
+        tarama anının stop değerini uygulamak için kullanılmaz.
+        """
+        return self.resolve_pending_detailed(symbol, cd, cost)["resolved"]
 
     def p_fake(self, signal, regime, cfg=None):
         """Sinyal×rejim Beta posterior → (p_fake, calibrated). n<min_events → nötr (0.5, False)."""
@@ -608,7 +794,8 @@ class SignalStore:
             c = self._conn()
             try:
                 wins, n = c.execute("SELECT COALESCE(SUM(real),0), COUNT(*) FROM signal_outcomes "
-                                    "WHERE signal=? AND regime=? AND resolved=1",
+                                    "WHERE signal=? AND regime=? AND resolved=1 "
+                                    "AND real IS NOT NULL AND sl_pct IS NOT NULL",
                                     (signal, regime)).fetchone()
             finally:
                 c.close()

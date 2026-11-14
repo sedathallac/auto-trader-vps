@@ -1306,8 +1306,10 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         if _main6 is not None:
             for _r6 in _v6.readings:
                 if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
-                    _store6.record_event(symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
-                                         RISK_CONFIG["confirm_horizon"])
+                    _store6.record_event(
+                        symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
+                        RISK_CONFIG["confirm_horizon"], sl_pct=sl_pct
+                    )
         if mode == "on" and not _v6.allow:
             log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
             return False
@@ -1317,6 +1319,79 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
             return False
         log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
     return True
+
+
+
+def _resolve_pending_signal_outcomes(binance):
+    """Aday listesine bağlı olmadan DB'deki tüm bekleyen Faz6 sembollerini sonuçlandır."""
+    summary = {
+        "symbols": 0,
+        "resolved": 0,
+        "scored": 0,
+        "unscored": 0,
+        "waiting": 0,
+        "unavailable": 0,
+        "errors": 0,
+    }
+
+    try:
+        import strategy_engine as _se
+        store = _se.SignalStore(_se.SIGNAL_DB)
+        pending = store.pending_symbol_ranges()
+    except Exception as exc:
+        log.warning(f"Faz6 bekleyen sonuç kuyruğu okunamadı: {exc}")
+        summary["errors"] += 1
+        return summary
+
+    if not pending:
+        return summary
+
+    summary["symbols"] = len(pending)
+    tf = RISK_CONFIG.get(
+        "confirm_tf_main",
+        _se.CONFIRM_DEFAULTS["confirm_tf_main"],
+    )
+    cost = float(RISK_CONFIG.get("fee_pct_round_trip", 0.0008))
+
+    for symbol, oldest_entry_ts in pending:
+        try:
+            candles = _se.fetch_candles_from(
+                binance, symbol, tf, oldest_entry_ts
+            )
+            if candles is None:
+                summary["unavailable"] += 1
+                log.warning(
+                    f"Faz6 sonuç kuyruğu: {symbol} mum verisi alınamadı; "
+                    "kayıtlar beklemede bırakıldı."
+                )
+                continue
+
+            result = store.resolve_pending_detailed(symbol, candles, cost)
+            summary["resolved"] += result["resolved"]
+            summary["scored"] += result["scored"]
+            summary["unscored"] += result["unscored"]
+            summary["waiting"] += result["waiting"]
+
+            if result["error"]:
+                summary["errors"] += 1
+                log.error(
+                    f"Faz6 sonuç kuyruğu DB hatası ({symbol}): {result['error']}"
+                )
+        except Exception as exc:
+            summary["errors"] += 1
+            log.exception(f"Faz6 bekleyen sonuç işlenemedi ({symbol}): {exc}")
+
+    log.info(
+        "Faz6 bekleyen sonuç kuyruğu: "
+        f"sembol={summary['symbols']} "
+        f"çözülen={summary['resolved']} "
+        f"skorlanabilir={summary['scored']} "
+        f"eski_stop_bilgisi_yok={summary['unscored']} "
+        f"bekleyen={summary['waiting']} "
+        f"veri_yok={summary['unavailable']} "
+        f"hata={summary['errors']}"
+    )
+    return summary
 
 
 def _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, mode):
@@ -1834,6 +1909,12 @@ def run_once(dry_run=False):
     stale = not check_stale_data(binance, max_age_sec=30)
 
     allow_new, _reasons = protect_then_gate(binance, reserver, drift, stale)
+
+    # Risk/pozisyon koruma kontrolleri tamamlandı.
+    # Bekleyen araştırma sinyallerini aday listesinden bağımsız çöz.
+    # Bu işlem yalnızca public kline verisi okur.
+    _resolve_pending_signal_outcomes(binance)
+
     if not allow_new:
         if drift:
             log.critical("🚨 Reconciliation drift — yeni giriş engellendi (koruma denetimi yine de çalıştı)")

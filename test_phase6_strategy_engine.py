@@ -172,8 +172,9 @@ def test_store_posterior_neutral_until_min_events_then_beta(tmp_path):
     c = sqlite3.connect(st.path)
     for i in range(10):
         c.execute("INSERT INTO signal_outcomes (recorded_at,symbol,signal,family,regime,direction,"
-                  "entry_ts,entry_price,horizon,resolved,real) VALUES (0,'X','rsi_extreme','exhaustion',"
-                  "'range',1,?,100,8,1,?)", (i, 1 if i < 8 else 0))
+                  "entry_ts,entry_price,horizon,resolved,real,sl_pct) "
+                  "VALUES (0,'X','rsi_extreme','exhaustion','range',1,?,100,8,1,?,0.05)",
+                  (i, 1 if i < 8 else 0))
     c.commit(); c.close()
     pf, cal = st.p_fake("rsi_extreme", "range", cfg)
     assert cal and pf == pytest.approx(1 - (1 + 8) / (2 + 10))     # Beta(1+8, 1+2)
@@ -184,7 +185,7 @@ def test_store_record_dedup_and_resolve(tmp_path):
     st = SignalStore(tmp_path / "s.db")
     cd = _cd([100 + 0.3 * i for i in range(40)])
     ts = cd.t[20]
-    assert st.record_event("X", _reading(), "range", ts, cd.c[20], 8)
+    assert st.record_event("X", _reading(), "range", ts, cd.c[20], 8, sl_pct=0.05)
     assert not st.record_event("X", _reading(), "range", ts, cd.c[20], 8)   # aynı olay tekrar yok
     assert st.resolve_pending("X", cd, 0.0008, 0.05) == 1
     row = sqlite3.connect(st.path).execute("SELECT resolved, real FROM signal_outcomes").fetchone()
@@ -196,6 +197,142 @@ def test_store_uses_separate_db_not_risk_ledger(tmp_path):
     st.record_event("X", _reading(), "range", 1, 100.0, 8)
     tables = {r[0] for r in sqlite3.connect(st.path).execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == {"signal_outcomes", "sqlite_sequence"}
+
+
+
+
+def test_legacy_pending_event_is_resolved_without_fabricating_real(tmp_path):
+    st = SignalStore(tmp_path / "legacy_pending.db")
+    cd = _cd([100 + 0.3 * i for i in range(40)])
+    ts = cd.t[20]
+
+    # Eski şema/kayıt davranışı: olayda stop mesafesi yok.
+    assert st.record_event("OLD", _reading(), "range", ts, cd.c[20], 8)
+
+    result = st.resolve_pending_detailed("OLD", cd, 0.0008)
+    assert result["resolved"] == 1
+    assert result["unscored"] == 1
+    assert result["scored"] == 0
+
+    row = sqlite3.connect(st.path).execute(
+        "SELECT resolved,real,fwd_ret,persist_bars,sl_pct "
+        "FROM signal_outcomes"
+    ).fetchone()
+    assert row[0] == 1
+    assert row[1] is None
+    assert row[2] is not None
+    assert row[3] is not None
+    assert row[4] is None
+
+    # Stop bilgisi olmayan kayıt posterior'da kayıp sayılmaz.
+    assert st.p_fake(
+        "rsi_extreme", "range", {"confirm_min_events": 1}
+    ) == (0.5, False)
+
+
+def test_fetch_candles_from_paginates_old_history_and_drops_tail():
+    rows = _rows([100 + 0.01 * i for i in range(1205)])
+
+    class PagedBinance:
+        def __init__(self):
+            self.calls = []
+
+        def _get(self, endpoint, params):
+            self.calls.append(dict(params))
+            assert endpoint == "/fapi/v1/klines"
+            matching = [
+                row for row in rows
+                if int(row[0]) >= int(params["startTime"])
+            ]
+            return matching[:params["limit"]]
+
+    fake = PagedBinance()
+    cd = se.fetch_candles_from(fake, "OLD", "15m", 0)
+
+    assert cd is not None
+    assert len(fake.calls) == 2
+    assert cd.t[0] == 900_000
+    # Son dönen mum açık mum kabul edilip atılır.
+    assert cd.t[-1] == 1203 * 900_000
+
+
+def test_pending_resolver_processes_symbols_outside_candidate_list(monkeypatch, tmp_path):
+    db = tmp_path / "pending_all.db"
+    monkeypatch.setattr(se, "SIGNAL_DB", str(db))
+
+    closes = [100 + 0.3 * i for i in range(40)]
+    cd = _cd(closes)
+    raw_rows = _rows(closes)
+    store = SignalStore(db)
+
+    for symbol in ("OLD_A", "OLD_B"):
+        assert store.record_event(
+            symbol, _reading(), "range", cd.t[20], cd.c[20], 8,
+            sl_pct=0.05,
+        )
+
+    class PublicKlines:
+        def _get(self, endpoint, params):
+            assert params["symbol"] in ("OLD_A", "OLD_B")
+            return [
+                row for row in raw_rows
+                if int(row[0]) >= int(params["startTime"])
+            ][:params["limit"]]
+
+    summary = auto_trader._resolve_pending_signal_outcomes(PublicKlines())
+
+    assert summary["symbols"] == 2
+    assert summary["resolved"] == 2
+    assert summary["scored"] == 2
+    assert summary["unavailable"] == 0
+    assert store.pending_symbol_ranges() == []
+
+
+def test_store_migrates_legacy_schema_without_losing_rows(tmp_path):
+    db = tmp_path / "old_schema.db"
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE signal_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at REAL NOT NULL,
+        symbol TEXT NOT NULL,
+        signal TEXT NOT NULL,
+        family TEXT NOT NULL,
+        regime TEXT NOT NULL,
+        direction INTEGER NOT NULL,
+        strength REAL,
+        entry_ts INTEGER NOT NULL,
+        entry_price REAL NOT NULL,
+        horizon INTEGER NOT NULL,
+        source TEXT NOT NULL DEFAULT 'live',
+        resolved INTEGER NOT NULL DEFAULT 0,
+        real INTEGER,
+        fwd_ret REAL,
+        persist_bars INTEGER
+    )""")
+    con.execute(
+        "INSERT INTO signal_outcomes "
+        "(recorded_at,symbol,signal,family,regime,direction,strength,"
+        "entry_ts,entry_price,horizon,source,resolved) "
+        "VALUES (1,'OLD','rsi_extreme','exhaustion','range',1,0.8,"
+        "900000,100,8,'live',0)"
+    )
+    con.commit()
+    con.close()
+
+    st = SignalStore(db)
+    assert st.pending_symbol_ranges() == [("OLD", 900000)]
+
+    con = sqlite3.connect(db)
+    columns = {
+        row[1] for row in con.execute("PRAGMA table_info(signal_outcomes)")
+    }
+    preserved = con.execute(
+        "SELECT symbol,entry_price,resolved FROM signal_outcomes"
+    ).fetchone()
+    con.close()
+
+    assert "sl_pct" in columns
+    assert preserved == ("OLD", 100.0, 0)
 
 
 # ------------------------------------------------------------------ confirm(): veto / aileler / p_real
