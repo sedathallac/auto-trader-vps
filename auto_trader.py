@@ -75,6 +75,11 @@ _SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
+# FAZ14l: dolum beklemesi. 8 saniye limit emir için gerçekçi değildi; dolmayan executor
+# keep_position=True ile durdurulunca pozisyon borsada kalıp HB onu unutuyordu → kalıcı
+# drift. Artık varsayılan 300 saniye beklenir ve karar BORSA GERÇEĞİNE göre verilir.
+FILL_WAIT_S = float(os.getenv("LIVE_FILL_WAIT_S", "300") or 300)
+FILL_POLL_S = float(os.getenv("LIVE_FILL_POLL_S", "5") or 5)
 TOP_N = int(_env_float("TOP_N", 2))   # FAZ13-A: env'e bağlı; picks altında kalırsa huniden geçen kadar probe edilir
 # Faz 9: WHALE_HUNTING=compare iken bu kadar aday DEĞERLENDİRİLİR (ilk TOP_N open_coin ile; kalanı compare_probe ile
 # YALNIZ loglanır — emir/blacklist/rezervasyon yok). 0 veya TOP_N altı → ek aday yok.
@@ -1398,6 +1403,26 @@ def _verify_oneway(binance):
     return ((not hedge), "HEDGE" if hedge else "ONEWAY")
 
 
+def _exchange_position_amt(binance, symbol):
+    """Signed exchange position amount for one symbol, or None when unreadable.
+    None means the caller MUST fail-closed: an unknown position can neither be
+    adopted nor declared flat."""
+    try:
+        positions = binance.position_risk()
+    except Exception:
+        return None
+    if not isinstance(positions, list):
+        return None
+    for p in positions:
+        try:
+            if str(p.get("symbol")) != symbol:
+                continue
+            return float(p.get("positionAmt") or 0)
+        except (TypeError, ValueError):
+            return None
+    return 0.0
+
+
 def _exchange_open_symbols(binance):
     """Set of symbols with a non-zero exchange position, or None on API failure.
     None means the caller MUST fail-closed (do not admit a new position)."""
@@ -2057,7 +2082,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
                  f"(leverage_policy)")
         log.info(f"  [LIVE] caps: volatility={_cd.get('volatility')} liq={_cd.get('liquidation')} "
                  f"kelly={_cd.get('kelly')} stage={_cd.get('stage')} "
-                 f"exchange={_cd.get('exchange')} → binding={_levd.reason}")
+                 f"exchange={_cd.get('exchange')} → binding={_levd.caps[0] if _levd.caps else 'none'}")
     else:
         dyn_lev = LEVERAGE
     if not HB_OFFLINE:
@@ -2159,28 +2184,45 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return False
     log.info(f"  executor={eid}")
 
-    time.sleep(8)
-    ex = hb.get_executor(eid)
-    filled = ex.get("filled_amount_quote", 0) if ex else 0
-    err = ex.get("error_count", 0) if ex else 999
+    # FAZ14l: dolum beklemesi (env, varsayılan 300s) ve BORSA GERÇEĞİNE dayalı karar.
+    # Eski davranış: 8 saniye bekle, dolmadıysa executor'ı keep_position=True ile durdur.
+    # Limit emir 8 saniyede dolmayınca pozisyon borsada açık kalıyor, HB onu unutuyor ve
+    # kalıcı drift oluşuyordu (52 döngü). Artık: pozisyon varsa executor DURDURULMAZ
+    # (benimsenir) ve SL yerleştirmeye devam edilir; yalnız borsa flat ise durdurulur.
+    _deadline = time.time() + max(0.0, FILL_WAIT_S)
+    filled, err = 0.0, 0
+    while True:
+        ex = hb.get_executor(eid)
+        filled = ex.get("filled_amount_quote", 0) if ex else 0
+        err = ex.get("error_count", 0) if ex else 999
+        if filled >= 1 or err > 0 or time.time() >= _deadline:
+            break
+        time.sleep(min(max(FILL_POLL_S, 0.1), max(0.0, _deadline - time.time())))
     if filled < 1 or err > 0:
-        log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err}")
-        # Faz2 execution robustness: stop the unfilled/errored executor
-        # (keep_position=True so any partial fill becomes a position that
-        # ensure_sl_coverage/orphan_killer will protect) and RELEASE the reserved
-        # slot. Exchange positions are always counted in the cap (used = exchange ∪
-        # reservations), so releasing never under-counts; this prevents a leaked
-        # PENDING reservation from starving MAX_OPEN_POSITIONS until reconcile's TTL.
-        try:
-            hb.stop_executor(eid, keep_position=True)
-        except Exception as e:
-            log.warning(f"  executor durdurma hatası (dolmadı): {e}")
-        if reserver is not None and _res_id is not None:
-            reserver.release(_res_id, reason="not_filled")
-            log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
-        add_blacklist(symbol, "dolmadı")
-        return False
-    log.info(f"  ✅ doldu: {filled:.2f} USDT")
+        log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err} (bekleme={FILL_WAIT_S:.0f}s)")
+        _pos_amt = _exchange_position_amt(binance, symbol)
+        if _pos_amt is None:
+            # Pozisyon durumu okunamıyor: ne benimsenebilir ne flat sayılabilir.
+            log.critical(f"  🚨 {symbol}: pozisyon durumu okunamadı — executor DURDURULMADI, "
+                         f"rezervasyon KORUNDU (fail-closed)")
+            return False
+        if _pos_amt != 0:
+            # Borsada pozisyon var: executor'ı durdurmak drift üretir. Benimse ve devam et.
+            log.warning(f"  ♻️  {symbol}: borsada pozisyon var ({_pos_amt}) — executor BENİMSENDİ "
+                        f"(durdurulmadı), SL yerleştirmeye geçiliyor")
+        else:
+            # Borsa flat: durdurmak güvenli, drift oluşmaz.
+            try:
+                hb.stop_executor(eid, keep_position=True)
+            except Exception as e:
+                log.warning(f"  executor durdurma hatası (dolmadı): {e}")
+            if reserver is not None and _res_id is not None:
+                reserver.release(_res_id, reason="not_filled")
+                log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
+            add_blacklist(symbol, "dolmadı")
+            return False
+    else:
+        log.info(f"  ✅ doldu: {filled:.2f} USDT")
 
     tick = float(filt["PRICE_FILTER"]["tickSize"])
     if side == 1:
