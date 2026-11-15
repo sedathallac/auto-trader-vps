@@ -376,6 +376,33 @@ class BinanceAPI:
             "quantity": f"{quantity:.8f}", "reduceOnly": "true",
         })
 
+    def market_order(self, symbol, side, quantity, reduce_only=True):
+        """POST /fapi/v1/order — MARKET emir.
+
+        FAZ14n: sınıfta market emir yolu yoktu; drift temizliği `futures_create_order`
+        çağırınca AttributeError alınıyordu. `side` hem Hummingbot konvansiyonunu
+        (1=LONG, 2=SHORT) hem 'BUY'/'SELL' kabul eder; geçersiz değer fail-closed.
+        """
+        if isinstance(side, int) and not isinstance(side, bool):
+            if side not in (1, 2):
+                raise ValueError(f"invalid side={side!r}: expected 1 (LONG), 2 (SHORT) or 'BUY'/'SELL'")
+            side = "BUY" if side == 1 else "SELL"
+        side = str(side).upper()
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"invalid side={side!r}: expected 1 (LONG), 2 (SHORT) or 'BUY'/'SELL'")
+        params = {"symbol": symbol, "side": side, "type": "MARKET",
+                  "quantity": f"{float(quantity):.8f}", "newOrderRespType": "RESULT"}
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        return self._post("/fapi/v1/order", params)
+
+    def close_position(self, symbol, amount):
+        """Pozisyonu reduceOnly MARKET ile kapatır. `amount` imzalıdır: negatif = SHORT."""
+        amt = float(amount)
+        if amt == 0:
+            return {"status": "NOOP", "reason": "zero amount"}
+        return self.market_order(symbol, "BUY" if amt < 0 else "SELL", abs(amt), reduce_only=True)
+
 
 def build_executor_config(symbol, amount, lev, side):
     """K1=B: a position_executor with NO autonomous close barriers.
