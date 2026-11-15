@@ -116,7 +116,8 @@ def test_archive_db_path_is_home_relative_not_hardcoded_root():
     src = Path(auto_trader.__file__).read_text()
     assert 'sqlite3.connect("/root' not in src
     assert auto_trader.TRADING_ARCHIVE_DB.name == ".trading_archive.db"
-    assert str(auto_trader.TRADING_ARCHIVE_DB).startswith(str(Path.home()))
+    # FAZ14w: yol STATE_DIR'den türetilir (varsayılan HOME, testlerde geçici dizin).
+    assert str(auto_trader.TRADING_ARCHIVE_DB).startswith(str(auto_trader.STATE_DIR))
 
 
 def test_process_counts_failed_when_finalize_returns_false(monkeypatch):

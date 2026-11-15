@@ -76,8 +76,8 @@ class TestSyncRiskEngineK2Gate(unittest.TestCase):
         conn.execute("INSERT INTO sync_meta (id, last_close_ts) VALUES (1, 0)")
         conn.execute("CREATE TABLE trade_ledger (executor_id TEXT PRIMARY KEY)")
         conn.commit(); conn.close()
-        self._orig_home = at.Path.home
-        at.Path.home = staticmethod(lambda: Path(self.tmp))
+        self._orig_home = at.STATE_DIR
+        at.STATE_DIR = Path(self.tmp)
         self._orig_post = at.requests.post
         term = {"data": [{"executor_id": "E1", "status": "TERMINATED",
                           "close_timestamp": 9999999999, "net_pnl_quote": -0.27,
@@ -85,7 +85,7 @@ class TestSyncRiskEngineK2Gate(unittest.TestCase):
         at.requests.post = lambda *a, **k: _FakeResp(term)
 
     def tearDown(self):
-        at.Path.home = self._orig_home
+        at.STATE_DIR = self._orig_home
         at.requests.post = self._orig_post
         shutil.rmtree(self.tmp, ignore_errors=True)
 
