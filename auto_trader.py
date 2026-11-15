@@ -85,8 +85,13 @@ FILL_POLL_S = float(os.getenv("LIVE_FILL_POLL_S", "5") or 5)
 STALE_PENDING_GRACE_S = float(os.getenv("LIVE_STALE_PENDING_GRACE_S", "3600") or 3600)
 # FAZ14p: bekleyen dolumlar süreç belleğinde DEĞİL, diskte tutulur. Restart bekleme
 # penceresine denk gelirse rezervasyon/executor bağlamı kaybolmaz; ilk tick geri yükler.
+# FAZ14w: tüm durum dosyaları TEK bir kök dizinden türetilir. Varsayılan HOME'dur
+# (canlı davranış değişmez); FAZ9_STATE_DIR ile ezilebilir. Böylece testler gerçek
+# canlı durum dosyalarına YAZAMAZ (kanıt: VPS'te pytest çalıştırmak
+# /root/.pending_fills.json içine test artığı E1/SOLUSDT yazıyordu).
+STATE_DIR = Path(os.getenv("FAZ9_STATE_DIR") or Path.home())
 PENDING_FILLS_JSON = Path(os.getenv("PENDING_FILLS_JSON")
-                          or (Path.home() / ".pending_fills.json"))
+                          or (STATE_DIR / ".pending_fills.json"))
 _PENDING_FILLS = {}
 _PENDING_LOADED = [False]   # FAZ14s: diskten yükleme süreç başına BİR kez
 # FAZ14q: arşiv DB'si sabit "/root/.trading_archive.db" idi; servis ProtectHome=yes ve
@@ -94,7 +99,7 @@ _PENDING_LOADED = [False]   # FAZ14s: diskten yükleme süreç başına BİR kez
 # "archive_symbols register failed: unable to open database file" veriyordu (sessiz
 # kayıp). archiver.py/archive_report.py ile aynı kural: HOME altında, env ile ezilebilir.
 TRADING_ARCHIVE_DB = Path(os.getenv("TRADING_ARCHIVE_DB")
-                          or (Path.home() / ".trading_archive.db"))
+                          or (STATE_DIR / ".trading_archive.db"))
 TOP_N = int(_env_float("TOP_N", 2))   # FAZ13-A: env'e bağlı; picks altında kalırsa huniden geçen kadar probe edilir
 # Faz 9: WHALE_HUNTING=compare iken bu kadar aday DEĞERLENDİRİLİR (ilk TOP_N open_coin ile; kalanı compare_probe ile
 # YALNIZ loglanır — emir/blacklist/rezervasyon yok). 0 veya TOP_N altı → ek aday yok.
@@ -256,8 +261,8 @@ USE_SHORTS = True          # short işlemleri aktif
 LONG_ON_DIP_PCT = _env_float("LONG_ON_DIP_PCT", -3.0)     # %3+ düşmüşse LONG (mean reversion)
 SHORT_ON_PUMP_PCT = _env_float("SHORT_ON_PUMP_PCT", 3.0)  # %3+ yükselmişse SHORT (mean reversion)
 
-HEARTBEAT_FILE = Path.home() / ".auto_trader.heartbeat"
-BLACKLIST_FILE = Path.home() / ".auto_trader_blacklist.json"
+HEARTBEAT_FILE = STATE_DIR / ".auto_trader.heartbeat"
+BLACKLIST_FILE = STATE_DIR / ".auto_trader_blacklist.json"
 BLACKLIST_TTL_SEC = 86400
 PRESEED_BLACKLIST = [
     # Kripto dışı tokenize hisse/ETF türevleri
@@ -637,7 +642,7 @@ def sync_risk_engine(risk, hb, binance=None):
     import sqlite3 as _sq
     from datetime import timezone as _tz
 
-    db_path = Path.home() / "risk_ledger.db"
+    db_path = STATE_DIR / "risk_ledger.db"
 
     try:
         with _sq.connect(str(db_path), timeout=10) as conn:
@@ -778,7 +783,7 @@ def reconcile_positions(binance, hb):
             drift = True
             # AUTO-HEAL with per-symbol cooldown (avoid hammering HB)
             cooldown_sec = 300
-            heal_state_file = Path.home() / ".auto_heal_cooldown.json"
+            heal_state_file = STATE_DIR / ".auto_heal_cooldown.json"
             heal_state = {}
             if heal_state_file.exists():
                 try:
@@ -922,7 +927,7 @@ def protect_then_gate(binance, reserver, drift, stale):
 
 # K-3: shared ledger path for the cross-process SL-placement intent (same db as the
 # reservation / close-intent). Overridable in tests.
-SL_LEDGER_DB = str(Path.home() / "risk_ledger.db")
+SL_LEDGER_DB = str(STATE_DIR / "risk_ledger.db")
 
 
 def _dedupe_algo_sl(binance, symbol):
@@ -2623,7 +2628,7 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
 
     # Tracked list (orphan_killer cleanup only) - atomic write
     try:
-        TRACKED_JSON = Path.home() / ".tracked_symbols.json"
+        TRACKED_JSON = STATE_DIR / ".tracked_symbols.json"
         tracked = set()
         if TRACKED_JSON.exists():
             tracked = set(json.loads(TRACKED_JSON.read_text()))
@@ -2908,7 +2913,7 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
 
 
 def main():
-    log_file = Path.home() / "auto_trader.log"
+    log_file = STATE_DIR / "auto_trader.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",

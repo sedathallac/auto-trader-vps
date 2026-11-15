@@ -4,11 +4,20 @@ ensure_sl_coverage uses a shared SQLite store (auto_trader.SL_LEDGER_DB, default
 ~/risk_ledger.db) for the SL-placement intent. Without isolation that real file would
 leak intent state between tests (a PLACED intent -> BUSY -> placement skipped). This
 autouse fixture points SL_LEDGER_DB at a fresh per-test temp db.
+
+FAZ14w: aynı sorun tüm durum dosyalarında vardı. VPS'te pytest çalıştırmak
+/root/.pending_fills.json içine test artığı (E1/SOLUSDT) yazıyor, canlı servis de o
+kaydı "bekleyen dolum" sanıp slot işgal ediyordu. Artık FAZ9_STATE_DIR import'tan
+ÖNCE geçici bir dizine ayarlanır; hiçbir test gerçek HOME durum dosyasına dokunamaz.
 """
 import os
 import sys
+import tempfile
 
 import pytest
+
+# auto_trader import edilmeden ÖNCE: STATE_DIR modül yüklemesinde hesaplanır.
+os.environ["FAZ9_STATE_DIR"] = tempfile.mkdtemp(prefix="faz9-test-state-")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auto_trader
