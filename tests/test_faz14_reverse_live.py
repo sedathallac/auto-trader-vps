@@ -102,6 +102,18 @@ def test_live_edge_gate_opens_for_reversed_signals(monkeypatch):
     assert ok is True and "backtest" in reason
 
 
+def test_no_policy_reversal_never_overrides_decide_side():
+    """Politika hiçbir sinyali çevirmediyse oy dengesizliği yönü EZMEMELİ."""
+    readings = [se.SignalReading(se.FAM_STRUCTURE, "sr_proximity", -1, 0.9),
+                se.SignalReading(se.FAM_EXHAUSTION, "volume_climax", -1, 0.8)]
+    flat = [{"tf": "1h", "score": 0.0, "adx": 18.0, "adx_strength": 0.1},
+            {"tf": "4h", "score": 0.0, "adx": 16.0, "adx_strength": 0.1}]
+    v = se.evaluate(1, readings, flat, "range", PF, ONE_FAM,
+                    regime_adx=18.0, policy=se.REVERSE_POLICY)
+    assert v.effective_side == 1, "politika ters çevirme yapmadığı halde yön değişti"
+    assert v.reversed_signals == ()
+
+
 def test_open_coin_applies_the_effective_side(monkeypatch):
     """Kapı GEÇER ve yön ters çevrildiyse emir ters yönde açılır."""
     src = __import__("inspect").getsource(auto_trader.open_coin)

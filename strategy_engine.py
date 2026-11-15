@@ -479,7 +479,10 @@ def resolve_side(side_dir, readings, regime, policy=None, cfg=None):
         if eff != r.direction:
             reversed_names.append(f"reverse_{r.name}")
     net = votes[1] - votes[-1]
-    if net == 0:
+    # Yön YALNIZ politika gerçekten bir sinyali çevirdiyse değişir. Aksi halde oy
+    # dengesizliği decide_side'ın kararını sessizce ezerdi (regime=range'de ters politika
+    # yokken bile yön değişiyordu).
+    if not reversed_names or net == 0:
         return side_dir, tuple(reversed_names)
     return (1 if net > 0 else -1), tuple(reversed_names)
 
