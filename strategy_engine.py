@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CONFIRM_DEFAULTS = {
-    "confirm_min_families": 2,
+    "confirm_min_families": int(os.getenv("CONFIRM_MIN_FAMILIES", "1")),  # FAZ14j: 2 -> 1; 368 çağrının yalnız %2.4'ü 2+ aile üretiyordu, kapı yapısal olarak kilitliydi
     "confirm_min_p_real": 0.40,          # FAZ14h: 0.65 -> 0.40; kalibre hucreler 0.128-0.725 uretiyor, 0.65 kapıyı kilitliyordu
     "confirm_veto_trend_strength": 0.7,  # FAZ14: 0.60 → 0.70; ters sinyal 0.60'ta tam sınırda kalıyordu
     "confirm_adx_trend": 25.0,

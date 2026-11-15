@@ -99,14 +99,17 @@ def test_veto_threshold_07_allows_reversed_signal():
 
 
 def test_min_families_relaxed_for_reversed_only():
-    """Ters sinyalde 1 aile yeter; ters olmayan sinyalde 2 aile kuralı korunur."""
+    """FAZ14j: eşik 1'e indi; ters sinyalde de, düz sinyalde de tek aile aile kapısını geçer.
+    Ayrım artık aile sayısında değil, p_real kapısında: düz yön kalibre posteriorla düşer."""
     pf = _pf({("wick_rejection", "trend"): (0.725, True)})
     rev = se.evaluate(-1, _wick(), TRENDS_MIXED, "trend", pf, CFG, regime_adx=26,
                       policy=se.REVERSE_POLICY)
     plain = se.evaluate(1, _wick(1, 0.8), TRENDS_MIXED, "trend", pf, CFG, regime_adx=26,
                         policy=None)
     assert rev.allow is True
-    assert plain.allow is False and "teyit yetersiz (1/2 aile)" in plain.reason, plain.reason
+    assert plain.allow is False, plain.reason
+    assert "teyit yetersiz" not in plain.reason, plain.reason
+    assert "p_real=" in plain.reason, plain.reason
 
 
 def test_calibration_db_env_binding(monkeypatch):
