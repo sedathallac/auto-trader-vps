@@ -124,6 +124,55 @@ LIVE_BLOCKED_SYMBOLS = _blocked_symbols()
 _HB_AUTH_BROKEN = False  # FAZ14f: Hummingbot kimlik hatasi sonrasi surecte yeni emir denenmez
 
 
+def _norm_symbol(s):
+    return str(s or "").upper().replace("-", "").replace("_", "")
+
+
+def _occupied_slots(binance, hb):
+    """Yeni giriş için dolu slotlar: borsadaki açık pozisyonlar ∪ bekleyen dolumlar.
+
+    FAZ14v: eski kod YALNIZ HB executor'larını sayıyordu; iki yönlü hata vardı.
+    - HB'de RUNNING ama borsada flat "hayalet" executor slot işgal ediyordu
+      (canlı 00:35:24: borsada 3 pozisyon, kapı "5/5 dolu" deyip yeni girişi kesti).
+    - HB'ye ulaşılamazsa sayı 0 görünüp limit aşılabiliyordu.
+    Doğru semantik: slotu (a) borsadaki açık pozisyon ya da (b) dolumu bekleyen emir
+    işgal eder. Hayalet executor slot işgal ETMEZ (yalnız uyarı loglanır).
+    Dönüş: (slot_kümesi, hb_pair_kümesi) veya okunamazsa (None, None) -> çağıran fail-closed.
+    """
+    slots, pairs = set(), set()
+    if not HB_OFFLINE:
+        try:
+            for e in hb.active_executors():
+                if e.get("status") == "RUNNING":
+                    pairs.add(e.get("trading_pair"))
+        except Exception as e:
+            log.critical(f"🚨 slot sayımı: HB executor listesi alınamadı: {e}")
+            return None, None
+    try:
+        pr = binance.position_risk()
+    except Exception as e:
+        log.critical(f"🚨 slot sayımı: positionRisk alınamadı: {e}")
+        return None, None
+    if not isinstance(pr, list):
+        log.critical("🚨 slot sayımı: positionRisk beklenmeyen tip")
+        return None, None
+    for p in pr:
+        try:
+            if float(p.get("positionAmt") or 0) != 0:
+                slots.add(_norm_symbol(p.get("symbol")))
+        except (TypeError, ValueError):
+            continue
+    for ctx in list(_PENDING_FILLS.values()):
+        slots.add(_norm_symbol((ctx or {}).get("symbol")))
+    slots.discard("")
+    ghosts = {_norm_symbol(p) for p in pairs} - slots
+    ghosts.discard("")
+    if ghosts:
+        log.warning(f"  👻 hayalet executor (borsada pozisyon yok, slot sayılmadı): "
+                    f"{sorted(ghosts)}")
+    return slots, pairs
+
+
 def _effective_max_positions():
     """Pozisyon tavanı: canlıda LIVE_MAX_OPEN_POSITIONS, compare'da MAX_OPEN_POSITIONS.
 
@@ -2750,19 +2799,15 @@ def run_once(dry_run=False):
     if HB_OFFLINE:
         active = set()  # HB_OFFLINE: HB'siz; aktif executor yok sayılır (kalibrasyon modu)
     else:
-        try:
-            active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-        except Exception as e:
-            # FAZ14u: FAIL-CLOSED. Eski kod burada active=set() yapıp devam ediyordu;
-            # HB'ye ulaşılamadığında pozisyon limiti "0/5" görünüp yeni emir açılıyordu
-            # (canlı: 22:40:21 RemoteDisconnected -> limit kontrolü ATLANDI). Executor
-            # sayısı bilinmiyorsa yeni giriş yok.
-            log.critical(f"🚨 aktif executor sayısı alınamadı — pozisyon limiti "
-                         f"doğrulanamıyor, yeni giriş fail-closed engellendi: {e}")
+        # FAZ14v: slot sayımı borsa gerçeği ∪ HB executor'ları; okunamazsa fail-closed.
+        _slots, active = _occupied_slots(binance, hb)
+        if _slots is None:
+            log.critical("🚨 dolu slot sayısı doğrulanamadı — yeni giriş fail-closed engellendi")
             return
-    if not HB_OFFLINE and len(active) >= _effective_max_positions():
-        log.info(f"Maks pozisyon limiti ({_effective_max_positions()}) dolu → yeni açmıyorum")
-        return
+        if len(_slots) >= _effective_max_positions():
+            log.info(f"Maks pozisyon limiti ({_effective_max_positions()}) dolu "
+                     f"({len(_slots)} slot: {sorted(_slots)}) → yeni açmıyorum")
+            return
     try:
         eq = binance.get_balance("USDT")
         risk.update_equity(eq)
