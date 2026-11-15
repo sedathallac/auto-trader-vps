@@ -72,7 +72,7 @@ _SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.05
 TIME_LIMIT_SEC = 14400  # 4 saat
-TOP_N = 2
+TOP_N = int(_env_float("TOP_N", 2))   # FAZ13-A: env'e bağlı; picks altında kalırsa huniden geçen kadar probe edilir
 # Faz 9: WHALE_HUNTING=compare iken bu kadar aday DEĞERLENDİRİLİR (ilk TOP_N open_coin ile; kalanı compare_probe ile
 # YALNIZ loglanır — emir/blacklist/rezervasyon yok). 0 veya TOP_N altı → ek aday yok.
 try:
@@ -159,8 +159,10 @@ TARGET_MARGIN_USAGE_PCT = 0.30   # Bakiyenin %30'u toplam marjin
 MIN_NOTIONAL_USDT = 5.5           # Binance min
 MAX_NOTIONAL_USDT = 200.0         # İşlem başına üst sınır (FAZ12: Asama 1)
 USE_SHORTS = True          # short işlemleri aktif
-LONG_ON_DIP_PCT = -3.0     # %3+ düşmüşse LONG (mean reversion)
-SHORT_ON_PUMP_PCT = 3.0    # %3+ yükselmişse SHORT (mean reversion)
+# FAZ13-A: yön barajı env'e bağlı. Tarama barajı gevşetilip bu baraj sabit kalınca adaylar
+# "yön belirsiz" ile düşüyordu (Faz6 çağrısı 2.0 → 0.2/tarama). Varsayılanlar eski davranış.
+LONG_ON_DIP_PCT = _env_float("LONG_ON_DIP_PCT", -3.0)     # %3+ düşmüşse LONG (mean reversion)
+SHORT_ON_PUMP_PCT = _env_float("SHORT_ON_PUMP_PCT", 3.0)  # %3+ yükselmişse SHORT (mean reversion)
 
 HEARTBEAT_FILE = Path.home() / ".auto_trader.heartbeat"
 BLACKLIST_FILE = Path.home() / ".auto_trader_blacklist.json"
@@ -1586,7 +1588,9 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB)
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
-        _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
+        # FAZ13-C shadow: ters politika YALNIZ compare modunda uygulanır; canlı ('on') asıl yönle kalır.
+        _policy6 = _se.REVERSE_POLICY if mode == "compare" else None
+        _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG, policy=_policy6)
         # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
         # _faz6_confirm keeps its bool signature and every existing caller is untouched.
         _LAST_CONFIRM.clear()
@@ -1595,15 +1599,26 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
                  f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} "
                  f"adx15={'-' if _v6.regime_adx is None else f'{_v6.regime_adx:.0f}'} "
-                 f"adx_trend={'-' if _v6.trend_adx is None else f'{_v6.trend_adx:.0f}'} | "
+                 f"adx_trend={'-' if _v6.trend_adx is None else f'{_v6.trend_adx:.0f}'} "
+                 f"ters={list(_v6.reversed_signals) or '-'} | "
                  f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
         if _main6 is not None:
             for _r6 in _v6.readings:
-                if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
-                    _store6.record_event(
-                        symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
-                        RISK_CONFIG["confirm_horizon"], sl_pct=sl_pct
-                    )
+                # Shadow: politika uygulanmış yön kaydedilir ki çözücü ters yönün sonucunu hesaplasın.
+                # Shadow'da yön filtresi YOK (her iki yönün verisi gerekir); canlıda eski filtre korunur.
+                _eff6 = _se.effective_direction(_r6, _v6.regime, _policy6)
+                if _eff6 == 0 or _r6.strength < RISK_CONFIG["confirm_min_strength"]:
+                    continue
+                if _policy6 is None and _eff6 != _sd6:
+                    continue
+                _rec6 = _r6 if _eff6 == _r6.direction else \
+                    _se.SignalReading(_r6.family, _r6.name, _eff6, _r6.strength)
+                _store6.record_event(
+                    symbol, _rec6, _v6.regime, _main6.t[-1], _main6.c[-1],
+                    RISK_CONFIG["confirm_horizon"],
+                    source="shadow" if _policy6 is not None else "live",
+                    sl_pct=sl_pct
+                )
         if mode == "on" and not _v6.allow:
             log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
             return False
