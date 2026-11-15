@@ -28,9 +28,18 @@ BINANCE_FAPI = "https://fapi.binance.com"
 HB_API = "http://localhost:8000"
 HB_ACCOUNT = "master_account"
 
-MIN_VOLUME_USDT = 200_000_000
-MIN_PCT_CHANGE = 3.0
-MAX_PCT_CHANGE = 15.0
+def _env_float(name, default):
+    """Env'den float; geçersiz/boş → default. Tarama eşikleri yeniden derleme gerektirmeden ayarlanabilsin."""
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+MIN_VOLUME_USDT = _env_float("MIN_VOLUME_USDT", 200_000_000)
+MIN_PCT_CHANGE = _env_float("MIN_PCT_CHANGE", 3.0)
+MAX_PCT_CHANGE = _env_float("MAX_PCT_CHANGE", 15.0)
+_SCAN_FUNNEL = {}           # son scan_top tarama hunisi (ticker → USDT → blacklist → hacim → değişim → picks)
 MAX_SPREAD_PCT = 0.5
 MIN_DEPTH_USDT = 50_000
 TARGET_NOTIONAL = 10.0
@@ -1016,18 +1025,30 @@ def check_liquidity(binance, symbol):
 def scan_top(binance, n, blacklist=None):
     blacklist = blacklist or set()
     cands = []
+    funnel = {"tickers": 0, "usdt": 0, "blacklisted": 0, "volume": 0, "pct": 0, "picks": 0}
     for d in binance.tickers():
+        funnel["tickers"] += 1
         try:
             if not d["symbol"].endswith("USDT"):
                 continue
+            funnel["usdt"] += 1
             if d["symbol"] in blacklist:
+                funnel["blacklisted"] += 1
                 continue
             vol = float(d["quoteVolume"])
+            if vol < MIN_VOLUME_USDT:
+                continue
+            funnel["volume"] += 1
             chg = abs(float(d["priceChangePercent"]))
-            if vol >= MIN_VOLUME_USDT and MIN_PCT_CHANGE <= chg <= MAX_PCT_CHANGE:
-                cands.append(d)
+            if not (MIN_PCT_CHANGE <= chg <= MAX_PCT_CHANGE):
+                continue
+            funnel["pct"] += 1
+            cands.append(d)
         except (KeyError, ValueError):
             continue
+    funnel["picks"] = min(len(cands), max(0, int(n)))
+    _SCAN_FUNNEL.clear()
+    _SCAN_FUNNEL.update(funnel)
     if not cands:
         return []
     mv = max(float(d["quoteVolume"]) for d in cands)
@@ -1529,6 +1550,29 @@ def _live_edge_decisions(store, cfg, ttl=300):
     return decisions
 
 
+_CALIB_LOGGED = {"done": False}
+
+
+def _log_calibration_status():
+    """Süreç başına bir kez: posterior hangi DB'den okunuyor, kaç hücre kalibre."""
+    if _CALIB_LOGGED["done"]:
+        return
+    _CALIB_LOGGED["done"] = True
+    try:
+        import strategy_engine as _se
+        cov = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB).calibration_coverage(RISK_CONFIG)
+        if cov.get("error"):
+            log.warning(f"🧮 Kalibrasyon DB okunamadı ({cov['path']}): {cov['error']} — p_fake nötr 0.5 kalacak")
+            return
+        log.info(f"🧮 Kalibrasyon: db={cov['path']} hücre={cov['cells']} kalibre_hücre={cov['calibrated_cells']} "
+                 f"(n≥{cov['min_events']}) skorlanabilir_satır={cov['scorable_rows']}")
+        if not cov["calibrated_cells"]:
+            log.warning("⚠️ CALIBRATION-REQUIRED: hiçbir (sinyal,rejim) hücresi min_events'i geçmiyor — "
+                        "p_fake nötr 0.5, p_real prior'a eşit kalır")
+    except Exception as e:
+        log.warning(f"🧮 Kalibrasyon durumu okunamadı: {e}")
+
+
 def _faz6_confirm(binance, symbol, side, sl_pct, mode):
     """Faz 6 teyit. compare: logla + signal_outcomes'a yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
     Döner: True = devam, False = reddet (yalnız mode=='on')."""
@@ -1539,7 +1583,7 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _main6 = _se.fetch_candles(binance, symbol, RISK_CONFIG["confirm_tf_main"], _lim)
         _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
                 for tf in RISK_CONFIG["confirm_tf_veto"]}
-        _store6 = _se.SignalStore(_se.SIGNAL_DB)
+        _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB)
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
@@ -1549,7 +1593,9 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _LAST_CONFIRM.update({"families": dict(_v6.families or {}), "regime": _v6.regime,
                               "p_real": _v6.p_real, "allow": bool(_v6.allow)})
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
-                 f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
+                 f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} "
+                 f"adx15={'-' if _v6.regime_adx is None else f'{_v6.regime_adx:.0f}'} "
+                 f"adx_trend={'-' if _v6.trend_adx is None else f'{_v6.trend_adx:.0f}'} | "
                  f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
         if _main6 is not None:
             for _r6 in _v6.readings:
@@ -2333,9 +2379,15 @@ def run_once(dry_run=False):
     bl = load_blacklist()
     log.info(f"Aktif: {sorted(active) if active else 'yok'}")
     log.info(f"Blacklist: {sorted(bl.keys())}")
+    _log_calibration_status()
 
     picks = scan_top(binance, max(TOP_N * 3, (TOP_N_COMPARE * 2) if WHALE_HUNTING == "compare" else 0),
                      blacklist=set(bl.keys()))
+    if _SCAN_FUNNEL:
+        log.info(f"  🔎 Tarama hunisi: ticker={_SCAN_FUNNEL['tickers']} usdt={_SCAN_FUNNEL['usdt']} "
+                 f"blacklist={_SCAN_FUNNEL['blacklisted']} hacim≥{MIN_VOLUME_USDT:,.0f}={_SCAN_FUNNEL['volume']} "
+                 f"değişim {MIN_PCT_CHANGE:.1f}-{MAX_PCT_CHANGE:.1f}%={_SCAN_FUNNEL['pct']} "
+                 f"picks={_SCAN_FUNNEL['picks']}")
 
     # Faz 4: hiyerarşik tarama (flag arkasında; 'off' → bu blok atlanır, davranış değişmez).
     if HIERARCHICAL_SCAN in ("compare", "on"):

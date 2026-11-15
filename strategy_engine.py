@@ -13,6 +13,7 @@ Yalnız KAPANMIŞ mumlar kullanılır (look-ahead yok): fetch son (oluşmakta ol
 p_fake: signal_outcomes.db'deki (ayrı SQLite) sinyal×rejim Beta posterior'u; veri yoksa nötr 0.5.
 """
 import math
+import os
 import random
 import sqlite3
 import statistics
@@ -406,6 +407,8 @@ class Verdict:
     readings: list = field(default_factory=list)
     trend_against: float = 0.0
     calibrated: bool = False
+    regime_adx: float = None      # 15m ADX (rejim kaynağı)
+    trend_adx: float = None       # 1h/4h ADX maksimumu (veto kaynağı)
 
 
 def trend_against_strength(trends, side_dir, weights=None):
@@ -428,7 +431,7 @@ def compute_readings(main: Candles):
     return exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
 
 
-def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None) -> Verdict:
+def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx=None) -> Verdict:
     """KARAR mantığı (veri toplamadan bağımsız; canlı confirm() ve offline backtest AYNI kodu kullanır).
     p_fake_fn(signal_name, regime) → (p_fake, calibrated)."""
     # 1) REJİM VETO — güçlü trende karşı mean-reversion
@@ -436,8 +439,10 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None) -> Verdict
     adx_max = max(t["adx"] for t in trends)
     if (against >= _cfg(cfg, "confirm_veto_trend_strength")
             and adx_max >= _cfg(cfg, "confirm_adx_trend")):
-        return Verdict(False, f"güçlü trende karşı mean-reversion (against={against:.2f}, ADX={adx_max:.0f})",
-                       regime=regime, veto=True, readings=readings, trend_against=against)
+        return Verdict(False, f"güçlü trende karşı mean-reversion (against={against:.2f}, ADX_trend={adx_max:.0f}, "
+                              f"ADX_15m={'n/a' if regime_adx is None else f'{regime_adx:.0f}'})",
+                       regime=regime, veto=True, readings=readings, trend_against=against,
+                       regime_adx=regime_adx, trend_adx=adx_max)
 
     # 2) TEYİT — aile başına en iyi uyumlu sinyal
     best, calibrated_all = {}, True
@@ -451,7 +456,8 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None) -> Verdict
     if len(best) < _cfg(cfg, "confirm_min_families"):
         return Verdict(False, f"teyit yetersiz ({len(best)}/{_cfg(cfg, 'confirm_min_families')} aile)",
                        regime=regime, families={f: b[1].name for f, b in best.items()},
-                       readings=readings, trend_against=against)
+                       readings=readings, trend_against=against,
+                       regime_adx=regime_adx, trend_adx=adx_max)
 
     # 3) Birleşik güven — aile başına TEK LLR terimi (aile içi çift sayım yok)
     prior = _clip(_cfg(cfg, "confirm_prior_real"), 0.01, 0.99)
@@ -465,7 +471,7 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None) -> Verdict
     return Verdict(allow, (f"p_real={p_real:.3f} " + ("≥" if allow else "<")
                            + f" {_cfg(cfg, 'confirm_min_p_real'):.2f}"),
                    p_real, regime, False, {f: b[1].name for f, b in best.items()},
-                   readings, against, calibrated_all)
+                   readings, against, calibrated_all, regime_adx, adx_max)
 
 
 def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None) -> Verdict:
@@ -479,11 +485,12 @@ def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg
         if t is None:
             return Verdict(False, f"{tf} trend verisi yetersiz (fail-closed)")
         trends.append(t)
-    regime = regime_from_adx(adx_last(main.h, main.l, main.c), cfg)
+    regime_adx = adx_last(main.h, main.l, main.c)
+    regime = regime_from_adx(regime_adx, cfg)
     readings = exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
     p_fake_fn = (lambda name, reg: store.p_fake(name, reg, cfg)) if store is not None \
         else (lambda name, reg: (0.5, False))
-    return evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg)
+    return evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg, regime_adx=regime_adx)
 
 
 # ===================================================================== istatistik araçları
@@ -594,6 +601,9 @@ def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_p
 
 # ===================================================================== signal_outcomes (AYRI sqlite)
 SIGNAL_DB = str(Path.home() / "signal_outcomes.db")
+# FAZ13: posterior OKUMASI için ayrı (salt-okunur) DB. Canlı servis kendi state dizininde yazar; kalibrasyon
+# compare'in biriktirdiği çözülmüş satırlardan okunur. Boş bırakılırsa SIGNAL_DB kullanılır (eski davranış).
+CALIB_DB = os.getenv("SIGNAL_CALIBRATION_DB") or SIGNAL_DB
 
 def _utc_now_iso() -> str:
     """Resolver damgasi: hangi satirin ne zaman cozuldugu. Eski satirlar NULL kalir (geriye uyumlu)."""
@@ -625,8 +635,18 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS signal_outcomes (
 class SignalStore:
     """Sinyal sonuçları için ayrı SQLite deposu; risk_ledger.db'ye dokunmaz."""
 
-    def __init__(self, path=SIGNAL_DB):
+    def __init__(self, path=SIGNAL_DB, calib_db=None):
         self.path = str(path)
+        # Kalibrasyon DB'si yalnız varsayılan yazma DB'si için CALIB_DB'ye düşer; özel bir path veren
+        # çağıran (testler, arşiv araçları) kendi DB'sinden okur — sürpriz çapraz okuma olmaz.
+        default_calib = CALIB_DB if self.path == SIGNAL_DB else self.path
+        self.calib_path = str(calib_db or default_calib or self.path)
+
+    def _calib_conn(self):
+        """Posterior okuması: kalibrasyon DB'si yazma DB'sinden farklıysa SALT-OKUNUR açılır."""
+        if self.calib_path == self.path:
+            return self._conn()
+        return sqlite3.connect(f"file:{self.calib_path}?mode=ro", uri=True, timeout=5)
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=5)
@@ -839,7 +859,7 @@ class SignalStore:
     def p_fake(self, signal, regime, cfg=None):
         """Sinyal×rejim Beta posterior → (p_fake, calibrated). n<min_events → nötr (0.5, False)."""
         try:
-            c = self._conn()
+            c = self._calib_conn()
             try:
                 wins, n = c.execute("SELECT COALESCE(SUM(real),0), COUNT(*) FROM signal_outcomes "
                                     "WHERE signal=? AND regime=? AND resolved=1 "
@@ -854,3 +874,21 @@ class SignalStore:
         a = _cfg(cfg, "confirm_beta_a0") + wins
         b = _cfg(cfg, "confirm_beta_b0") + (n - wins)
         return 1.0 - a / (a + b), True
+
+    def calibration_coverage(self, cfg=None):
+        """Kalibrasyon kapsamı (açılış logu): kaç (sinyal,rejim) hücresi min_events'i geçiyor."""
+        me = _cfg(cfg, "confirm_min_events")
+        try:
+            c = self._calib_conn()
+            try:
+                rows = c.execute("SELECT signal, regime, COUNT(*) FROM signal_outcomes "
+                                 "WHERE resolved=1 AND real IS NOT NULL AND sl_pct IS NOT NULL "
+                                 "GROUP BY signal, regime").fetchall()
+            finally:
+                c.close()
+        except Exception as e:
+            return {"path": self.calib_path, "error": f"{type(e).__name__}: {e}"[:200],
+                    "cells": 0, "calibrated_cells": 0, "scorable_rows": 0, "min_events": me}
+        return {"path": self.calib_path, "cells": len(rows),
+                "calibrated_cells": sum(1 for r in rows if r[2] >= me),
+                "scorable_rows": sum(r[2] for r in rows), "min_events": me}
