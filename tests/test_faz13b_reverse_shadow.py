@@ -106,7 +106,7 @@ def test_disabled_strategies_do_not_fire():
 
 def test_shadow_mode_does_not_affect_live():
     src = inspect.getsource(auto_trader._faz6_confirm)
-    assert '_se.REVERSE_POLICY if mode == "compare" else None' in src
+    assert 'mode == "compare" and REVERSE_POLICY_ENABLED' in src
     assert 'source="shadow" if _policy6 is not None else "live"' in src
     # Canlı modda politika None → asıl yön; compare'de politika uygulanır.
     readings = [_rd("wick_rejection", se.FAM_STRUCTURE, 1, 0.79),

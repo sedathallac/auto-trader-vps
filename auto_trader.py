@@ -66,6 +66,9 @@ _WHALE_TRACKER = None       # whale_engine.WhaleTracker (tembel init; duvar kal�
 # compare=teyit/p_real loglanır + signal_outcomes.db'ye yazılır ama karar ESKİ mantıkla verilir,
 # on=yalnız FİLTRE (trend veto / teyit yetersiz / p_real düşük girişi REDDEDER; asla giriş tetiklemez).
 STRATEGY_CONFIRMATION = os.getenv("STRATEGY_CONFIRMATION", "off").strip().lower()
+# FAZ13-C: ters yön politikası yalnız compare/shadow modunda uygulanır. Bu bayrak kapalıysa
+# compare de asıl yönle karar verir (eski davranış). Canlı ('on') bu bayraktan ETKİLENMEZ.
+REVERSE_POLICY_ENABLED = os.getenv("REVERSE_POLICY", "on").strip().lower() in ("1", "on", "true", "yes")
 # Faz 4: --loop sürecinde run_once çağrıları arasında yaşayan cache + tier zamanlama.
 _SCAN_CACHE = None          # scan_engine.MetricCache (tembel init)
 _SCAN_LAST_RUN = {}         # tier.name -> son çalışma epoch'u
@@ -1588,8 +1591,10 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB)
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
-        # FAZ13-C shadow: ters politika YALNIZ compare modunda uygulanır; canlı ('on') asıl yönle kalır.
-        _policy6 = _se.REVERSE_POLICY if mode == "compare" else None
+        # FAZ13-C shadow: ters politika YALNIZ compare modunda ve REVERSE_POLICY açıkken uygulanır;
+        # canlı ('on') asıl yönle kalır.
+        _policy6 = (_se.REVERSE_POLICY
+                    if (mode == "compare" and REVERSE_POLICY_ENABLED) else None)
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG, policy=_policy6)
         # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
         # _faz6_confirm keeps its bool signature and every existing caller is untouched.
