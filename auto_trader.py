@@ -1496,6 +1496,11 @@ def _live_regime_gate():
     if not cfg.is_live:
         return True, "not live: gate open"
     regime = _LAST_CONFIRM.get("regime")
+    # FAZ14: ters politika uygulanmış bir sinyal varsa rejim kapısı açılır. Ters strateji
+    # TAM OLARAK trend rejimi için kanıtlandı (wick_rejection/rsi_divergence, p<0.01);
+    # LIVE_WINNING_REGIMES=range,mid bu hücreleri bloke ederdi.
+    if _LAST_CONFIRM.get("reversed"):
+        return True, f"reverse policy: regime={regime} allowed"
     ok, reason = live_guard.regime_gate(regime, cfg)
     if not ok:
         log.info(f"[LIVE] skipped regime={regime} (not in winning set)")
@@ -1518,6 +1523,11 @@ def _live_edge_gate():
     mode = os.getenv("EDGE_GATE", "auto").strip().lower()
     if mode in ("off", "0", "false", "no"):
         return True, "edge gate off"
+    # FAZ14: ters politika hücresi backtest ile kanıtlı (wick_rejection/trend p<0.0001,
+    # rsi_divergence/trend p=0.0011). Kanıt ters yönde olduğu için asıl-yön hücre kaydı
+    # bu emri bloke etmemeli.
+    if _LAST_CONFIRM.get("reversed"):
+        return True, "reverse policy: cell proven by backtest"
     regime = _LAST_CONFIRM.get("regime")
     families = list((_LAST_CONFIRM.get("families") or {}).keys())
     if not families:
@@ -1591,16 +1601,18 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB)
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
-        # FAZ13-C shadow: ters politika YALNIZ compare modunda ve REVERSE_POLICY açıkken uygulanır;
-        # canlı ('on') asıl yönle kalır.
+        # FAZ14: ters politika canlıda da uygulanır (REVERSE_POLICY=on). Politika evaluate()
+        # içinde trend vetosundan ÖNCE çalışır; nihai yön ters çevrilmiş sinyallerden gelir.
         _policy6 = (_se.REVERSE_POLICY
-                    if (mode == "compare" and REVERSE_POLICY_ENABLED) else None)
+                    if (mode in ("compare", "on") and REVERSE_POLICY_ENABLED) else None)
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG, policy=_policy6)
         # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
         # _faz6_confirm keeps its bool signature and every existing caller is untouched.
         _LAST_CONFIRM.clear()
         _LAST_CONFIRM.update({"families": dict(_v6.families or {}), "regime": _v6.regime,
-                              "p_real": _v6.p_real, "allow": bool(_v6.allow)})
+                              "p_real": _v6.p_real, "allow": bool(_v6.allow),
+                              "effective_side": _v6.effective_side,
+                              "reversed": tuple(_v6.reversed_signals)})
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
                  f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} "
                  f"adx15={'-' if _v6.regime_adx is None else f'{_v6.regime_adx:.0f}'} "
@@ -1860,6 +1872,13 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if STRATEGY_CONFIRMATION in ("compare", "on"):
         if not _faz6_confirm(binance, symbol, side, sl_pct, STRATEGY_CONFIRMATION):
             return False
+        # FAZ14: ters politika nihai yönü çevirdiyse emir de o yönde açılır.
+        _eff_side = _LAST_CONFIRM.get("effective_side")
+        if _eff_side in (1, -1) and _eff_side != side:
+            side = _eff_side
+            side_name = "LONG" if side == 1 else "SHORT"
+            log.info(f"  🔄 ters politika: yön {side_name} olarak uygulandı "
+                     f"(ters={list(_LAST_CONFIRM.get('reversed') or [])})")
 
     # FAZ9 live: yalnız kazanan aile emir verebilir. Compare/dry-run'da kapı açık; canlıda kapalı = sinyal
     # signal_outcomes'a yazıldı, emir yok.

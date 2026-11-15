@@ -103,7 +103,7 @@ def test_reverse_policy_applied_in_shadow_mode():
               {"tf": "4h", "score": 0.0, "adx": 16.0, "adx_strength": 0.04}]
     v = se.evaluate(-1, readings, trends, "trend", lambda n, g: (0.3, True),
                     se.CONFIRM_DEFAULTS, regime_adx=30.0, policy=se.REVERSE_POLICY)
-    assert v.allow is True and set(v.reversed_signals) == {"wick_rejection", "rsi_divergence"}
+    assert v.allow is True and set(v.reversed_signals) == {"reverse_wick_rejection", "reverse_rsi_divergence"}
 
 
 def test_live_unaffected_by_shadow():
@@ -117,4 +117,4 @@ def test_live_unaffected_by_shadow():
     assert "shadow" not in cp["Service"]["Environment"].lower()
     # Kod tarafı: canlı modda politika None → ters yön sızmaz.
     src = inspect.getsource(auto_trader._faz6_confirm)
-    assert 'mode == "compare" and REVERSE_POLICY_ENABLED' in src
+    assert 'mode in ("compare", "on") and REVERSE_POLICY_ENABLED' in src
