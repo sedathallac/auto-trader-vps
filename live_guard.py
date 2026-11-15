@@ -21,7 +21,7 @@ FUTURES_TESTNET = "https://testnet.binancefuture.com"
 # confirmation flag on top of the stage number.
 STAGE_CAPS = {
     1: {"capital_usdt": 0.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 5, "max_positions": 2},
-    2: {"capital_usdt": 100.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 5, "max_positions": 5},
+    2: {"capital_usdt": 100.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 20, "max_positions": 5},
     3: {"capital_usdt": 500.0, "max_notional": 400.0, "daily_loss": 50.0, "leverage": 5, "max_positions": 5},
     4: {"capital_usdt": 2500.0, "max_notional": 840.0, "daily_loss": 150.0, "leverage": 5, "max_positions": 5},
 }

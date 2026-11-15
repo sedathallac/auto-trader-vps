@@ -128,9 +128,9 @@ def test_green_liquidation_cap_formula():
 
 def test_red_old_leverage_ignores_sl_distance():
     """RED: Faz 3 kaldıracı SL mesafesine bakmaz; geniş SL'de tasfiye SL'den önce gelebilir."""
-    lev = scientific_leverage(0.004, _stats(q=0.9, f_star=1.0), 0.0)      # tam kenar → hi=5
+    lev = scientific_leverage(0.004, _stats(q=0.9, f_star=1.0), 0.0)      # tam kenar → hi=20 (FAZ14m)
     sl = 0.30                                                              # senaryo: çok geniş SL
-    assert lev == 5.0 and 1.0 / lev < sl                                   # tasfiye (%20) < SL (%30)
+    assert lev == 20.0 and 1.0 / lev < sl                                  # tasfiye (%5) < SL (%30)
 
 
 def test_green_unified_leverage_keeps_liquidation_beyond_sl():
@@ -153,9 +153,10 @@ def test_green_leverage_rounds_down_not_up_against_cap():
 
 # ------------------------------------------------------------------ marjin
 def test_green_margin_budget_binds_for_small_balance():
-    u = unified_sizing(10.0, 0.004, 0.011, 0.0, _stats(q=0.9, f_star=0.9), RC, 5.5, 25.0,
+    # FAZ14m: hi=20 olduğu için marjin tavanı ancak çok küçük bakiyede bağlar.
+    u = unified_sizing(0.5, 0.004, 0.011, 0.0, _stats(q=0.9, f_star=0.9), RC, 5.5, 25.0,
                        risk_notional=None)
-    assert u.margin <= RC["max_total_margin_pct"] * 10.0 + 1e-9
+    assert u.margin <= RC["max_total_margin_pct"] * 0.5 + 1e-9
     assert "margin" in u.caps
 
 

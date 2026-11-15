@@ -67,14 +67,16 @@ def test_size_decision_as_dict_is_json_safe():
 
 def test_suggest_sl_tp_scales_with_atr():
     g = sp.suggest_sl_tp(0.01)
-    assert g.sl_pct == pytest.approx(0.015) and g.tp_pct == pytest.approx(0.025)
+    assert g.sl_pct == pytest.approx(0.015) and g.tp_pct == pytest.approx(0.03)
     assert g.ok and g.net_rr > 1.2
 
 
 def test_suggest_sl_tp_clips_a_dead_market_to_the_floor():
     g = sp.suggest_sl_tp(0.001)
     assert g.sl_pct == pytest.approx(0.004) and "sl_min" in g.clipped
-    assert not g.ok and "net_rr" in g.reason
+    # FAZ14m: TP tabanı 2 x SL (0.008) → net_rr 1.31, eşiği geçer.
+    assert g.tp_pct == pytest.approx(0.008) and "tp_min" in g.clipped
+    assert g.ok and g.net_rr >= sp.SIZING_DEFAULTS["min_net_reward_risk"]
 
 
 def test_suggest_sl_tp_clips_a_wild_market_to_the_ceiling():
@@ -99,5 +101,7 @@ def test_suggest_sl_tp_honours_a_stricter_rr_requirement():
 
 
 def test_geometry_as_dict_reports_clipping():
-    d = sp.suggest_sl_tp(0.001).as_dict()
+    # FAZ14m: TP tabanı 2 x SL olduğu için ölü piyasa artık R/R kapısını geçiyor;
+    # reddi kanıtlamak için daha sıkı bir R/R şartı verilir.
+    d = sp.suggest_sl_tp(0.001, min_rr=3.0).as_dict()
     assert d["ok"] is False and "sl_min" in d["clipped"]

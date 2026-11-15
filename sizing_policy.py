@@ -28,14 +28,14 @@ SIZING_DEFAULTS = {
     "min_notional": 5.5,
     "max_notional": 25.0,
     "max_position_pct": 20.0,   # FAZ14: equity yuzdesi tavani (0 = tavan yok)
-    "max_leverage": 5,          # FAZ14: kaldiracli marjin tavani
+    "max_leverage": 20,         # FAZ14m: 5 -> 20 (kaldiracli marjin tavani)
     "min_net_reward_risk": 1.20,
     "quality_floor": 0.55,
     "sl_atr_mult": 1.5,
-    "tp_atr_mult": 2.5,
+    "tp_atr_mult": 3.0,         # FAZ14m: TP = 2 x SL
     "sl_min_pct": 0.004,
     "sl_max_pct": 0.060,
-    "tp_min_pct": 0.006,
+    "tp_min_pct": 0.008,        # FAZ14m: 2 x sl_min_pct
     "tp_max_pct": 0.120,
 }
 

@@ -126,16 +126,16 @@ RISK_CONFIG = {
     "risk_guards_enabled": True,
     "target_risk_units": 3.0,
     "min_leverage": 1,
-    "max_leverage": 5,
+    "max_leverage": 20,  # FAZ14m: 5 -> 20 (kullanici talebi); baglayici tavan yine 9-faktor formulu
     "min_notional": 5.5,
     "max_notional": 999999.0,  # FAZ14h: sabit USDT tavani kaldirildi; baglayici tavan max_position_pct (equity %20)
     "max_position_pct": 20.0,  # FAZ14: equity yuzdesi tavani (sabit USDT yerine olceklenen matematik)
-    # ATR-bazlı dinamik SL/TP
+    # ATR-bazlı dinamik SL/TP — FAZ14m: TP = 2 x SL (brut R/R 2.0, slippage sonrasi ~1.94)
     "atr_sl_multiplier": 1.5,
-    "atr_tp_multiplier": 2.5,
+    "atr_tp_multiplier": 3.0,
     "sl_min_pct": 0.010,
     "sl_max_pct": 0.10,
-    "tp_min_pct": 0.015,
+    "tp_min_pct": 0.020,
     "tp_max_pct": 0.15,
 }
 

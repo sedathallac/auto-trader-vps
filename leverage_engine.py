@@ -50,7 +50,7 @@ from typing import Optional
 LEV_ENGINE_CONFIG = {
     "c": 0.12,              # kalibrasyon sabiti (σ=0.02,q=0.5,d=0 → L≈3, mevcut merkeze yakın)
     "lo": 1.0,             # L alt sınırı
-    "hi": 5.0,             # L üst sınırı (RISK_CONFIG.max_leverage ile hizalı)
+    "hi": 20.0,            # L üst sınırı (RISK_CONFIG.max_leverage ile hizalı; FAZ14m: 5 -> 20)
     "kelly_fraction": 0.25,  # fractional Kelly (1/4 Kelly)
     "kelly_full_ref": 0.25,  # "tam kenar" sayılan fractional-Kelly değeri (edge normalizasyonu)
     "lookback": 50,        # q/p/b için son N kapanmış işlem
