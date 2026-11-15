@@ -37,7 +37,12 @@ def _env_float(name, default):
 LEVERAGE_DEFAULTS = {
     # FAZ14k: c env'e bağlandı. c=0.02 → σ=%2'de 1x (~%3 risk/işlem),
     # c=0.06 → σ=%2'de 3x (~%9 risk/işlem). Ölçek keyfi sabit değil.
-    "c": _env_float("LEVERAGE_C", 0.02),   # volatilite ölçeği: L_vol = c/σ
+    "c": _env_float("LEVERAGE_C", 0.02),   # volatilite ölçeği: L_vol = c_eff/σ
+    # FAZ14o: c_eff coine göre ölçeklenir. Kalite skoru yüksek coin daha yüksek
+    # volatilite tavanı hak eder; düşük kalite cezalandırılır. quality=None → ölçek 1.0
+    # (eski davranış birebir korunur).
+    "quality_gain": _env_float("LEVERAGE_QUALITY_GAIN", 1.0),
+    "quality_floor": _env_float("LEVERAGE_QUALITY_FLOOR", 1.0),
     "lo": 1.0,
     "hi": 20.0,
     "kelly_fraction": 0.25,
@@ -108,14 +113,31 @@ def liquidation_cap(sl_pct, cfg=None):
     return max(lo, 1.0 / (buf * float(sl_pct) + maint))
 
 
+def quality_scale(quality, cfg=None):
+    """Coine özel c çarpanı: floor + gain·clip(quality,0,1).
+
+    quality=None → 1.0 (eski davranış birebir korunur). Kalite skoru 0..1 arttıkça
+    aynı volatilitede daha yüksek kaldıraç hakkı doğar; düşük kaliteli coin ceza alır.
+    """
+    if quality is None:
+        return 1.0
+    floor_ = float(_cfg(cfg, "quality_floor"))
+    gain = float(_cfg(cfg, "quality_gain"))
+    return floor_ + gain * _clip(float(quality), 0.0, 1.0)
+
+
 def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
-                     exchange_max=None, cfg=None) -> LeverageDecision:
+                     exchange_max=None, cfg=None, quality=None) -> LeverageDecision:
     """Beş tavanın en küçüğü; tam sayıya round-half-to-even ile yuvarlanır.
 
     FAZ14k: `floor` yerine `round` (banker's rounding). floor, ham değer 1.85 iken 1x
     verip 2.00 iken 2x veriyordu; %8 ATR farkı %100 kaldıraç farkı üretiyordu. round
     sürekli davranır (1.85→2, 2.00→2, 2.597→3). Yuvarlama sonrası değer tasfiye
     tavanını aşarsa L_liq'e clamp edilir — güvenlik korunur.
+
+    FAZ14o: `quality` verilirse volatilite ölçeği coine göre ölçeklenir
+    (c_eff = c · quality_scale). Böylece tavan 20 tek bir global sabitle değil,
+    coinin kendi durumuyla (σ ve kalite) erişilebilir olur.
 
     Dönen `caps` hangi tavanın bağlayıcı olduğunu söyler (denetim izi);
     `caps_detail` tüm tavanların ham değerlerini taşır (şeffaflık logu).
@@ -130,7 +152,11 @@ def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
                                 float(sigma or 0.0), float(drawdown or 0.0),
                                 {"invalid_inputs": lo}, 0.0)
 
-    l_vol = volatility_leverage(sigma, cfg)
+    _qs = quality_scale(quality, cfg)
+    _c_eff = float(_cfg(cfg, "c")) * _qs
+    _cfg_eff = dict(cfg or {})
+    _cfg_eff["c"] = _c_eff
+    l_vol = volatility_leverage(sigma, _cfg_eff)
     l_dd = drawdown_penalty(l_vol, drawdown)
     if l_dd < l_vol:
         caps.append("drawdown")
@@ -168,7 +194,9 @@ def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
     detail = {"volatility": round(l_vol, 4), "drawdown": round(l_dd, 4),
               "kelly": round(l_kelly, 4), "liquidation": round(l_liq, 4),
               "stage": None if stage_cap is None else float(stage_cap),
-              "exchange": None if exchange_max is None else float(exchange_max)}
+              "exchange": None if exchange_max is None else float(exchange_max),
+              "c_eff": round(_c_eff, 6), "quality": None if quality is None else round(float(quality), 4),
+              "quality_scale": round(_qs, 4)}
     binding = caps[0] if caps else "none"
     reason = f"binding={binding}"
     # risk_per_trade: SL mesafesi × kaldıraç = notional'ın yüzdesi olarak risk.

@@ -1352,12 +1352,16 @@ def calc_amount(price, filters):
     return round(amt, 8)
 
 
-def calculate_dynamic_leverage(atr_pct, *, drawdown=0.0, f_star=None, stage_cap=None):
+def calculate_dynamic_leverage(atr_pct, *, drawdown=0.0, f_star=None, stage_cap=None,
+                               quality=None):
     """FAZ11 Katman 2: leverage_policy.compute_leverage delege eder.
 
     Beş tavanın en küçüğü (volatilite, drawdown, Kelly, tasfiye, kademe/borsa) ve
     tam sayıya AŞAĞI yuvarlama. Eski `target_risk/ATR%` formülü yalnız volatilite
     tavanını görüyordu; tasfiye güvenliği ve Kelly hesaba katılmıyordu.
+
+    FAZ14o: `quality` (coin kalite skoru 0..1) verilirse volatilite ölçeği coine göre
+    ölçeklenir; tavan 20 coinin kendi durumuyla erişilebilir olur.
     """
     if atr_pct is None or atr_pct <= 0:
         return RISK_CONFIG["min_leverage"]
@@ -1370,6 +1374,7 @@ def calculate_dynamic_leverage(atr_pct, *, drawdown=0.0, f_star=None, stage_cap=
         f_star=f_star,
         stage_cap=stage_cap if stage_cap is not None else RISK_CONFIG["max_leverage"],
         exchange_max=RISK_CONFIG["max_leverage"],
+        quality=quality,
     )
     return max(RISK_CONFIG["min_leverage"], min(RISK_CONFIG["max_leverage"], d.leverage))
 
@@ -2095,16 +2100,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         dyn_lev = max(1, int(round(_new_lev)))
         log.info(f"  🔬 Faz3 kaldıraç uygulandı: {dyn_lev}x (bilimsel formül)")
     elif RISK_CONFIG.get("risk_guards_enabled", False):
+        _cq_lev = coin.get("CQ")
         dyn_lev = calculate_dynamic_leverage(atr_pct, drawdown=_dd_now,
-                                             stage_cap=_stage_cap)
+                                             stage_cap=_stage_cap, quality=_cq_lev)
         _levd = leverage_policy.compute_leverage(
             float(atr_pct), float(sl_pct),
             drawdown=float(_dd_now or 0.0), f_star=None,
             stage_cap=_stage_cap if _stage_cap is not None else RISK_CONFIG["max_leverage"],
-            exchange_max=RISK_CONFIG["max_leverage"])
+            exchange_max=RISK_CONFIG["max_leverage"], quality=_cq_lev)
         _cd = _levd.caps_detail
         log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} σ={atr_pct:.4f} "
-                 f"c={leverage_policy.LEVERAGE_DEFAULTS['c']:.3f} → L_vol={_cd.get('volatility')} "
+                 f"c={leverage_policy.LEVERAGE_DEFAULTS['c']:.3f} "
+                 f"cq={'n/a' if _cq_lev is None else f'{float(_cq_lev):.3f}'} "
+                 f"c_eff={_cd.get('c_eff')} → L_vol={_cd.get('volatility')} "
                  f"→ round={dyn_lev}x → risk_per_trade={_levd.risk_per_trade*100:.2f}% "
                  f"(leverage_policy)")
         log.info(f"  [LIVE] caps: volatility={_cd.get('volatility')} liq={_cd.get('liquidation')} "
