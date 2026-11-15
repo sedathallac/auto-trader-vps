@@ -85,9 +85,12 @@ class TestRunOnceBlocksWhenNoCoordinator(unittest.TestCase):
         saved = {n: getattr(auto_trader, n) for n in stubs}
         for n, v in stubs.items():
             setattr(auto_trader, n, v)
-        orig_env = {k: os.environ.get(k) for k in ("BINANCE_KEY", "BINANCE_SECRET")}
+        orig_env = {k: os.environ.get(k) for k in ("BINANCE_KEY", "BINANCE_SECRET",
+                                                   "HB_USERNAME", "HB_PASSWORD")}
         os.environ["BINANCE_KEY"] = "k"
         os.environ["BINANCE_SECRET"] = "s"
+        os.environ["HB_USERNAME"] = "u"
+        os.environ["HB_PASSWORD"] = "p"
         try:
             auto_trader.run_once(dry_run=False)
             self.assertFalse(captured["open_coin_called"],
