@@ -409,22 +409,26 @@ def test_confirm_weak_strength_does_not_count(patch_signals):
     assert not se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05)).allow
 
 
-def test_confirm_cold_start_uncalibrated_rejects_even_with_two_families(patch_signals):
-    """p_fake=0.5 nötr → p_real=prior=0.5 < 0.65: kalibrasyon olmadan 'on' muhafazakâr reddeder."""
+def test_confirm_cold_start_uncalibrated_passes_at_new_threshold(patch_signals):
+    """FAZ14h: esik 0.40'e indi; p_fake=0.5 notr → p_real=prior=0.5 ≥ 0.40, kalibrasyonsuz gecer.
+
+    UYARI: bu, esik dusurumunun gercek ve istenmeyen yan etkisidir — kalibrasyon kaniti
+    olmayan sinyal artik gecer. Rapor'da ayrica belirtilir.
+    """
     patch_signals(exh=[_reading()], struct=[_reading("sr_proximity", se.FAM_STRUCTURE)])
     v = se.confirm(1, _flat_main(), _trend_cds(), None)
-    assert not v.allow and v.p_real == pytest.approx(0.5) and not v.calibrated
+    assert v.allow and v.p_real == pytest.approx(0.5) and not v.calibrated
 
 
-def test_confirm_p_real_threshold_0_65(patch_signals):
+def test_confirm_p_real_threshold_0_40(patch_signals):
     patch_signals(exh=[_reading()], struct=[_reading("sr_proximity", se.FAM_STRUCTURE)])
     strong = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.2))     # 2·ln4 → p≈0.94
     assert strong.allow and strong.p_real > 0.9 and strong.calibrated
     edge = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.40))      # 2·ln1.5 → p≈0.69
     assert edge.allow and 0.65 <= edge.p_real < 0.75
-    weak = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.45))      # p≈0.60 < 0.65
-    assert not weak.allow and 0.55 < weak.p_real < 0.65
-    assert se.CONFIRM_DEFAULTS["confirm_min_p_real"] == 0.65
+    weak = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.45))      # p≈0.60 ≥ 0.40
+    assert weak.allow and 0.55 < weak.p_real < 0.65
+    assert se.CONFIRM_DEFAULTS["confirm_min_p_real"] == 0.40
 
 
 def test_confirm_three_families_more_confident_than_two(patch_signals):
@@ -441,7 +445,7 @@ def test_default_flag_off_and_config_in_risk_config():
     assert auto_trader.STRATEGY_CONFIRMATION == "off"
     for k in se.CONFIRM_DEFAULTS:
         assert k in auto_trader.RISK_CONFIG
-    assert auto_trader.RISK_CONFIG["confirm_min_p_real"] == 0.65
+    assert auto_trader.RISK_CONFIG["confirm_min_p_real"] == 0.40
     assert auto_trader.RISK_CONFIG["confirm_tf_main"] == "15m"
     assert auto_trader.RISK_CONFIG["confirm_tf_veto"] == ("1h", "4h")
 

@@ -24,7 +24,7 @@ from pathlib import Path
 
 CONFIRM_DEFAULTS = {
     "confirm_min_families": 2,
-    "confirm_min_p_real": 0.65,          # yönetici kararı (0.55 çok düşük bulundu)
+    "confirm_min_p_real": 0.40,          # FAZ14h: 0.65 -> 0.40; kalibre hucreler 0.128-0.725 uretiyor, 0.65 kapıyı kilitliyordu
     "confirm_veto_trend_strength": 0.7,  # FAZ14: 0.60 → 0.70; ters sinyal 0.60'ta tam sınırda kalıyordu
     "confirm_adx_trend": 25.0,
     "confirm_adx_range": 20.0,
