@@ -76,6 +76,10 @@ RISK_CONFIG = {
     "risk_per_trade_pct": 0.015,
     "kelly_fraction": 0.25,
     "fee_pct_round_trip": 0.0008,
+    "slippage_pct_round_trip": 0.0004,
+    "min_net_reward_risk": 1.20,
+    "min_notional_policy": "refuse",
+    "max_daily_loss_pct": 0.05,
     "risk_guards_enabled": True,
     "target_risk_units": 3.0,
     "min_leverage": 1,
@@ -1298,6 +1302,7 @@ _LAST_CONFIRM = {}          # son Faz6 teyidinin aileleri (live family gate içi
 
 _LIVE_CFG = None            # live_guard.LiveConfig (tembel; HB_OFFLINE=1 iken hiç yüklenmez)
 _startup_checked = [False]  # live açılış doğrulaması süreç başına bir kez
+_EDGE_CACHE = {"ts": 0.0, "decisions": None}  # FAZ10: promotion_gate TTL cache
 
 
 def _live_cfg():
@@ -1348,6 +1353,59 @@ def _live_regime_gate():
     if not ok:
         log.info(f"[LIVE] skipped regime={regime} (not in winning set)")
     return ok, reason
+
+
+def _live_edge_gate():
+    """(allowed, reason). Canlıda yalnız istatistiksel olarak KANITLANMIŞ aile×rejim hücresi emir verir.
+
+    Kanıt yoksa (hiç çözülmüş hücre yok) kapı "shadow" modunda açık kalır: veri
+    toplanmadan kanıt üretilemez. Kanıt varsa ve bu hücre geçmiyorsa emir YOK.
+    """
+    try:
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    mode = os.getenv("EDGE_GATE", "auto").strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return True, "edge gate off"
+    regime = _LAST_CONFIRM.get("regime")
+    families = list((_LAST_CONFIRM.get("families") or {}).keys())
+    if not families:
+        return False, "no confirming family"
+    try:
+        import edge_engine
+        import strategy_engine as _se
+        decisions = _live_edge_decisions(_se.SignalStore(_se.SIGNAL_DB), RISK_CONFIG)
+    except Exception as e:
+        log.critical(f"🚨 edge gate hesabı başarısız, fail-closed: {e}")
+        return False, f"edge gate error: {e}"
+    if not decisions:
+        log.info("[EDGE] shadow: henüz çözülmüş hücre yok, kapı veri toplama için açık")
+        return True, "shadow: no resolved cells yet"
+    for fam in families:
+        ok, reason = edge_engine.gate_lookup(decisions, fam, regime)
+        if ok:
+            log.info(f"  🎓 edge cell kanıtlı: {fam}:{regime} ({reason})")
+            return True, reason
+    return False, f"no proven edge cell for {families} regime={regime}"
+
+
+def _live_edge_decisions(store, cfg, ttl=300):
+    """promotion_gate sonuçlarını süreç içinde TTL ile cache'ler (her tick'te DB taraması yok)."""
+    now = time.time()
+    if _EDGE_CACHE["decisions"] is not None and now - _EDGE_CACHE["ts"] < ttl:
+        return _EDGE_CACHE["decisions"]
+    import edge_engine
+    cost = float(cfg.get("fee_pct_round_trip", 0.0008)) + \
+        float(cfg.get("slippage_pct_round_trip", 0.0004))
+    cells = edge_engine.cells_from_rows(store.resolved_rows(), cost=cost)
+    decisions = edge_engine.promotion_gate(cells, cfg)
+    _EDGE_CACHE["ts"] = now
+    _EDGE_CACHE["decisions"] = decisions
+    return decisions
 
 
 def _faz6_confirm(binance, symbol, side, sl_pct, mode):
@@ -1611,6 +1669,25 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  atlandı: live regime gate ({_reg_reason})")
         return False
 
+    # FAZ10: kanıtlanmış edge kapısı. Yalnız istatistiksel olarak pozitif hücre emir verir.
+    _edge_ok, _edge_reason = _live_edge_gate()
+    if not _edge_ok:
+        log.info(f"  atlandı: live edge gate ({_edge_reason})")
+        return False
+
+    # FAZ10: net R/R kapısı — komisyon+slipaj düşüldükten sonra kazanç/kayıp oranı.
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        import edge_engine as _ee
+        _rr, _rr_ok, _rr_detail = _ee.net_reward_risk(
+            tp_pct, sl_pct,
+            RISK_CONFIG.get("fee_pct_round_trip", 0.0008),
+            RISK_CONFIG.get("slippage_pct_round_trip", 0.0004))
+        _min_rr = float(RISK_CONFIG.get("min_net_reward_risk", 1.20))
+        if not _rr_ok or _rr < _min_rr:
+            log.warning(f"  atlandı: net R/R {_rr:.2f} < {_min_rr:.2f} ({_rr_detail})")
+            return False
+        log.info(f"  ⚖️  net R/R={_rr:.2f} ({_rr_detail})")
+
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
         slippage_pct = get_real_slippage(binance, symbol)
@@ -1631,7 +1708,8 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
 
     # Boyutlandırma (FAZ 1.2: RiskEngine onayı)
     if RISK_CONFIG.get("risk_guards_enabled", False) and risk is not None:
-        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct)
+        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct,
+                                                     take_profit_pct=tp_pct)
         if target_notional is None:
             log.warning(f"  RiskEngine reddetti: {status}")
             return False
@@ -1670,15 +1748,20 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             log.warning(f"  Faz3 leverage_engine hatası (eski formüle düşülüyor): {_e}")
             _new_lev = None
 
-    # Target notional → amount
+    # Target notional → amount (FAZ10: Decimal adım yuvarlama; min notional altı → emir YOK)
+    import edge_engine as _ee_amt
     step = float(filt["LOT_SIZE"]["stepSize"])
-    raw_amount = target_notional / price
-    steps = max(1, int(raw_amount / step))
-    amount = round(steps * step, 8)
-
+    min_q = float(filt["LOT_SIZE"].get("minQty", 0) or 0)
     min_n = float(filt.get("MIN_NOTIONAL", {}).get("notional", 5))
-    if amount * price < min_n:
-        amount = round((min_n / price / step + 1) * step, 8)
+    amount, _amt_ok = _ee_amt.amount_for_notional(target_notional, price, step, min_q, min_n)
+    if not _amt_ok:
+        if dry_run:
+            log.warning(f"  [DRY] miktar min notional'ı karşılamıyor "
+                        f"(amount={amount}, ≈{amount * price:.2f} < {min_n:.2f} USDT) — emir yok")
+        else:
+            log.warning(f"  atlandı: miktar min notional'ı karşılamıyor "
+                        f"(amount={amount}, ≈{amount * price:.2f} < {min_n:.2f} USDT)")
+            return False
 
     log.info(f"  amount={amount} (≈{amount * price:.2f} USDT)")
 

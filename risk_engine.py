@@ -19,6 +19,7 @@ class RiskEngine:
         self.db_file = Path(config.get("db_file", str(DEFAULT_DB_FILE)))
         self.peak_equity = 0.0
         self.current_equity = 0.0
+        self.day_start_equity = 0.0
         self.current_drawdown = 0.0
         self.consecutive_losses = 0
         self.daily_trades = 0
@@ -157,6 +158,21 @@ class RiskEngine:
             self.peak_equity = current_equity
         if self.peak_equity > 0:
             self.current_drawdown = (self.peak_equity - current_equity) / self.peak_equity
+        # FAZ10: gerçekleşmemiş zarar da günlük limiti tetikler. Gün başı equity
+        # baz alınır; realized-only muhasebe açık pozisyon zararını gizliyordu.
+        today = datetime.now().date().isoformat()
+        if self.state.get("day_start_equity_date") != today or not self.day_start_equity:
+            self.day_start_equity = current_equity
+            self.state["day_start_equity"] = current_equity
+            self.state["day_start_equity_date"] = today
+        if self.day_start_equity > 0:
+            day_loss = (self.day_start_equity - current_equity) / self.day_start_equity
+            limit = float(self.cfg.get("max_daily_loss_pct", 0.05))
+            if day_loss >= limit and not self.is_halted:
+                self.is_halted = True
+                self.halt_reason = (f"daily_loss_pct %{day_loss*100:.2f} "
+                                    f"(limit %{limit*100:.0f}%)")
+                log.critical(f"🚨 GÜNLÜK EQUITY KESİCİ: {self.halt_reason}")
         if self.current_drawdown >= self.cfg["max_drawdown_pct"] and not self.is_halted:
             self.is_halted = True
             self.halt_reason = f"Drawdown %{self.current_drawdown*100:.1f} (limit %{self.cfg['max_drawdown_pct']*100:.0f}%)"
@@ -182,7 +198,13 @@ class RiskEngine:
             self.halt_reason = f"Exposure limit aşıldı (%{usage*100:.1})"
             log.critical(f"🚨 {self.halt_reason} — yeni pozisyon açılmayacak")
 
-    def approve_trade(self, balance, stop_distance_pct):
+    def approve_trade(self, balance, stop_distance_pct, take_profit_pct=None):
+        """Risk bütçesi onayı. Döner (notional|None, reason).
+
+        FAZ10: maliyetler (komisyon + slipaj) stop mesafesine eklenir; net R/R
+        kapısı ve bütçe taşması kapısı edge_engine'dedir. `take_profit_pct`
+        verilmezse R/R kapısı atlanır (geriye uyumlu çağrılar).
+        """
         if self.is_halted:
             return None, f"halted: {self.halt_reason}"
         if self.daily_trades >= self.cfg["max_trades_per_day"]:
@@ -199,13 +221,34 @@ class RiskEngine:
             return None, f"daily_loss_limit ({self.daily_pnl:.2f})"
         if stop_distance_pct <= 0:
             return None, "invalid_stop"
+
+        import edge_engine
+
         fee_pct = self.cfg.get("fee_pct_round_trip", 0.0008)
-        kelly = self.cfg.get("kelly_fraction", 0.25)
-        effective_sl = stop_distance_pct + fee_pct
-        risk_amount = balance * self.cfg["risk_per_trade_pct"]
-        raw_notional = risk_amount / effective_sl
-        notional = raw_notional * kelly
-        notional = max(self.cfg["min_notional"], min(notional, self.cfg["max_notional"]))
+        slip_pct = self.cfg.get("slippage_pct_round_trip", 0.0004)
+        if take_profit_pct is not None:
+            rr, rr_ok, detail = edge_engine.net_reward_risk(
+                take_profit_pct, stop_distance_pct, fee_pct, slip_pct)
+            min_rr = float(self.cfg.get("min_net_reward_risk",
+                                        edge_engine.EDGE_DEFAULTS["min_net_reward_risk"]))
+            if not rr_ok or rr < min_rr:
+                log.warning(f"  RiskEngine net R/R reddi: rr={rr:.2f} < {min_rr:.2f} ({detail})")
+                return None, f"net_rr ({rr:.2f} < {min_rr:.2f})"
+
+        notional, reason = edge_engine.risk_notional(
+            balance,
+            float(self.cfg["risk_per_trade_pct"]),
+            stop_distance_pct,
+            fee_pct,
+            slip_pct,
+            float(self.cfg.get("kelly_fraction", 0.25)),
+            float(self.cfg["min_notional"]),
+            float(self.cfg["max_notional"]),
+            policy=str(self.cfg.get("min_notional_policy", "refuse")),
+        )
+        if notional is None:
+            log.warning(f"  RiskEngine boyut reddi: {reason}")
+            return None, reason
         return notional, "approved"
 
     def register_open(self):
@@ -215,5 +258,8 @@ class RiskEngine:
     def reset_daily(self):
         self.daily_trades = 0
         self.daily_pnl = 0.0
+        self.day_start_equity = 0.0
+        self.state.pop("day_start_equity", None)
+        self.state.pop("day_start_equity_date", None)
         self._save_state()
         log.info("🌅 Günlük sayaçlar sıfırlandı")

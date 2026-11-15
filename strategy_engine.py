@@ -546,15 +546,30 @@ def kaplan_meier(durations, observed):
     return curve
 
 
-def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_pct):
-    """Sekiz kapanmış gelecek mumdan teorik sonuç üretir.
+def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_pct,
+                      tp_pct=None):
+    """Kapanmış gelecek mumlardan teorik sonuç üretir.
 
     sl_pct yoksa yalnızca fwd_ret ve persist_bars hesaplanır.
     real=None bırakılır; bilinmeyen geçmiş stop mesafesi uydurulmaz.
+
+    FAZ10: `tp_pct` verilirse sonuç YOL-BAĞIMLIdır (edge_engine.first_touch_outcome):
+    SL/TP ilk teması belirler, aynı mumda ikisi de varsa SL kazanır. Bu durumda
+    ikinci değer NET getiridir (cost = komisyon+slipaj düşülmüş), `real` ise
+    net_ret > 0'dır. `tp_pct=None` eski (kapanış-bazlı) davranışı korur.
     """
     n = min(horizon, len(fut_c))
     if n < horizon or direction not in (-1, 1) or entry <= 0:
         return None
+
+    if tp_pct is not None:
+        import edge_engine
+        touch = edge_engine.first_touch_outcome(
+            direction, entry, fut_h[:horizon], fut_l[:horizon], fut_c[:horizon],
+            float(sl_pct), float(tp_pct), fee_pct=float(cost), slippage_pct=0.0)
+        if touch is None:
+            return None
+        return (touch.net_ret > 0), touch.net_ret, touch.bars_held
 
     fwd = direction * (fut_c[horizon - 1] - entry) / entry
     persist = next(
@@ -797,6 +812,29 @@ class SignalStore:
         tarama anının stop değerini uygulamak için kullanılmaz.
         """
         return self.resolve_pending_detailed(symbol, cd, cost)["resolved"]
+
+    def resolved_rows(self, limit=None):
+        """Çözülmüş ve fiyat metriği olan satırlar (edge/promotion analizi için).
+
+        Yalnız okuma; `real` tautolojisine güvenilmez, çağıran fwd_ret'i maliyetle
+        netleştirir. Dönen sözlükler: family, regime, fwd_ret, persist_bars, entry_ts.
+        """
+        sql = ("SELECT family, regime, fwd_ret, persist_bars, entry_ts "
+               "FROM signal_outcomes WHERE resolved=1 AND fwd_ret IS NOT NULL "
+               "ORDER BY entry_ts")
+        params = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        c = self._conn()
+        try:
+            return [
+                {"family": r[0], "regime": r[1], "fwd_ret": r[2],
+                 "persist_bars": r[3], "entry_ts": r[4]}
+                for r in c.execute(sql, params).fetchall()
+            ]
+        finally:
+            c.close()
 
     def p_fake(self, signal, regime, cfg=None):
         """Sinyal×rejim Beta posterior → (p_fake, calibrated). n<min_events → nötr (0.5, False)."""

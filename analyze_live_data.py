@@ -244,6 +244,18 @@ def _approved_cells(train, min_events, fdr, n_perm, seed):
     return out
 
 
+def net_expectancy_report(rows, *, cost=DEFAULT_COST, n_trials=1):
+    """FAZ10: maliyet sonrası expectancy + bootstrap GA + DSR (tek satırlık kanıt)."""
+    import edge_engine
+    xs = [float(r["fwd"]) - cost for r in rows]
+    st = edge_engine.expectancy(xs)
+    lo, hi = edge_engine.bootstrap_ci_mean(xs, 2000, 0.05, seed=0)
+    return {"n": st.n, "mean_net": st.mean, "ci": [lo, hi], "p_value": st.p_value,
+            "win_rate": st.win_rate, "payoff": st.payoff,
+            "profit_factor": st.profit_factor,
+            "dsr": edge_engine.deflated_sharpe_ratio(xs, max(1, int(n_trials)))}
+
+
 def strategy_analysis(rows, *, cost=DEFAULT_COST, min_events=100, fdr=0.10, min_p_real=0.65, folds=4,
                       min_acc=30, n_perm=1000, seed=0, horizon=8):
     rows = decluster(rows, lambda r: (r["symbol"], r["signal"], r["side"]), "ts", horizon * M15)
@@ -286,6 +298,8 @@ def strategy_analysis(rows, *, cost=DEFAULT_COST, min_events=100, fdr=0.10, min_
     checks = {"wilson_lo>taban": out["accepted_wilson"][0] > base,
               "net_beklenti>0": (out["accepted_net_expectancy"] or 0) > 0,
               "p<0.10": out.get("p_value", 1.0) < 0.10}
+    out["expectancy"] = net_expectancy_report(acc, cost=cost, n_trials=folds)
+    checks["bootstrap_ci_low>0"] = out["expectancy"]["ci"][0] > 0
     out["checks"] = checks
     out["verdict"] = EDGE if all(checks.values()) else NO_EDGE
     return out
@@ -345,6 +359,11 @@ def render(rep):
          f"taban={f(s.get('base_real_rate'))} kabul oran={f(s.get('accepted_real_rate'))} "
          f"Wilson alt={f((s.get('accepted_wilson') or [None])[0])} "
          f"E_net={f(s.get('accepted_net_expectancy'), 5)} p={f(s.get('p_value'))}"]
+    e = s.get("expectancy")
+    if e:
+        L.append(f"  expectancy: n={e['n']} mean_net={f(e['mean_net'], 5)} "
+                 f"CI=[{f(e['ci'][0], 5)},{f(e['ci'][1], 5)}] DSR={f(e['dsr'], 3)} "
+                 f"PF={f(e['profit_factor'], 2)} payoff={f(e['payoff'], 2)}")
     for name in ("whale", "strategy"):
         d = rep[name]
         if d.get("reason"):
