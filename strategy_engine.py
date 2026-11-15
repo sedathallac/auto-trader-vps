@@ -25,10 +25,10 @@ from pathlib import Path
 CONFIRM_DEFAULTS = {
     "confirm_min_families": 2,
     "confirm_min_p_real": 0.65,          # yönetici kararı (0.55 çok düşük bulundu)
-    "confirm_veto_trend_strength": 0.6,
+    "confirm_veto_trend_strength": 0.7,  # FAZ14: 0.60 → 0.70; ters sinyal 0.60'ta tam sınırda kalıyordu
     "confirm_adx_trend": 25.0,
     "confirm_adx_range": 20.0,
-    "confirm_min_strength": 0.3,         # bir sinyalin oy sayılması için
+    "confirm_min_strength": 0.15,        # FAZ14: 0.30 → 0.15 (geçici, veri toplansın)
     "confirm_prior_real": 0.5,
     "confirm_min_events": 100,           # posterior'un güvenilir sayılması için (declustered)
     "confirm_beta_a0": 1.0, "confirm_beta_b0": 1.0,
@@ -525,8 +525,11 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
         score = (1.0 - p_fake) * r.strength
         if r.family not in best or score > best[r.family][0]:
             best[r.family] = (score, r, p_fake, cal)
-    if len(best) < _cfg(cfg, "confirm_min_families"):
-        return Verdict(False, f"teyit yetersiz ({len(best)}/{_cfg(cfg, 'confirm_min_families')} aile)",
+    # FAZ14: ters politika uygulanmışsa tek aile yeterlidir. Ters sinyal zaten kalibre
+    # posteriorla tek başına başabaşın üstünde; ikinci aile beklemek kapıyı hiç açmıyordu.
+    _min_fam = 1 if reversed_all else _cfg(cfg, "confirm_min_families")
+    if len(best) < _min_fam:
+        return Verdict(False, f"teyit yetersiz ({len(best)}/{_min_fam} aile)",
                        regime=regime, families={f: b[1].name for f, b in best.items()},
                        readings=readings, trend_against=against,
                        regime_adx=regime_adx, trend_adx=adx_max,
@@ -680,6 +683,17 @@ SIGNAL_DB = str(Path.home() / "signal_outcomes.db")
 # FAZ13: posterior OKUMASI için ayrı (salt-okunur) DB. Canlı servis kendi state dizininde yazar; kalibrasyon
 # compare'in biriktirdiği çözülmüş satırlardan okunur. Boş bırakılırsa SIGNAL_DB kullanılır (eski davranış).
 CALIB_DB = os.getenv("SIGNAL_CALIBRATION_DB") or SIGNAL_DB
+
+
+def calib_db_path(env=None):
+    """Kalibrasyon DB yolu — çağrı anında env'den okunur.
+
+    Modül düzeyi CALIB_DB import anında donar; süreç env'i sonradan değişirse
+    (test, gömülü çalıştırma) eski yol kullanılmaya devam ederdi. Bu yardımcı
+    her çağrıda taze değer verir ve boş/geçersiz değeri SIGNAL_DB'ye düşürür.
+    """
+    e = os.environ if env is None else env
+    return (e.get("SIGNAL_CALIBRATION_DB") or "").strip() or SIGNAL_DB
 
 def _utc_now_iso() -> str:
     """Resolver damgasi: hangi satirin ne zaman cozuldugu. Eski satirlar NULL kalir (geriye uyumlu)."""

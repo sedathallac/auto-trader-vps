@@ -1586,7 +1586,7 @@ def _log_calibration_status():
     _CALIB_LOGGED["done"] = True
     try:
         import strategy_engine as _se
-        cov = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB).calibration_coverage(RISK_CONFIG)
+        cov = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.calib_db_path()).calibration_coverage(RISK_CONFIG)
         if cov.get("error"):
             log.warning(f"🧮 Kalibrasyon DB okunamadı ({cov['path']}): {cov['error']} — p_fake nötr 0.5 kalacak")
             return
@@ -1609,7 +1609,7 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _main6 = _se.fetch_candles(binance, symbol, RISK_CONFIG["confirm_tf_main"], _lim)
         _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
                 for tf in RISK_CONFIG["confirm_tf_veto"]}
-        _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.CALIB_DB)
+        _store6 = _se.SignalStore(_se.SIGNAL_DB, calib_db=_se.calib_db_path())
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
         # FAZ14: ters politika canlıda da uygulanır (REVERSE_POLICY=on). Politika evaluate()
