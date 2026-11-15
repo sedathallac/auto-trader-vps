@@ -103,6 +103,24 @@ try:
 except ValueError:
     TOP_N_COMPARE = 20
 MAX_OPEN_POSITIONS = max(0, int(os.getenv("MAX_OPEN_POSITIONS", "0")))  # 0 = EMERGENCY (yeni giris durdu)
+# FAZ14t: CANLI SEMBOL KAPISI. Kullanıcı kısıtı: bu sembollere emir AÇILMAZ.
+# Kanıt (canlı, 2026-11-16 00:16:57): kapı yoktu, bot ENAUSDT SHORT açtı.
+# Sabit varsayılan korunur; env yalnız EKLEME yapar (kaldıramaz) — yanlış/boş env
+# yasak listesini asla boşaltamaz (fail-closed).
+LIVE_BLOCKED_SYMBOLS_DEFAULT = ("BARDUSDT", "SUIUSDT", "ENAUSDT", "PEPEUSDT",
+                                "1000PEPEUSDT", "XRPUSDT")
+
+
+def _blocked_symbols():
+    out = {s.strip().upper() for s in LIVE_BLOCKED_SYMBOLS_DEFAULT}
+    for s in (os.getenv("LIVE_BLOCKED_SYMBOLS") or "").split(","):
+        s = s.strip().upper()
+        if s:
+            out.add(s)
+    return frozenset(out)
+
+
+LIVE_BLOCKED_SYMBOLS = _blocked_symbols()
 _HB_AUTH_BROKEN = False  # FAZ14f: Hummingbot kimlik hatasi sonrasi surecte yeni emir denenmez
 
 
@@ -1946,6 +1964,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  C6: limit dolu ({len(_cur)}/{_effective_max_positions()}), atlanıyor")
         return False
     symbol = coin["symbol"]
+    # FAZ14t: canlı sembol kapısı — yasaklı sembole emir açılmaz (compare/dry-run etkilenmez).
+    if not HB_OFFLINE and symbol.upper() in LIVE_BLOCKED_SYMBOLS:
+        log.warning(f"  atlandı: canlı sembol kapısı ({symbol} yasaklı listede)")
+        return False
     pair = symbol.replace("USDT", "-USDT")
     price = float(coin["lastPrice"])
     log.info(f"→ {pair} fiyat={price} hacim={float(coin['quoteVolume']):,.0f} skor={coin['_score']:.3f}")
