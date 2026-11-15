@@ -44,11 +44,32 @@ def _env():
 
 def test_shadow_service_uses_compare_mode():
     cp = _unit()
-    assert cp["Service"]["EnvironmentFile"] == "/etc/auto_trader/shadow.env"
+    lines = _unit_lines()
+    assert "EnvironmentFile=/etc/auto_trader/shadow.env" in lines
+    assert "EnvironmentFile=/etc/auto_trader/keys.env" in lines
     assert 'test \\"$HB_OFFLINE\\" = 1' in cp["Service"]["ExecStartPre"]
     assert "--interval 30" in cp["Service"]["ExecStart"]
     assert _env()["STRATEGY_CONFIRMATION"] == "compare"
     assert _env()["HB_OFFLINE"] == "1"
+
+
+def test_risk_engine_creates_its_schema_in_a_fresh_state_dir(tmp_path):
+    """Yeni state dizininde risk_state tablosu yoktu → FAIL-CLOSED halt. Şema artık kodda."""
+    import risk_engine
+    db = tmp_path / "risk_ledger.db"
+    eng = risk_engine.RiskEngine({"db_file": str(db)})
+    assert eng.is_halted is False, f"fresh state dir halted: {eng.halt_reason}"
+    import sqlite3
+    cols = [r[1] for r in sqlite3.connect(str(db)).execute("PRAGMA table_info(risk_state)")]
+    assert "peak_equity" in cols and "is_halted" in cols and "last_reset_date" in cols
+
+
+def test_risk_engine_schema_is_idempotent(tmp_path):
+    import risk_engine
+    db = tmp_path / "risk_ledger.db"
+    risk_engine.RiskEngine({"db_file": str(db)})._save_state()
+    again = risk_engine.RiskEngine({"db_file": str(db)})
+    assert again.is_halted is False and again.halt_reason is None
 
 
 def _unit_lines():
