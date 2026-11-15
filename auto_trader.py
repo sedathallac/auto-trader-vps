@@ -19,6 +19,7 @@ _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
 from position_reservation import PositionReserver
 import coin_quality
+import leverage_policy
 import requests
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -1295,15 +1296,15 @@ def get_real_slippage(binance, symbol):
 
 
 def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
-    """Risk-bazlı boyutlandırma (Van Tharp)."""
-    risk_amount = balance_usdt * RISK_CONFIG["risk_per_trade_pct"]
-    effective_sl = sl_pct + slippage_pct
-    if effective_sl <= 0:
-        return None
-    notional = risk_amount / effective_sl
-    notional = min(notional, RISK_CONFIG["max_notional"])
-    notional = max(notional, RISK_CONFIG["min_notional"])
-    return notional, risk_amount, effective_sl
+    """Risk-bazlı boyutlandırma — FAZ11 Katman 3 politikasına delege eder.
+
+    Eski gövde `max(notional, min_notional)` ile kayıp bütçesini aşabiliyordu;
+    `sizing_policy.size_position` bütçe minimumu karşılamıyorsa None döner.
+    Dönen üçlü geriye uyumludur: (notional|None, risk_amount, effective_sl).
+    """
+    import sizing_policy
+    d = sizing_policy.size_position(balance_usdt, sl_pct + slippage_pct, cfg=RISK_CONFIG)
+    return d.notional, d.budget, d.effective_sl
 
 
 def _verify_oneway(binance):
@@ -1879,6 +1880,12 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} → {dyn_lev}x")
     else:
         dyn_lev = LEVERAGE
+
+    # FAZ11 Katman 2: kaldıraç politikası — tasfiye tavanını aşan kaldıraçla emir açılmaz.
+    _lev_ok, _lev_detail = leverage_policy.leverage_ok(dyn_lev, sl_pct)
+    if not _lev_ok:
+        log.warning(f"  atlandı: kaldıraç güvenli değil ({_lev_detail})")
+        return False
 
     lr = binance.set_leverage(symbol, dyn_lev)
     if isinstance(lr, dict) and "leverage" in lr:
