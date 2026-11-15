@@ -101,7 +101,7 @@ def test_reverse_policy_applied_in_shadow_mode():
                 se.SignalReading(se.FAM_EXHAUSTION, "rsi_divergence", 1, 0.7)]
     trends = [{"tf": "1h", "score": 0.0, "adx": 18.0, "adx_strength": 0.12},
               {"tf": "4h", "score": 0.0, "adx": 16.0, "adx_strength": 0.04}]
-    v = se.evaluate(-1, readings, trends, "trend", lambda n, g: (0.3, True),
+    v = se.evaluate(-1, readings, trends, "trend", lambda n, g: (0.7, True),
                     se.CONFIRM_DEFAULTS, regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v.allow is True and set(v.reversed_signals) == {"reverse_wick_rejection", "reverse_rsi_divergence"}
 
