@@ -111,7 +111,9 @@ def test_refused_sizing_stops_the_chain():
 
 
 def test_refused_geometry_stops_the_chain():
-    r = pf.pre_flight_check(**providers(geometry=sp.suggest_sl_tp(0.001)))
+    # FAZ14m: TP tabanı 2 x SL olduğu için ölü piyasa R/R kapısını geçiyor;
+    # reddi kanıtlamak için daha sıkı bir R/R şartı verilir.
+    r = pf.pre_flight_check(**providers(geometry=sp.suggest_sl_tp(0.001, min_rr=3.0)))
     assert not r.ok and r.failed_at == "geometry" and "net_rr" in r.reason
 
 
