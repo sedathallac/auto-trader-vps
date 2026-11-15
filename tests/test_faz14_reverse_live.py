@@ -17,6 +17,7 @@ import strategy_engine as se
 TRENDS = [{"tf": "1h", "score": -1.0, "adx": 64.0, "adx_strength": 1.0},
           {"tf": "4h", "score": -1.0, "adx": 60.0, "adx_strength": 1.0}]
 PF = lambda n, g: (0.28, True)
+PF_HIGH = lambda n, g: (0.725, True)   # asıl yön çoğunlukla sahte → ters yön kanıtlı
 # Tek sinyal testleri: aile sayısı kapısı ayrı test edilir, burada yön çevirme ölçülür.
 ONE_FAM = dict(se.CONFIRM_DEFAULTS, confirm_min_families=1)
 
@@ -30,7 +31,7 @@ def _rsi_div():
 
 
 def test_reverse_policy_flips_wick_rejection_in_live():
-    v = se.evaluate(1, _wick(), TRENDS, "trend", PF, ONE_FAM,
+    v = se.evaluate(1, _wick(), TRENDS, "trend", PF_HIGH, ONE_FAM,
                     regime_adx=28.0, policy=se.REVERSE_POLICY)
     assert v.effective_side == -1, "wick_rejection/trend ters çevrilmedi"
     assert "reverse_wick_rejection" in v.reversed_signals
@@ -38,7 +39,7 @@ def test_reverse_policy_flips_wick_rejection_in_live():
 
 
 def test_reverse_policy_flips_rsi_divergence_in_live():
-    v = se.evaluate(1, _rsi_div(), TRENDS, "trend", PF, ONE_FAM,
+    v = se.evaluate(1, _rsi_div(), TRENDS, "trend", PF_HIGH, ONE_FAM,
                     regime_adx=28.0, policy=se.REVERSE_POLICY)
     assert v.effective_side == -1, "rsi_divergence/trend ters çevrilmedi"
     assert "reverse_rsi_divergence" in v.reversed_signals
@@ -112,6 +113,19 @@ def test_no_policy_reversal_never_overrides_decide_side():
                     regime_adx=18.0, policy=se.REVERSE_POLICY)
     assert v.effective_side == 1, "politika ters çevirme yapmadığı halde yön değişti"
     assert v.reversed_signals == ()
+
+
+def test_reversed_signal_flips_its_fake_probability():
+    """Ters sinyalde p_fake çevrilir: asıl yönün sahteliği ters yönün kanıtıdır."""
+    # p_fake=0.725 (asıl yön sahte) → ters yön için 0.275 → LLR pozitif → p_real > 0.5
+    v = se.evaluate(1, _wick() + _rsi_div(), TRENDS, "trend", lambda n, g: (0.725, True),
+                    ONE_FAM, regime_adx=28.0, policy=se.REVERSE_POLICY)
+    assert v.allow is True, f"ters sinyal p_real'i yükseltmedi: {v.p_real}"
+    assert v.p_real > 0.8
+    # Politika yoksa aynı p_fake p_real'i prior'ın ALTINA çeker (asıl yön sahte).
+    v0 = se.evaluate(1, _wick() + _rsi_div(), TRENDS, "trend", lambda n, g: (0.725, True),
+                     ONE_FAM, regime_adx=28.0, policy=None)
+    assert v0.p_real < 0.5
 
 
 def test_open_coin_applies_the_effective_side(monkeypatch):

@@ -57,12 +57,12 @@ def test_reverse_strategy_wick_rejection_in_trend():
     readings = [_rd("wick_rejection", se.FAM_STRUCTURE, 1, 0.79),
                 _rd("rsi_divergence", se.FAM_EXHAUSTION, 1, 0.7)]
     # FAZ14: politika vetodan ÖNCE çalışır; side=+1 gelse de nihai yön -1'e çevrilir ve GEÇER.
-    v_long = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    v_long = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                          regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v_long.effective_side == -1 and v_long.allow is True
     assert set(v_long.reversed_signals) == {"reverse_wick_rejection", "reverse_rsi_divergence"}
     # SHORT (side=-1): ters çevrilmiş iki sinyal teyit eder → GEÇER
-    v_short = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    v_short = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                           regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v_short.allow is True
     assert set(v_short.families) == {se.FAM_STRUCTURE, se.FAM_EXHAUSTION}
@@ -73,19 +73,21 @@ def test_reverse_strategy_rsi_divergence_in_trend():
     readings = [_rd("rsi_divergence", se.FAM_EXHAUSTION, -1, 0.75),
                 _rd("wick_rejection", se.FAM_STRUCTURE, -1, 0.7)]
     # Sinyaller SHORT diyor; ters politika LONG'u teyit eder.
-    v = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    v = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                     regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v.allow is True and "reverse_rsi_divergence" in v.reversed_signals
     # Politika yoksa aynı okumalar LONG'u teyit ETMEZ (eski davranış korunur)
-    v_off = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    v_off = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                         regime_adx=30.0, policy=None)
     assert v_off.allow is False and v_off.families == {}
 
 
 def test_original_strategy_sr_proximity_in_range():
-    readings = [_rd("sr_proximity", se.FAM_STRUCTURE, 1, 0.8),
-                _rd("rsi_divergence", se.FAM_EXHAUSTION, 1, 0.7)]
-    v = se.evaluate(1, readings, FLAT_TRENDS, "range", lambda n, g: (0.3, True), CFG,
+    readings = [_rd("sr_proximity", se.FAM_STRUCTURE, 1, 0.8)]
+    # sr_proximity/range kanıtlı hücre (asıl oran 0.564, p=0.0013) → p_fake düşük.
+    pf = lambda n, g: (0.30, True)
+    one = dict(CFG, confirm_min_families=1)
+    v = se.evaluate(1, readings, FLAT_TRENDS, "range", pf, one,
                     regime_adx=12.0, policy=se.REVERSE_POLICY)
     assert v.allow is True
     assert "sr_proximity" in v.families.values()
@@ -112,9 +114,9 @@ def test_shadow_mode_does_not_affect_live():
     # Canlı modda politika None → asıl yön; compare'de politika uygulanır.
     readings = [_rd("wick_rejection", se.FAM_STRUCTURE, 1, 0.79),
                 _rd("rsi_divergence", se.FAM_EXHAUSTION, 1, 0.7)]
-    live = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    live = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                        regime_adx=30.0, policy=None)
     assert live.allow is False, "canlı modda ters politika sızmamalı"
-    shadow = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
+    shadow = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.7, True), CFG,
                          regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert shadow.allow is True

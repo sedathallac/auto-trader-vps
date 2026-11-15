@@ -517,6 +517,11 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
         if eff != r.direction and f"reverse_{r.name}" not in reversed_sigs:
             reversed_sigs.append(f"reverse_{r.name}")
         p_fake, cal = p_fake_fn(r.name, regime)
+        # FAZ14: sinyal ters çevrildiyse "sahte" olasılığı da çevrilir. p_fake asıl yönün
+        # sahtelik olasılığıdır; ters yönün sahteliği 1-p_fake'tir. Bu yapılmazsa ters
+        # sinyaller kendi aleyhlerine kanıt sayılıp p_real'i prior'ın altına çekiyordu.
+        if eff != r.direction:
+            p_fake = 1.0 - p_fake
         score = (1.0 - p_fake) * r.strength
         if r.family not in best or score > best[r.family][0]:
             best[r.family] = (score, r, p_fake, cal)
