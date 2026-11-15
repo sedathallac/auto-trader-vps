@@ -42,6 +42,31 @@ CONFIRM_DEFAULTS = {
 FAM_TREND, FAM_EXHAUSTION, FAM_STRUCTURE, FAM_VOLUME = "trend", "exhaustion", "structure", "volume"
 CONFIRM_FAMILIES = (FAM_EXHAUSTION, FAM_STRUCTURE, FAM_VOLUME)
 
+# FAZ13-C: ters yön politikası. Ölçüm (664 satır, mum doğrulamalı) hangi (sinyal,rejim) hücresinin
+# ters yönde başabaşın üstünde olduğunu gösterdi. "reverse" = sinyalin yönü çevrilir, "keep" = asıl yön,
+# "disabled" = sinyal oy sayılmaz (p>0.05, edge yok). Politika dışı hücreler "keep" davranır.
+REVERSE_POLICY = {
+    ("wick_rejection", "trend"): "reverse",     # ters oran 0.612, tersR +0.476, p<0.0001
+    ("rsi_divergence", "trend"): "reverse",     # ters oran 0.578, tersR +0.350, p=0.0011
+    ("sr_proximity", "range"): "keep",          # asıl oran 0.564, asılR +0.744, p=0.0013
+    ("rsi_extreme", "trend"): "disabled",       # ters oran 0.431, p=0.8432
+    ("bollinger_z", "trend"): "disabled",       # ters oran 0.520, p=0.7999
+    ("sr_proximity", "trend"): "disabled",      # ters oran 0.436, p=0.9010
+}
+REVERSE_POLICY_DEFAULT = "keep"
+
+
+def effective_direction(reading, regime, policy=None):
+    """Sinyalin oy yönü: +1/−1, 0 = devre dışı. Politika yoksa asıl yön (eski davranış)."""
+    if policy is None:
+        return reading.direction
+    action = policy.get((reading.name, regime), REVERSE_POLICY_DEFAULT)
+    if action == "disabled":
+        return 0
+    if action == "reverse":
+        return -reading.direction
+    return reading.direction
+
 
 def _cfg(cfg, key):
     return (cfg or {}).get(key, CONFIRM_DEFAULTS[key])
@@ -409,6 +434,7 @@ class Verdict:
     calibrated: bool = False
     regime_adx: float = None      # 15m ADX (rejim kaynağı)
     trend_adx: float = None       # 1h/4h ADX maksimumu (veto kaynağı)
+    reversed_signals: tuple = ()  # ters çevrilen sinyal adları (politika uygulandıysa)
 
 
 def trend_against_strength(trends, side_dir, weights=None):
@@ -431,9 +457,10 @@ def compute_readings(main: Candles):
     return exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
 
 
-def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx=None) -> Verdict:
+def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx=None,
+             policy=None) -> Verdict:
     """KARAR mantığı (veri toplamadan bağımsız; canlı confirm() ve offline backtest AYNI kodu kullanır).
-    p_fake_fn(signal_name, regime) → (p_fake, calibrated)."""
+    p_fake_fn(signal_name, regime) → (p_fake, calibrated). policy: (sinyal,rejim)→reverse/keep/disabled."""
     # 1) REJİM VETO — güçlü trende karşı mean-reversion
     against = trend_against_strength(trends, side_dir)
     adx_max = max(t["adx"] for t in trends)
@@ -444,11 +471,14 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
                        regime=regime, veto=True, readings=readings, trend_against=against,
                        regime_adx=regime_adx, trend_adx=adx_max)
 
-    # 2) TEYİT — aile başına en iyi uyumlu sinyal
-    best, calibrated_all = {}, True
+    # 2) TEYİT — aile başına en iyi uyumlu sinyal (politika uygulanmış yönle)
+    best, calibrated_all, reversed_sigs = {}, True, []
     for r in readings:
-        if r.direction != side_dir or r.strength < _cfg(cfg, "confirm_min_strength"):
+        eff = effective_direction(r, regime, policy)
+        if eff == 0 or eff != side_dir or r.strength < _cfg(cfg, "confirm_min_strength"):
             continue
+        if eff != r.direction:
+            reversed_sigs.append(r.name)
         p_fake, cal = p_fake_fn(r.name, regime)
         score = (1.0 - p_fake) * r.strength
         if r.family not in best or score > best[r.family][0]:
@@ -457,7 +487,8 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
         return Verdict(False, f"teyit yetersiz ({len(best)}/{_cfg(cfg, 'confirm_min_families')} aile)",
                        regime=regime, families={f: b[1].name for f, b in best.items()},
                        readings=readings, trend_against=against,
-                       regime_adx=regime_adx, trend_adx=adx_max)
+                       regime_adx=regime_adx, trend_adx=adx_max,
+                       reversed_signals=tuple(reversed_sigs))
 
     # 3) Birleşik güven — aile başına TEK LLR terimi (aile içi çift sayım yok)
     prior = _clip(_cfg(cfg, "confirm_prior_real"), 0.01, 0.99)
@@ -471,10 +502,12 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
     return Verdict(allow, (f"p_real={p_real:.3f} " + ("≥" if allow else "<")
                            + f" {_cfg(cfg, 'confirm_min_p_real'):.2f}"),
                    p_real, regime, False, {f: b[1].name for f, b in best.items()},
-                   readings, against, calibrated_all, regime_adx, adx_max)
+                   readings, against, calibrated_all, regime_adx, adx_max,
+                   tuple(reversed_sigs))
 
 
-def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None) -> Verdict:
+def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None,
+            policy=None) -> Verdict:
     """side_dir: +1 LONG / −1 SHORT. main=15m Candles; trend_cds={'1h':Candles,'4h':Candles}.
     Eksik veri → fail-closed. YALNIZ allow/deny üretir."""
     if main is None or len(main) < 60 or not trend_cds or any(v is None for v in trend_cds.values()):
@@ -490,7 +523,8 @@ def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg
     readings = exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
     p_fake_fn = (lambda name, reg: store.p_fake(name, reg, cfg)) if store is not None \
         else (lambda name, reg: (0.5, False))
-    return evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg, regime_adx=regime_adx)
+    return evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg, regime_adx=regime_adx,
+                    policy=policy)
 
 
 # ===================================================================== istatistik araçları

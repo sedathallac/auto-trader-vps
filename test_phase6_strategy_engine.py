@@ -520,8 +520,12 @@ def test_compare_logs_records_but_does_not_block(monkeypatch, tmp_path):
     _patch_open_coin(monkeypatch, tmp_path)
     monkeypatch.setattr(auto_trader, "STRATEGY_CONFIRMATION", "compare")
     assert auto_trader.open_coin(fake, None, _coin(), dry_run=True) is True   # karar etkilenmedi
-    n = sqlite3.connect(str(tmp_path / "so.db")).execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0]
-    assert n > 0                                                               # hipotetik olaylar yazıldı
+    rows = sqlite3.connect(str(tmp_path / "so.db")).execute(
+        "SELECT signal, direction, source FROM signal_outcomes").fetchall()
+    # FAZ13-C: bu fixture'da yalnız rsi_extreme + bollinger_z üretiliyor; ikisi de politikada
+    # "disabled" (p>0.05) olduğu için oy/kayıt üretmez. Kayıt yolu ayrı testlerde kanıtlanıyor.
+    assert rows == []
+    assert all(r[1] != 0 for r in rows)
 
 
 def test_on_never_adds_entries_verdict_is_bool_only():
