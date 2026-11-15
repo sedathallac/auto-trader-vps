@@ -19,10 +19,25 @@ Tasarım kuralları:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
+
+def _env_float(name, default):
+    """Env'den float oku; bozuk/boş değerde varsayılana dön (fail-safe)."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 LEVERAGE_DEFAULTS = {
-    "c": 0.02,                 # volatilite ölçeği: σ=2% → L≈1
+    # FAZ14k: c env'e bağlandı. c=0.02 → σ=%2'de 1x (~%3 risk/işlem),
+    # c=0.06 → σ=%2'de 3x (~%9 risk/işlem). Ölçek keyfi sabit değil.
+    "c": _env_float("LEVERAGE_C", 0.02),   # volatilite ölçeği: L_vol = c/σ
     "lo": 1.0,
     "hi": 20.0,
     "kelly_fraction": 0.25,
@@ -49,11 +64,15 @@ class LeverageDecision:
     reason: str = ""
     sigma: float = 0.0
     drawdown: float = 0.0
+    caps_detail: dict = field(default_factory=dict)
+    risk_per_trade: float = 0.0
 
     def as_dict(self):
         return {"leverage": self.leverage, "raw": round(self.raw, 4),
                 "caps": list(self.caps), "reason": self.reason,
-                "sigma": round(self.sigma, 6), "drawdown": round(self.drawdown, 4)}
+                "sigma": round(self.sigma, 6), "drawdown": round(self.drawdown, 4),
+                "caps_detail": dict(self.caps_detail),
+                "risk_per_trade": round(self.risk_per_trade, 6)}
 
 
 def volatility_leverage(sigma, cfg=None):
@@ -91,9 +110,15 @@ def liquidation_cap(sl_pct, cfg=None):
 
 def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
                      exchange_max=None, cfg=None) -> LeverageDecision:
-    """Beş tavanın en küçüğü; tam sayıya aşağı yuvarlanır.
+    """Beş tavanın en küçüğü; tam sayıya round-half-to-even ile yuvarlanır.
 
-    Dönen `caps` hangi tavanın bağlayıcı olduğunu söyler (denetim izi).
+    FAZ14k: `floor` yerine `round` (banker's rounding). floor, ham değer 1.85 iken 1x
+    verip 2.00 iken 2x veriyordu; %8 ATR farkı %100 kaldıraç farkı üretiyordu. round
+    sürekli davranır (1.85→2, 2.00→2, 2.597→3). Yuvarlama sonrası değer tasfiye
+    tavanını aşarsa L_liq'e clamp edilir — güvenlik korunur.
+
+    Dönen `caps` hangi tavanın bağlayıcı olduğunu söyler (denetim izi);
+    `caps_detail` tüm tavanların ham değerlerini taşır (şeffaflık logu).
     """
     lo = float(_cfg(cfg, "lo"))
     hi = float(_cfg(cfg, "hi"))
@@ -102,7 +127,8 @@ def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
     if sigma is None or sigma <= 0 or sl_pct is None or sl_pct <= 0:
         return LeverageDecision(max(1, int(math.floor(lo))), lo,
                                 ["invalid_inputs"], "invalid_inputs: fail-safe lo",
-                                float(sigma or 0.0), float(drawdown or 0.0))
+                                float(sigma or 0.0), float(drawdown or 0.0),
+                                {"invalid_inputs": lo}, 0.0)
 
     l_vol = volatility_leverage(sigma, cfg)
     l_dd = drawdown_penalty(l_vol, drawdown)
@@ -122,13 +148,33 @@ def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
     if exchange_max is not None and float(exchange_max) < raw:
         raw = float(exchange_max)
         caps.append("exchange")
+    # Şeffaflık: hiçbir ceza/kademe tavanı bağlamadıysa bağlayan volatilitedir.
+    if not caps:
+        caps.append("volatility")
 
-    lev = int(math.floor(raw))
+    # round-half-to-even: sürekli, sıçramasız. Python'un round()'u banker's rounding yapar.
+    lev = int(round(raw))
     if lev < 1:
         lev = 1
         caps.append("floor")
-    reason = "binding=" + (caps[0] if caps else "none")
-    return LeverageDecision(lev, raw, caps, reason, float(sigma), float(drawdown or 0.0))
+    # Güvenlik: yuvarlama tasfiye tavanını delemez.
+    if float(lev) > l_liq:
+        lev = max(1, int(math.floor(l_liq)))
+        caps.append("liq_clamp")
+    if float(lev) > hi:
+        lev = int(math.floor(hi))
+        caps.append("hi_clamp")
+
+    detail = {"volatility": round(l_vol, 4), "drawdown": round(l_dd, 4),
+              "kelly": round(l_kelly, 4), "liquidation": round(l_liq, 4),
+              "stage": None if stage_cap is None else float(stage_cap),
+              "exchange": None if exchange_max is None else float(exchange_max)}
+    binding = caps[0] if caps else "none"
+    reason = f"binding={binding}"
+    # risk_per_trade: SL mesafesi × kaldıraç = notional'ın yüzdesi olarak risk.
+    risk = float(sl_pct) * float(lev)
+    return LeverageDecision(lev, raw, caps, reason, float(sigma),
+                            float(drawdown or 0.0), detail, risk)
 
 
 def leverage_ok(leverage, sl_pct, cfg=None):

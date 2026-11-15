@@ -2045,8 +2045,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     elif RISK_CONFIG.get("risk_guards_enabled", False):
         dyn_lev = calculate_dynamic_leverage(atr_pct, drawdown=_dd_now,
                                              stage_cap=_stage_cap)
-        log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} DD=%{_dd_now*100:.1f} "
-                 f"→ {dyn_lev}x (leverage_policy)")
+        _levd = leverage_policy.compute_leverage(
+            float(atr_pct), float(sl_pct),
+            drawdown=float(_dd_now or 0.0), f_star=None,
+            stage_cap=_stage_cap if _stage_cap is not None else RISK_CONFIG["max_leverage"],
+            exchange_max=RISK_CONFIG["max_leverage"])
+        _cd = _levd.caps_detail
+        log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} σ={atr_pct:.4f} "
+                 f"c={leverage_policy.LEVERAGE_DEFAULTS['c']:.3f} → L_vol={_cd.get('volatility')} "
+                 f"→ round={dyn_lev}x → risk_per_trade={_levd.risk_per_trade*100:.2f}% "
+                 f"(leverage_policy)")
+        log.info(f"  [LIVE] caps: volatility={_cd.get('volatility')} liq={_cd.get('liquidation')} "
+                 f"kelly={_cd.get('kelly')} stage={_cd.get('stage')} "
+                 f"exchange={_cd.get('exchange')} → binding={_levd.reason}")
     else:
         dyn_lev = LEVERAGE
     if not HB_OFFLINE:
