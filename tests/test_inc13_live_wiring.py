@@ -56,6 +56,10 @@ class FakeBinance:
     def open_algo_orders_for(self, symbol):
         return []
 
+    def order_book(self, symbol, limit=20):
+        # FAZ11 kalite kapısı için gerçekçi defter: 2.5 bps spread, ~800k USDT derinlik.
+        return {"bids": [["79.99", "5000"]], "asks": [["80.01", "5000"]]}
+
     # --- used by the CloseCoordinator / adapter ---
     def position_risk(self):
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": self.entry}]

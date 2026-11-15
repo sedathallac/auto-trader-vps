@@ -18,6 +18,7 @@ _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
 from position_reservation import PositionReserver
+import coin_quality
 import requests
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -80,6 +81,7 @@ RISK_CONFIG = {
     "min_net_reward_risk": 1.20,
     "min_notional_policy": "refuse",
     "max_daily_loss_pct": 0.05,
+    "min_coin_quality": 0.55,
     "risk_guards_enabled": True,
     "target_risk_units": 3.0,
     "min_leverage": 1,
@@ -220,6 +222,19 @@ class BinanceAPI:
 
     def order_book(self, symbol, limit=20):
         return self._get("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+
+    def funding_rate(self, symbol):
+        """GET /fapi/v1/premiumIndex — anlık funding oranı (lastFundingRate)."""
+        return self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+
+    def open_interest(self, symbol):
+        """GET /fapi/v1/openInterest — açık pozisyon miktarı (base cinsinden)."""
+        return self._get("/fapi/v1/openInterest", {"symbol": symbol})
+
+    def taker_klines(self, symbol, interval="5m", limit=1):
+        """Son `limit` mum: taker buy/sell oranı için (kline[9]=takerBuyBase)."""
+        return self._get("/fapi/v1/klines",
+                         {"symbol": symbol, "interval": interval, "limit": limit})
 
     def position_risk(self):
         return self._get("/fapi/v2/positionRisk", signed=True)
@@ -998,7 +1013,11 @@ def scan_top(binance, n, blacklist=None):
     for d in cands:
         d["_score"] = 0.6 * (float(d["quoteVolume"]) / mv) + 0.4 * (abs(float(d["priceChangePercent"])) / mc)
     cands.sort(key=lambda x: x["_score"], reverse=True)
-    return cands[:n]
+    top = cands[:n]
+    # FAZ11: legacy yol da kalite taşısın (yalnız seçilen n coin için, tek çağrı seti).
+    for d in top:
+        d.update(_attach_coin_quality(binance, d["symbol"], d))
+    return top
 
 
 def _depth_liquidity(binance, symbol, bps=10):
@@ -1016,6 +1035,70 @@ def _depth_liquidity(binance, symbol, bps=10):
         return liq
     except Exception:
         return None
+
+
+def _coin_quality_metrics(binance, symbol, ticker, cache=None, atr_pct=None, ttl=300):
+    """FAZ11: order book + funding + OI + taker oranı → coin_quality.score_coin girdisi.
+
+    Her metrik ayrı TTL'li cache anahtarında tutulur; bir metrik hatası diğerlerini
+    düşürmez (eksik metrik skorda raporlanır, uydurulmaz).
+    """
+    def _cached(key, fn):
+        if cache is not None:
+            hit = cache.get(key, ttl)
+            if hit is not None:
+                return hit
+        try:
+            val = fn()
+        except Exception:
+            return None
+        if val is not None and cache is not None:
+            cache.put(key, val)
+        return val
+
+    ob = _cached(f"ob:{symbol}", lambda: binance.order_book(symbol, limit=20))
+    bids = ob.get("bids") if isinstance(ob, dict) else None
+    asks = ob.get("asks") if isinstance(ob, dict) else None
+    metrics = {
+        "spread_bps": coin_quality.spread_bps_from_book(bids, asks) if bids and asks else None,
+        "depth_usdt_1pct": coin_quality.depth_within_pct(bids, asks, 0.01) if bids and asks else None,
+        "quote_volume_24h": float(ticker.get("quoteVolume") or 0) or None,
+        "atr_pct": atr_pct,
+        "price_change_24h_pct": (float(ticker["priceChangePercent"]) / 100.0
+                                 if ticker.get("priceChangePercent") is not None else None),
+    }
+    fr = _cached(f"fund:{symbol}", lambda: binance.funding_rate(symbol))
+    if isinstance(fr, dict) and fr.get("lastFundingRate") is not None:
+        try:
+            metrics["funding_rate"] = float(fr["lastFundingRate"])
+        except (TypeError, ValueError):
+            metrics["funding_rate"] = None
+    oi = _cached(f"oi:{symbol}", lambda: binance.open_interest(symbol))
+    if isinstance(oi, dict) and oi.get("openInterest") is not None:
+        try:
+            qty = float(oi["openInterest"])
+            px = float(ticker.get("lastPrice") or 0)
+            metrics["open_interest_usdt"] = qty * px if px > 0 else None
+        except (TypeError, ValueError):
+            metrics["open_interest_usdt"] = None
+    kl = _cached(f"taker:{symbol}", lambda: binance.taker_klines(symbol, "5m", 1))
+    metrics["taker_buy_sell_ratio"] = coin_quality.taker_ratio_from_klines(kl) if kl else None
+    return metrics
+
+
+def _attach_coin_quality(binance, symbol, ticker, cache=None, atr_pct=None, direction=1):
+    """Ticker'a CQ / quality_vetoes / funding_cost_bps alanlarını ekler (hata → CQ None)."""
+    try:
+        metrics = _coin_quality_metrics(binance, symbol, ticker, cache, atr_pct)
+        cq = coin_quality.score_coin(symbol, metrics, direction=direction)
+        return {"CQ": cq.score, "quality_ok": cq.ok,
+                "quality_vetoes": list(cq.vetoes), "quality_missing": list(cq.missing),
+                "funding_cost_bps": cq.funding_cost_bps,
+                "quality_components": cq.components}
+    except Exception as e:
+        log.debug(f"  Faz11 kalite hatası {symbol}: {e}")
+        return {"CQ": None, "quality_ok": False, "quality_vetoes": ["quality_error"],
+                "quality_missing": [], "funding_cost_bps": 0.0, "quality_components": {}}
 
 
 def _volume_confirmation(binance, symbol, interval="15m", lookback=20):
@@ -1105,13 +1188,20 @@ def run_tiered_scan(binance, blacklist=None):
             if vc is None:
                 vc = 1.0  # teyit yok → nötr
             raw.append({**d, "liquidity": liq, "momentum": mom,
-                        "atr_pct": atr, "volume_conf": vc})
+                        "atr_pct": atr, "volume_conf": vc,
+                        **_attach_coin_quality(binance, sym, d, cache, atr)})
         except Exception as e:
             log.debug(f"  Faz4 metrik hatası {sym}: {e}")
 
     for t in due:
         _SCAN_LAST_RUN[t.name] = now
-    return compute_quality_scores(raw)
+    scored = compute_quality_scores(raw)
+    # FAZ11: kalite vetosu olan coinler taranmış havuzdan ÇIKARILIR (fail-closed).
+    kept = [c for c in scored if c.get("quality_ok")]
+    if len(kept) != len(scored):
+        log.info(f"  🧪 Faz11 kalite: {len(scored) - len(kept)} coin veto/eleme "
+                 f"({len(kept)} kaldı)")
+    return kept
 
 
 def calculate_position_size(balance_usdt, coin):
@@ -1624,6 +1714,17 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         add_blacklist(symbol, msg)
         return False
     log.info(f"  likidite OK: {msg}")
+
+    # FAZ11 Katman 1: çok kriterli coin kalite kapısı (veto + min skor).
+    # Tarama zaten CQ ekliyorsa yeniden hesaplanmaz; yoksa burada tek sefer hesaplanır.
+    if coin.get("CQ") is None:
+        coin.update(_attach_coin_quality(binance, symbol, coin))
+    _q_ok, _q_reason = coin_quality.quality_gate(coin, RISK_CONFIG.get("min_coin_quality",
+                                                                     coin_quality.MIN_QUALITY))
+    if not _q_ok:
+        log.info(f"  atlandı: coin kalite ({_q_reason})")
+        return False
+    log.info(f"  kalite OK: {_q_reason}")
 
     # Korelasyon limiti kontrolü
     if not check_correlation_limit(symbol, binance):
