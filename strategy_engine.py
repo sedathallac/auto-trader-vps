@@ -435,6 +435,7 @@ class Verdict:
     regime_adx: float = None      # 15m ADX (rejim kaynağı)
     trend_adx: float = None       # 1h/4h ADX maksimumu (veto kaynağı)
     reversed_signals: tuple = ()  # ters çevrilen sinyal adları (politika uygulandıysa)
+    effective_side: int = 0       # politika sonrası nihai yön (+1/−1)
 
 
 def trend_against_strength(trends, side_dir, weights=None):
@@ -457,28 +458,61 @@ def compute_readings(main: Candles):
     return exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
 
 
+def resolve_side(side_dir, readings, regime, policy=None, cfg=None):
+    """Politika uygulanmış NİHAİ yön. (effective_side, reversed_names).
+
+    FAZ14: ters politika vetodan ÖNCE çalışmalı. Aksi halde `wick_rejection/trend` gibi
+    hücrelerde sinyal asıl yönüyle trend vetosuna takılıyor ve ters yön hiç denenmiyordu.
+    Burada her sinyalin politika-sonrası yönü hesaplanır, güçle ağırlıklı oy toplanır ve
+    net oy asıl yönü ezip geçerse yön değişir. Beraberlikte asıl yön korunur (fail-safe).
+    """
+    if policy is None:
+        return side_dir, ()
+    min_strength = _cfg(cfg, "confirm_min_strength")
+    votes = {1: 0.0, -1: 0.0}
+    reversed_names = []
+    for r in readings:
+        eff = effective_direction(r, regime, policy)
+        if eff == 0 or r.strength < min_strength:
+            continue
+        votes[eff] += r.strength
+        if eff != r.direction:
+            reversed_names.append(f"reverse_{r.name}")
+    net = votes[1] - votes[-1]
+    if net == 0:
+        return side_dir, tuple(reversed_names)
+    return (1 if net > 0 else -1), tuple(reversed_names)
+
+
 def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx=None,
              policy=None) -> Verdict:
     """KARAR mantığı (veri toplamadan bağımsız; canlı confirm() ve offline backtest AYNI kodu kullanır).
-    p_fake_fn(signal_name, regime) → (p_fake, calibrated). policy: (sinyal,rejim)→reverse/keep/disabled."""
-    # 1) REJİM VETO — güçlü trende karşı mean-reversion
-    against = trend_against_strength(trends, side_dir)
+    p_fake_fn(signal_name, regime) → (p_fake, calibrated). policy: (sinyal,rejim)→reverse/keep/disabled.
+
+    FAZ14 sıralaması: politika → nihai yön → trend vetosu → aile teyidi → p_real.
+    """
+    # 0) POLİTİKA ÖNCE: ters çevrilecek sinyaller nihai yönü belirler
+    eff_side, reversed_all = resolve_side(side_dir, readings, regime, policy, cfg)
+
+    # 1) REJİM VETO — NİHAİ yöne karşı güçlü trend
+    against = trend_against_strength(trends, eff_side)
     adx_max = max(t["adx"] for t in trends)
     if (against >= _cfg(cfg, "confirm_veto_trend_strength")
             and adx_max >= _cfg(cfg, "confirm_adx_trend")):
         return Verdict(False, f"güçlü trende karşı mean-reversion (against={against:.2f}, ADX_trend={adx_max:.0f}, "
                               f"ADX_15m={'n/a' if regime_adx is None else f'{regime_adx:.0f}'})",
                        regime=regime, veto=True, readings=readings, trend_against=against,
-                       regime_adx=regime_adx, trend_adx=adx_max)
+                       regime_adx=regime_adx, trend_adx=adx_max,
+                       reversed_signals=reversed_all, effective_side=eff_side)
 
     # 2) TEYİT — aile başına en iyi uyumlu sinyal (politika uygulanmış yönle)
-    best, calibrated_all, reversed_sigs = {}, True, []
+    best, calibrated_all, reversed_sigs = {}, True, list(reversed_all)
     for r in readings:
         eff = effective_direction(r, regime, policy)
-        if eff == 0 or eff != side_dir or r.strength < _cfg(cfg, "confirm_min_strength"):
+        if eff == 0 or eff != eff_side or r.strength < _cfg(cfg, "confirm_min_strength"):
             continue
-        if eff != r.direction:
-            reversed_sigs.append(r.name)
+        if eff != r.direction and f"reverse_{r.name}" not in reversed_sigs:
+            reversed_sigs.append(f"reverse_{r.name}")
         p_fake, cal = p_fake_fn(r.name, regime)
         score = (1.0 - p_fake) * r.strength
         if r.family not in best or score > best[r.family][0]:
@@ -488,7 +522,7 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
                        regime=regime, families={f: b[1].name for f, b in best.items()},
                        readings=readings, trend_against=against,
                        regime_adx=regime_adx, trend_adx=adx_max,
-                       reversed_signals=tuple(reversed_sigs))
+                       reversed_signals=tuple(reversed_sigs), effective_side=eff_side)
 
     # 3) Birleşik güven — aile başına TEK LLR terimi (aile içi çift sayım yok)
     prior = _clip(_cfg(cfg, "confirm_prior_real"), 0.01, 0.99)
@@ -503,7 +537,7 @@ def evaluate(side_dir, readings, trends, regime, p_fake_fn, cfg=None, regime_adx
                            + f" {_cfg(cfg, 'confirm_min_p_real'):.2f}"),
                    p_real, regime, False, {f: b[1].name for f, b in best.items()},
                    readings, against, calibrated_all, regime_adx, adx_max,
-                   tuple(reversed_sigs))
+                   tuple(reversed_sigs), eff_side)
 
 
 def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg=None,

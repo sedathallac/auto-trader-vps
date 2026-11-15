@@ -56,16 +56,17 @@ def test_long_on_dip_env_override(monkeypatch):
 def test_reverse_strategy_wick_rejection_in_trend():
     readings = [_rd("wick_rejection", se.FAM_STRUCTURE, 1, 0.79),
                 _rd("rsi_divergence", se.FAM_EXHAUSTION, 1, 0.7)]
-    # Asıl yön LONG (side=+1): ters politika ile iki sinyal de SHORT'u teyit eder → RED
+    # FAZ14: politika vetodan ÖNCE çalışır; side=+1 gelse de nihai yön -1'e çevrilir ve GEÇER.
     v_long = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
                          regime_adx=30.0, policy=se.REVERSE_POLICY)
-    assert v_long.allow is False and v_long.families == {}
+    assert v_long.effective_side == -1 and v_long.allow is True
+    assert set(v_long.reversed_signals) == {"reverse_wick_rejection", "reverse_rsi_divergence"}
     # SHORT (side=-1): ters çevrilmiş iki sinyal teyit eder → GEÇER
     v_short = se.evaluate(-1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
                           regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v_short.allow is True
     assert set(v_short.families) == {se.FAM_STRUCTURE, se.FAM_EXHAUSTION}
-    assert set(v_short.reversed_signals) == {"wick_rejection", "rsi_divergence"}
+    assert set(v_short.reversed_signals) == {"reverse_wick_rejection", "reverse_rsi_divergence"}
 
 
 def test_reverse_strategy_rsi_divergence_in_trend():
@@ -74,7 +75,7 @@ def test_reverse_strategy_rsi_divergence_in_trend():
     # Sinyaller SHORT diyor; ters politika LONG'u teyit eder.
     v = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
                     regime_adx=30.0, policy=se.REVERSE_POLICY)
-    assert v.allow is True and "rsi_divergence" in v.reversed_signals
+    assert v.allow is True and "reverse_rsi_divergence" in v.reversed_signals
     # Politika yoksa aynı okumalar LONG'u teyit ETMEZ (eski davranış korunur)
     v_off = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.3, True), CFG,
                         regime_adx=30.0, policy=None)
@@ -88,7 +89,7 @@ def test_original_strategy_sr_proximity_in_range():
                     regime_adx=12.0, policy=se.REVERSE_POLICY)
     assert v.allow is True
     assert "sr_proximity" in v.families.values()
-    assert "sr_proximity" not in v.reversed_signals
+    assert "reverse_sr_proximity" not in v.reversed_signals
     assert se.effective_direction(readings[0], "range", se.REVERSE_POLICY) == 1
 
 
@@ -106,7 +107,7 @@ def test_disabled_strategies_do_not_fire():
 
 def test_shadow_mode_does_not_affect_live():
     src = inspect.getsource(auto_trader._faz6_confirm)
-    assert 'mode == "compare" and REVERSE_POLICY_ENABLED' in src
+    assert 'mode in ("compare", "on") and REVERSE_POLICY_ENABLED' in src
     assert 'source="shadow" if _policy6 is not None else "live"' in src
     # Canlı modda politika None → asıl yön; compare'de politika uygulanır.
     readings = [_rd("wick_rejection", se.FAM_STRUCTURE, 1, 0.79),
