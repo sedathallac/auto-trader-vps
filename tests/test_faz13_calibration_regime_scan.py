@@ -161,3 +161,48 @@ def test_scan_thresholds_env_overridable(monkeypatch):
     assert auto_trader._env_float("MIN_VOLUME_USDT", 200_000_000) == 50_000_000
     monkeypatch.setenv("MIN_VOLUME_USDT", "bozuk")
     assert auto_trader._env_float("MIN_VOLUME_USDT", 200_000_000) == 200_000_000
+
+
+# ------------------------------------------------------------------ F) emir yolu
+def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
+    """Kapı açıkken emir yolu uçtan uca çalışır: tek blokaj FAZ6 kapısıdır, emir hattı değil."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_faz12_layer_wiring import _FakeBinance, _FakeHB
+
+    posted = []
+    hb = _FakeHB()
+
+    def fake_create(symbol, amount, lev, sl, tp, tl, side=1):
+        posted.append({"symbol": symbol, "amount": amount, "lev": lev, "sl": sl, "tp": tp, "side": side})
+        return {"executor_id": "E1"}
+
+    hb.create_executor = fake_create
+    hb.get_executor = lambda eid: {"filled_amount_quote": 200.0, "error_count": 0}
+
+    monkeypatch.setattr(auto_trader, "HB_OFFLINE", False)
+    monkeypatch.setattr(auto_trader, "STRATEGY_CONFIRMATION", "off")
+    monkeypatch.setattr(auto_trader, "_live_family_gate", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(auto_trader, "_live_regime_gate", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(auto_trader, "_live_edge_gate", lambda *a, **k: (True, "shadow"))
+    monkeypatch.setattr(auto_trader, "_live_cfg", lambda: type("C", (), {
+        "is_live": True, "leverage": 2, "max_open_positions": 2, "stage": 1, "testnet": True,
+        "strategy_family": "", "max_notional": 200.0, "daily_loss_limit": 20.0,
+        "base_url": "https://testnet.binancefuture.com", "risk_overrides": lambda self=None: {}})())
+    monkeypatch.setattr(auto_trader.preflight, "pre_flight_check",
+                        lambda **kw: auto_trader.preflight.PreflightResult(True, [], None, "ok"))
+    monkeypatch.setattr(auto_trader.time, "sleep", lambda s: None)
+    import close_adapter
+    monkeypatch.setattr(close_adapter.BinanceHBCloseAdapter, "sl_status",
+                        lambda self, *a, **k: close_adapter.SL_PRESENT)
+
+    coin = {"symbol": "SOLUSDT", "lastPrice": "80", "quoteVolume": "1000000", "_score": 0.9,
+            "priceChangePercent": "6", "CQ": 0.9, "quality_vetoes": [], "quality_ok": True}
+    b = _FakeBinance()
+    b.place_algo_sl = lambda symbol, trig, amount, side: {"algoId": 1}
+    b.cancel_algo_order = lambda aid: {"ok": True}
+    ok = auto_trader.open_coin(b, hb, coin, dry_run=False, risk=None,
+                               reserver=None, coordinator=None)
+    assert ok is True
+    assert len(posted) == 1, "kapı açıkken create_executor çağrılmadı"
+    assert posted[0]["symbol"] == "SOLUSDT" and posted[0]["sl"] > 0 and posted[0]["tp"] > 0
+
