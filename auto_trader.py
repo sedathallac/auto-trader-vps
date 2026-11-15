@@ -18,6 +18,8 @@ _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
 from position_reservation import PositionReserver
+import coin_quality
+import leverage_policy
 import requests
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -76,6 +78,11 @@ RISK_CONFIG = {
     "risk_per_trade_pct": 0.015,
     "kelly_fraction": 0.25,
     "fee_pct_round_trip": 0.0008,
+    "slippage_pct_round_trip": 0.0004,
+    "min_net_reward_risk": 1.20,
+    "min_notional_policy": "refuse",
+    "max_daily_loss_pct": 0.05,
+    "min_coin_quality": 0.55,
     "risk_guards_enabled": True,
     "target_risk_units": 3.0,
     "min_leverage": 1,
@@ -173,11 +180,14 @@ def add_blacklist(symbol, reason):
 
 
 class BinanceAPI:
-    def __init__(self, key, secret):
+    def __init__(self, key, secret, base=None):
         self.key = key
         self.secret = secret
         self._info = None
         self._info_ts = 0
+        # FAZ9 live: the base URL is per instance, so the testnet and mainnet instances can never share a client.
+        # BINANCE_FUTURES_BASE_URL wins, then the module default (mainnet) — the compare instance is unchanged.
+        self.base = (base or os.getenv("BINANCE_FUTURES_BASE_URL") or BINANCE_FAPI).rstrip("/")
 
     def _sign(self, params):
         qs = urlencode(params)
@@ -191,24 +201,41 @@ class BinanceAPI:
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 60000
-            return _session.get(f"{BINANCE_FAPI}{path}?{self._sign(params)}",
+            return _session.get(f"{self.base}{path}?{self._sign(params)}",
                                 headers=self._hdr(), timeout=15).json()
-        return _session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15).json()
+        return _session.get(f"{self.base}{path}", params=params, timeout=15).json()
 
     def _post(self, path, params, method="POST"):
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 60000
-        url = f"{BINANCE_FAPI}{path}?{self._sign(params)}"
+        url = f"{self.base}{path}?{self._sign(params)}"
         if method == "DELETE":
             return _session.delete(url, headers=self._hdr(), timeout=15).json()
         return _session.post(url, headers=self._hdr(), timeout=15).json()
+
+    def account(self):
+        """GET /fapi/v2/account — the startup check reads balance and canTrade from here."""
+        return self._get("/fapi/v2/account", signed=True)
 
     def tickers(self):
         return self._get("/fapi/v1/ticker/24hr")
 
     def order_book(self, symbol, limit=20):
         return self._get("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+
+    def funding_rate(self, symbol):
+        """GET /fapi/v1/premiumIndex — anlık funding oranı (lastFundingRate)."""
+        return self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+
+    def open_interest(self, symbol):
+        """GET /fapi/v1/openInterest — açık pozisyon miktarı (base cinsinden)."""
+        return self._get("/fapi/v1/openInterest", {"symbol": symbol})
+
+    def taker_klines(self, symbol, interval="5m", limit=1):
+        """Son `limit` mum: taker buy/sell oranı için (kline[9]=takerBuyBase)."""
+        return self._get("/fapi/v1/klines",
+                         {"symbol": symbol, "interval": interval, "limit": limit})
 
     def position_risk(self):
         return self._get("/fapi/v2/positionRisk", signed=True)
@@ -987,7 +1014,11 @@ def scan_top(binance, n, blacklist=None):
     for d in cands:
         d["_score"] = 0.6 * (float(d["quoteVolume"]) / mv) + 0.4 * (abs(float(d["priceChangePercent"])) / mc)
     cands.sort(key=lambda x: x["_score"], reverse=True)
-    return cands[:n]
+    top = cands[:n]
+    # FAZ11: legacy yol da kalite taşısın (yalnız seçilen n coin için, tek çağrı seti).
+    for d in top:
+        d.update(_attach_coin_quality(binance, d["symbol"], d))
+    return top
 
 
 def _depth_liquidity(binance, symbol, bps=10):
@@ -1005,6 +1036,70 @@ def _depth_liquidity(binance, symbol, bps=10):
         return liq
     except Exception:
         return None
+
+
+def _coin_quality_metrics(binance, symbol, ticker, cache=None, atr_pct=None, ttl=300):
+    """FAZ11: order book + funding + OI + taker oranı → coin_quality.score_coin girdisi.
+
+    Her metrik ayrı TTL'li cache anahtarında tutulur; bir metrik hatası diğerlerini
+    düşürmez (eksik metrik skorda raporlanır, uydurulmaz).
+    """
+    def _cached(key, fn):
+        if cache is not None:
+            hit = cache.get(key, ttl)
+            if hit is not None:
+                return hit
+        try:
+            val = fn()
+        except Exception:
+            return None
+        if val is not None and cache is not None:
+            cache.put(key, val)
+        return val
+
+    ob = _cached(f"ob:{symbol}", lambda: binance.order_book(symbol, limit=20))
+    bids = ob.get("bids") if isinstance(ob, dict) else None
+    asks = ob.get("asks") if isinstance(ob, dict) else None
+    metrics = {
+        "spread_bps": coin_quality.spread_bps_from_book(bids, asks) if bids and asks else None,
+        "depth_usdt_1pct": coin_quality.depth_within_pct(bids, asks, 0.01) if bids and asks else None,
+        "quote_volume_24h": float(ticker.get("quoteVolume") or 0) or None,
+        "atr_pct": atr_pct,
+        "price_change_24h_pct": (float(ticker["priceChangePercent"]) / 100.0
+                                 if ticker.get("priceChangePercent") is not None else None),
+    }
+    fr = _cached(f"fund:{symbol}", lambda: binance.funding_rate(symbol))
+    if isinstance(fr, dict) and fr.get("lastFundingRate") is not None:
+        try:
+            metrics["funding_rate"] = float(fr["lastFundingRate"])
+        except (TypeError, ValueError):
+            metrics["funding_rate"] = None
+    oi = _cached(f"oi:{symbol}", lambda: binance.open_interest(symbol))
+    if isinstance(oi, dict) and oi.get("openInterest") is not None:
+        try:
+            qty = float(oi["openInterest"])
+            px = float(ticker.get("lastPrice") or 0)
+            metrics["open_interest_usdt"] = qty * px if px > 0 else None
+        except (TypeError, ValueError):
+            metrics["open_interest_usdt"] = None
+    kl = _cached(f"taker:{symbol}", lambda: binance.taker_klines(symbol, "5m", 1))
+    metrics["taker_buy_sell_ratio"] = coin_quality.taker_ratio_from_klines(kl) if kl else None
+    return metrics
+
+
+def _attach_coin_quality(binance, symbol, ticker, cache=None, atr_pct=None, direction=1):
+    """Ticker'a CQ / quality_vetoes / funding_cost_bps alanlarını ekler (hata → CQ None)."""
+    try:
+        metrics = _coin_quality_metrics(binance, symbol, ticker, cache, atr_pct)
+        cq = coin_quality.score_coin(symbol, metrics, direction=direction)
+        return {"CQ": cq.score, "quality_ok": cq.ok,
+                "quality_vetoes": list(cq.vetoes), "quality_missing": list(cq.missing),
+                "funding_cost_bps": cq.funding_cost_bps,
+                "quality_components": cq.components}
+    except Exception as e:
+        log.debug(f"  Faz11 kalite hatası {symbol}: {e}")
+        return {"CQ": None, "quality_ok": False, "quality_vetoes": ["quality_error"],
+                "quality_missing": [], "funding_cost_bps": 0.0, "quality_components": {}}
 
 
 def _volume_confirmation(binance, symbol, interval="15m", lookback=20):
@@ -1094,13 +1189,20 @@ def run_tiered_scan(binance, blacklist=None):
             if vc is None:
                 vc = 1.0  # teyit yok → nötr
             raw.append({**d, "liquidity": liq, "momentum": mom,
-                        "atr_pct": atr, "volume_conf": vc})
+                        "atr_pct": atr, "volume_conf": vc,
+                        **_attach_coin_quality(binance, sym, d, cache, atr)})
         except Exception as e:
             log.debug(f"  Faz4 metrik hatası {sym}: {e}")
 
     for t in due:
         _SCAN_LAST_RUN[t.name] = now
-    return compute_quality_scores(raw)
+    scored = compute_quality_scores(raw)
+    # FAZ11: kalite vetosu olan coinler taranmış havuzdan ÇIKARILIR (fail-closed).
+    kept = [c for c in scored if c.get("quality_ok")]
+    if len(kept) != len(scored):
+        log.info(f"  🧪 Faz11 kalite: {len(scored) - len(kept)} coin veto/eleme "
+                 f"({len(kept)} kaldı)")
+    return kept
 
 
 def calculate_position_size(balance_usdt, coin):
@@ -1194,15 +1296,15 @@ def get_real_slippage(binance, symbol):
 
 
 def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
-    """Risk-bazlı boyutlandırma (Van Tharp)."""
-    risk_amount = balance_usdt * RISK_CONFIG["risk_per_trade_pct"]
-    effective_sl = sl_pct + slippage_pct
-    if effective_sl <= 0:
-        return None
-    notional = risk_amount / effective_sl
-    notional = min(notional, RISK_CONFIG["max_notional"])
-    notional = max(notional, RISK_CONFIG["min_notional"])
-    return notional, risk_amount, effective_sl
+    """Risk-bazlı boyutlandırma — FAZ11 Katman 3 politikasına delege eder.
+
+    Eski gövde `max(notional, min_notional)` ile kayıp bütçesini aşabiliyordu;
+    `sizing_policy.size_position` bütçe minimumu karşılamıyorsa None döner.
+    Dönen üçlü geriye uyumludur: (notional|None, risk_amount, effective_sl).
+    """
+    import sizing_policy
+    d = sizing_policy.size_position(balance_usdt, sl_pct + slippage_pct, cfg=RISK_CONFIG)
+    return d.notional, d.budget, d.effective_sl
 
 
 def _verify_oneway(binance):
@@ -1286,6 +1388,117 @@ def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=Non
                        critical=True)
 
 
+_LAST_CONFIRM = {}          # son Faz6 teyidinin aileleri (live family gate için)
+
+
+_LIVE_CFG = None            # live_guard.LiveConfig (tembel; HB_OFFLINE=1 iken hiç yüklenmez)
+_startup_checked = [False]  # live açılış doğrulaması süreç başına bir kez
+_EDGE_CACHE = {"ts": 0.0, "decisions": None}  # FAZ10: promotion_gate TTL cache
+
+
+def _live_cfg():
+    """Live config, or None in compare mode. A bad live config raises: the service must not start."""
+    global _LIVE_CFG
+    if _LIVE_CFG is None:
+        import live_guard
+        _LIVE_CFG = live_guard.LiveConfig.from_env().validate()
+    return _LIVE_CFG
+
+
+def _live_family_gate(symbol, side):
+    """(allowed, reason). In compare/dry-run the gate is open; in live only the winning family may place an order."""
+    try:
+        import live_guard
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    if not cfg.strategy_family:
+        # Regime-only configuration: the regime gate decides, the family gate stays open.
+        return True, "no family filter: regime gate only"
+    families = list((_LAST_CONFIRM.get("families") or {}).keys())
+    if not families:
+        return False, "no confirming family for this side"
+    for fam in families:
+        ok, reason = live_guard.family_gate(fam, cfg)
+        if ok:
+            log.info(f"  🎯 live family eşleşti: {fam} ({symbol} side={side})")
+            return True, reason
+    return False, f"confirming families {families} do not include live family {cfg.strategy_family!r}"
+
+
+def _live_regime_gate():
+    """(allowed, reason). Canlıda yalnız kazanan rejimler emir verebilir; compare'da kapı açık."""
+    try:
+        import live_guard
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    regime = _LAST_CONFIRM.get("regime")
+    ok, reason = live_guard.regime_gate(regime, cfg)
+    if not ok:
+        log.info(f"[LIVE] skipped regime={regime} (not in winning set)")
+    return ok, reason
+
+
+def _live_edge_gate():
+    """(allowed, reason). Canlıda yalnız istatistiksel olarak KANITLANMIŞ aile×rejim hücresi emir verir.
+
+    Kanıt yoksa (hiç çözülmüş hücre yok) kapı "shadow" modunda açık kalır: veri
+    toplanmadan kanıt üretilemez. Kanıt varsa ve bu hücre geçmiyorsa emir YOK.
+    """
+    try:
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    mode = os.getenv("EDGE_GATE", "auto").strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return True, "edge gate off"
+    regime = _LAST_CONFIRM.get("regime")
+    families = list((_LAST_CONFIRM.get("families") or {}).keys())
+    if not families:
+        return False, "no confirming family"
+    try:
+        import edge_engine
+        import strategy_engine as _se
+        decisions = _live_edge_decisions(_se.SignalStore(_se.SIGNAL_DB), RISK_CONFIG)
+    except Exception as e:
+        log.critical(f"🚨 edge gate hesabı başarısız, fail-closed: {e}")
+        return False, f"edge gate error: {e}"
+    if not decisions:
+        log.info("[EDGE] shadow: henüz çözülmüş hücre yok, kapı veri toplama için açık")
+        return True, "shadow: no resolved cells yet"
+    for fam in families:
+        ok, reason = edge_engine.gate_lookup(decisions, fam, regime)
+        if ok:
+            log.info(f"  🎓 edge cell kanıtlı: {fam}:{regime} ({reason})")
+            return True, reason
+    return False, f"no proven edge cell for {families} regime={regime}"
+
+
+def _live_edge_decisions(store, cfg, ttl=300):
+    """promotion_gate sonuçlarını süreç içinde TTL ile cache'ler (her tick'te DB taraması yok)."""
+    now = time.time()
+    if _EDGE_CACHE["decisions"] is not None and now - _EDGE_CACHE["ts"] < ttl:
+        return _EDGE_CACHE["decisions"]
+    import edge_engine
+    cost = float(cfg.get("fee_pct_round_trip", 0.0008)) + \
+        float(cfg.get("slippage_pct_round_trip", 0.0004))
+    cells = edge_engine.cells_from_rows(store.resolved_rows(), cost=cost)
+    decisions = edge_engine.promotion_gate(cells, cfg)
+    _EDGE_CACHE["ts"] = now
+    _EDGE_CACHE["decisions"] = decisions
+    return decisions
+
+
 def _faz6_confirm(binance, symbol, side, sl_pct, mode):
     """Faz 6 teyit. compare: logla + signal_outcomes'a yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
     Döner: True = devam, False = reddet (yalnız mode=='on')."""
@@ -1300,6 +1513,11 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
+        # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
+        # _faz6_confirm keeps its bool signature and every existing caller is untouched.
+        _LAST_CONFIRM.clear()
+        _LAST_CONFIRM.update({"families": dict(_v6.families or {}), "regime": _v6.regime,
+                              "p_real": _v6.p_real, "allow": bool(_v6.allow)})
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
                  f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
                  f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
@@ -1498,6 +1716,17 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return False
     log.info(f"  likidite OK: {msg}")
 
+    # FAZ11 Katman 1: çok kriterli coin kalite kapısı (veto + min skor).
+    # Tarama zaten CQ ekliyorsa yeniden hesaplanmaz; yoksa burada tek sefer hesaplanır.
+    if coin.get("CQ") is None:
+        coin.update(_attach_coin_quality(binance, symbol, coin))
+    _q_ok, _q_reason = coin_quality.quality_gate(coin, RISK_CONFIG.get("min_coin_quality",
+                                                                     coin_quality.MIN_QUALITY))
+    if not _q_ok:
+        log.info(f"  atlandı: coin kalite ({_q_reason})")
+        return False
+    log.info(f"  kalite OK: {_q_reason}")
+
     # Korelasyon limiti kontrolü
     if not check_correlation_limit(symbol, binance):
         log.info("  atlandı: korelasyon limiti")
@@ -1529,6 +1758,38 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         if not _faz6_confirm(binance, symbol, side, sl_pct, STRATEGY_CONFIRMATION):
             return False
 
+    # FAZ9 live: yalnız kazanan aile emir verebilir. Compare/dry-run'da kapı açık; canlıda kapalı = sinyal
+    # signal_outcomes'a yazıldı, emir yok.
+    _fam_ok, _fam_reason = _live_family_gate(symbol, side)
+    if not _fam_ok:
+        log.info(f"  atlandı: live family gate ({_fam_reason})")
+        return False
+
+    # FAZ9 live: rejim kapısı. trend rejimi veri toplamaya devam eder, emir vermez.
+    _reg_ok, _reg_reason = _live_regime_gate()
+    if not _reg_ok:
+        log.info(f"  atlandı: live regime gate ({_reg_reason})")
+        return False
+
+    # FAZ10: kanıtlanmış edge kapısı. Yalnız istatistiksel olarak pozitif hücre emir verir.
+    _edge_ok, _edge_reason = _live_edge_gate()
+    if not _edge_ok:
+        log.info(f"  atlandı: live edge gate ({_edge_reason})")
+        return False
+
+    # FAZ10: net R/R kapısı — komisyon+slipaj düşüldükten sonra kazanç/kayıp oranı.
+    if RISK_CONFIG.get("risk_guards_enabled", False):
+        import edge_engine as _ee
+        _rr, _rr_ok, _rr_detail = _ee.net_reward_risk(
+            tp_pct, sl_pct,
+            RISK_CONFIG.get("fee_pct_round_trip", 0.0008),
+            RISK_CONFIG.get("slippage_pct_round_trip", 0.0004))
+        _min_rr = float(RISK_CONFIG.get("min_net_reward_risk", 1.20))
+        if not _rr_ok or _rr < _min_rr:
+            log.warning(f"  atlandı: net R/R {_rr:.2f} < {_min_rr:.2f} ({_rr_detail})")
+            return False
+        log.info(f"  ⚖️  net R/R={_rr:.2f} ({_rr_detail})")
+
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
         slippage_pct = get_real_slippage(binance, symbol)
@@ -1549,7 +1810,8 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
 
     # Boyutlandırma (FAZ 1.2: RiskEngine onayı)
     if RISK_CONFIG.get("risk_guards_enabled", False) and risk is not None:
-        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct)
+        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct,
+                                                     take_profit_pct=tp_pct)
         if target_notional is None:
             log.warning(f"  RiskEngine reddetti: {status}")
             return False
@@ -1588,15 +1850,20 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             log.warning(f"  Faz3 leverage_engine hatası (eski formüle düşülüyor): {_e}")
             _new_lev = None
 
-    # Target notional → amount
+    # Target notional → amount (FAZ10: Decimal adım yuvarlama; min notional altı → emir YOK)
+    import edge_engine as _ee_amt
     step = float(filt["LOT_SIZE"]["stepSize"])
-    raw_amount = target_notional / price
-    steps = max(1, int(raw_amount / step))
-    amount = round(steps * step, 8)
-
+    min_q = float(filt["LOT_SIZE"].get("minQty", 0) or 0)
     min_n = float(filt.get("MIN_NOTIONAL", {}).get("notional", 5))
-    if amount * price < min_n:
-        amount = round((min_n / price / step + 1) * step, 8)
+    amount, _amt_ok = _ee_amt.amount_for_notional(target_notional, price, step, min_q, min_n)
+    if not _amt_ok:
+        if dry_run:
+            log.warning(f"  [DRY] miktar min notional'ı karşılamıyor "
+                        f"(amount={amount}, ≈{amount * price:.2f} < {min_n:.2f} USDT) — emir yok")
+        else:
+            log.warning(f"  atlandı: miktar min notional'ı karşılamıyor "
+                        f"(amount={amount}, ≈{amount * price:.2f} < {min_n:.2f} USDT)")
+            return False
 
     log.info(f"  amount={amount} (≈{amount * price:.2f} USDT)")
 
@@ -1613,6 +1880,12 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} → {dyn_lev}x")
     else:
         dyn_lev = LEVERAGE
+
+    # FAZ11 Katman 2: kaldıraç politikası — tasfiye tavanını aşan kaldıraçla emir açılmaz.
+    _lev_ok, _lev_detail = leverage_policy.leverage_ok(dyn_lev, sl_pct)
+    if not _lev_ok:
+        log.warning(f"  atlandı: kaldıraç güvenli değil ({_lev_detail})")
+        return False
 
     lr = binance.set_leverage(symbol, dyn_lev)
     if isinstance(lr, dict) and "leverage" in lr:
@@ -1854,8 +2127,18 @@ def run_once(dry_run=False):
     log.info("=" * 60)
     log.info(f"Tarama: {datetime.now().isoformat()}")
     heartbeat_tick()
-    risk = RiskEngine(RISK_CONFIG)
-    reserver = PositionReserver(risk.db_file, MAX_OPEN_POSITIONS)
+    # FAZ9 live: kademe limitleri RiskEngine'e enjekte edilir. Compare'da cfg.is_live False → RISK_CONFIG aynen kalır.
+    _cfg = _live_cfg()
+    _risk_cfg = dict(RISK_CONFIG)
+    _max_positions = MAX_OPEN_POSITIONS
+    if _cfg.is_live:
+        _risk_cfg.update(_cfg.risk_overrides())
+        _max_positions = _cfg.max_open_positions
+        log.info(f"🔴 LIVE stage={_cfg.stage} testnet={_cfg.testnet} family={_cfg.strategy_family} "
+                 f"max_notional={_cfg.max_notional} daily_loss={_cfg.daily_loss_limit} "
+                 f"lev={_cfg.leverage} max_pos={_max_positions} base={_cfg.base_url}")
+    risk = RiskEngine(_risk_cfg)
+    reserver = PositionReserver(risk.db_file, _max_positions)
     try:
         reserver.init_schema()
     except Exception as e:
@@ -1868,8 +2151,22 @@ def run_once(dry_run=False):
         log.error("BINANCE_KEY/SECRET yok")
         return
 
-    binance = BinanceAPI(bk, bs)
+    binance = BinanceAPI(bk, bs, base=_cfg.base_url)
     hb = HBAPI(HB_API, hu, hp)
+    # FAZ9 live: tek seferlik açılış doğrulaması (bakiye + exchangeInfo). Başarısızsa süreç başlamaz.
+    if _cfg.is_live and not _startup_checked[0]:
+        try:
+            import live_guard
+            _sc = live_guard.startup_check(binance, _cfg)
+            _startup_checked[0] = True
+            log.info(f"[LIVE] startup check ok equity={_sc['balance_usdt']:.2f} symbols={_sc['symbols']} "
+                     f"canTrade={_sc['can_trade']} testnet={_sc['testnet']}")
+        except Exception as e:
+            log.critical(f"[LIVE] startup check FAILED reason={e}")
+            risk.is_halted = True
+            risk.halt_reason = f"live startup check failed: {e}"
+            risk._save_state()
+            raise SystemExit(1)
     if HB_OFFLINE:
         log.warning("🔌 HB_OFFLINE aktif — Hummingbot API atlanıyor; open_coin dry-run'a "
                     "zorlanacak (gerçek emir YOK). Kalibrasyon/log toplama modu.")

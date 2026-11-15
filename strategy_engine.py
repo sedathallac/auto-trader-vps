@@ -18,6 +18,7 @@ import sqlite3
 import statistics
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 CONFIRM_DEFAULTS = {
@@ -545,15 +546,30 @@ def kaplan_meier(durations, observed):
     return curve
 
 
-def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_pct):
-    """Sekiz kapanmış gelecek mumdan teorik sonuç üretir.
+def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_pct,
+                      tp_pct=None):
+    """Kapanmış gelecek mumlardan teorik sonuç üretir.
 
     sl_pct yoksa yalnızca fwd_ret ve persist_bars hesaplanır.
     real=None bırakılır; bilinmeyen geçmiş stop mesafesi uydurulmaz.
+
+    FAZ10: `tp_pct` verilirse sonuç YOL-BAĞIMLIdır (edge_engine.first_touch_outcome):
+    SL/TP ilk teması belirler, aynı mumda ikisi de varsa SL kazanır. Bu durumda
+    ikinci değer NET getiridir (cost = komisyon+slipaj düşülmüş), `real` ise
+    net_ret > 0'dır. `tp_pct=None` eski (kapanış-bazlı) davranışı korur.
     """
     n = min(horizon, len(fut_c))
     if n < horizon or direction not in (-1, 1) or entry <= 0:
         return None
+
+    if tp_pct is not None:
+        import edge_engine
+        touch = edge_engine.first_touch_outcome(
+            direction, entry, fut_h[:horizon], fut_l[:horizon], fut_c[:horizon],
+            float(sl_pct), float(tp_pct), fee_pct=float(cost), slippage_pct=0.0)
+        if touch is None:
+            return None
+        return (touch.net_ret > 0), touch.net_ret, touch.bars_held
 
     fwd = direction * (fut_c[horizon - 1] - entry) / entry
     persist = next(
@@ -579,6 +595,11 @@ def outcome_from_bars(direction, entry, fut_h, fut_l, fut_c, horizon, cost, sl_p
 # ===================================================================== signal_outcomes (AYRI sqlite)
 SIGNAL_DB = str(Path.home() / "signal_outcomes.db")
 
+def _utc_now_iso() -> str:
+    """Resolver damgasi: hangi satirin ne zaman cozuldugu. Eski satirlar NULL kalir (geriye uyumlu)."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 _SCHEMA = """CREATE TABLE IF NOT EXISTS signal_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     recorded_at REAL NOT NULL,
@@ -596,7 +617,8 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS signal_outcomes (
     real INTEGER,
     fwd_ret REAL,
     persist_bars INTEGER,
-    sl_pct REAL
+    sl_pct REAL,
+    resolved_at TEXT
 )"""
 
 
@@ -616,6 +638,9 @@ class SignalStore:
         }
         if "sl_pct" not in columns:
             c.execute("ALTER TABLE signal_outcomes ADD COLUMN sl_pct REAL")
+        # FAZ9: hangi satirin hangi resolver ile cozuldugu ayirt edilemiyordu. Nullable: eski satirlar NULL kalir.
+        if "resolved_at" not in columns:
+            c.execute("ALTER TABLE signal_outcomes ADD COLUMN resolved_at TEXT")
 
         c.commit()
         return c
@@ -761,9 +786,9 @@ class SignalStore:
                 real, fwd_ret, persist_bars = result
                 c.execute(
                     "UPDATE signal_outcomes "
-                    "SET resolved=1,real=?,fwd_ret=?,persist_bars=? WHERE id=?",
+                    "SET resolved=1,real=?,fwd_ret=?,persist_bars=?,resolved_at=? WHERE id=?",
                     (None if real is None else int(real),
-                     fwd_ret, persist_bars, row_id),
+                     fwd_ret, persist_bars, _utc_now_iso(), row_id),
                 )
                 stats["resolved"] += 1
                 if real is None:
@@ -787,6 +812,29 @@ class SignalStore:
         tarama anının stop değerini uygulamak için kullanılmaz.
         """
         return self.resolve_pending_detailed(symbol, cd, cost)["resolved"]
+
+    def resolved_rows(self, limit=None):
+        """Çözülmüş ve fiyat metriği olan satırlar (edge/promotion analizi için).
+
+        Yalnız okuma; `real` tautolojisine güvenilmez, çağıran fwd_ret'i maliyetle
+        netleştirir. Dönen sözlükler: family, regime, fwd_ret, persist_bars, entry_ts.
+        """
+        sql = ("SELECT family, regime, fwd_ret, persist_bars, entry_ts "
+               "FROM signal_outcomes WHERE resolved=1 AND fwd_ret IS NOT NULL "
+               "ORDER BY entry_ts")
+        params = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        c = self._conn()
+        try:
+            return [
+                {"family": r[0], "regime": r[1], "fwd_ret": r[2],
+                 "persist_bars": r[3], "entry_ts": r[4]}
+                for r in c.execute(sql, params).fetchall()
+            ]
+        finally:
+            c.close()
 
     def p_fake(self, signal, regime, cfg=None):
         """Sinyal×rejim Beta posterior → (p_fake, calibrated). n<min_events → nötr (0.5, False)."""

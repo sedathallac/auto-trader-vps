@@ -21,7 +21,11 @@ from leverage_engine import (
 )
 from risk_engine import RiskEngine
 
-RC = auto_trader.RISK_CONFIG
+RC = dict(auto_trader.RISK_CONFIG)
+# Bu dosya Faz 3 birleşik boyutlandırmayı RiskEngine'in ESKİ (upsize) politikasıyla
+# karşılaştırır. FAZ10 üretimde "refuse" kullanır; burada eski taban korunur ki
+# karşılaştırma elmayla elma olsun. Refuse politikası test_faz10_wiring.py'de kanıtlı.
+RC["min_notional_policy"] = "upsize"
 
 
 def _stats(q=0.6, f_star=0.4, reliable=True):
@@ -196,7 +200,7 @@ class _FakeRisk:
     daily_trades = 0
     consecutive_losses = 0
 
-    def approve_trade(self, balance, stop):       # RiskEngine'in onayladığı (küçük) notional
+    def approve_trade(self, balance, stop, take_profit_pct=None):  # RiskEngine'in onayladığı (küçük) notional
         return 10.0, "approved"
 
 

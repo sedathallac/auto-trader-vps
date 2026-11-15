@@ -44,6 +44,10 @@ class FakeBinance:
     def get_available_balance(self, a):
         return 1000.0
 
+    def order_book(self, symbol, limit=20):
+        # FAZ11 kalite kapısı: 2.5 bps spread, ~800k USDT derinlik.
+        return {"bids": [["79.99", "5000"]], "asks": [["80.01", "5000"]]}
+
     def set_leverage(self, s, l):
         return {"leverage": l}
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=Auto Trader FAZ9 LIVE (HB_OFFLINE=0, GERCEK EMIR, kademeli)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/auto_trader_faz9/app
+# Ayri state dizini: compare'in signal_outcomes/risk_ledger/whale_metrics dosyalarina dokunmaz.
+Environment=HOME=/var/lib/auto_trader_faz9_live
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/auto_trader/live.env
+# Fail-closed koruma: HB_OFFLINE=0 degilse live servisi BASLAMAZ (compare'in tersi).
+ExecStartPre=/bin/sh -c "test \"$HB_OFFLINE\" = 0"
+ExecStart=/opt/auto_trader_faz9/venv/bin/python /opt/auto_trader_faz9/app/auto_trader.py --loop
+Restart=always
+RestartSec=10
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/auto_trader_faz9_live /opt/auto_trader_faz9
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
