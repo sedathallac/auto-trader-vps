@@ -123,7 +123,7 @@ RISK_CONFIG = {
     "min_leverage": 1,
     "max_leverage": 5,
     "min_notional": 5.5,
-    "max_notional": 200.0,   # FAZ12: 25 USDT tavani kaldirildi; Asama 1 = 200 USDT (equity 2524, %0.5 risk / %1.5 SL)
+    "max_notional": 999999.0,  # FAZ14h: sabit USDT tavani kaldirildi; baglayici tavan max_position_pct (equity %20)
     "max_position_pct": 20.0,  # FAZ14: equity yuzdesi tavani (sabit USDT yerine olceklenen matematik)
     # ATR-bazlı dinamik SL/TP
     "atr_sl_multiplier": 1.5,
@@ -162,7 +162,7 @@ SECTOR_MAP = {
 # --- Pozisyon Boyutlandırma Beyni ---
 TARGET_MARGIN_USAGE_PCT = 0.30   # Bakiyenin %30'u toplam marjin
 MIN_NOTIONAL_USDT = 5.5           # Binance min
-MAX_NOTIONAL_USDT = 200.0         # İşlem başına üst sınır (FAZ12: Asama 1)
+MAX_NOTIONAL_USDT = float(RISK_CONFIG["max_notional"])  # FAZ14h: tek dogruluk kaynagi; sabit 200 kaldirildi
 USE_SHORTS = True          # short işlemleri aktif
 # FAZ13-A: yön barajı env'e bağlı. Tarama barajı gevşetilip bu baraj sabit kalınca adaylar
 # "yön belirsiz" ile düşüyordu (Faz6 çağrısı 2.0 → 0.2/tarama). Varsayılanlar eski davranış.

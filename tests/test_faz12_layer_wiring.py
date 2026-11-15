@@ -211,9 +211,10 @@ def test_analysis_render_prints_benchmark_lines():
 
 
 # --------------------------------------------------------------- ADIM 3: tavan
-def test_max_notional_cap_is_200():
-    assert auto_trader.RISK_CONFIG["max_notional"] == 200.0
-    assert auto_trader.MAX_NOTIONAL_USDT == 200.0
+def test_max_notional_cap_is_dynamic():
+    """FAZ14h: sabit 200 USDT tavani kaldirildi; baglayici tavan max_position_pct."""
+    assert auto_trader.RISK_CONFIG["max_notional"] >= 999999.0
+    assert auto_trader.RISK_CONFIG["max_position_pct"] == 20.0
 
 
 def test_stage_caps_allow_200_for_stage_1_and_2():
