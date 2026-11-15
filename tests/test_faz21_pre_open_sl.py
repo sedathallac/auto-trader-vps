@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from decimal import Decimal
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auto_trader
@@ -123,12 +124,18 @@ class Faz21Base(unittest.TestCase):
             setattr(auto_trader, n, v)
         self._slp = auto_trader.time.sleep
         auto_trader.time.sleep = lambda *a, **k: None
+        # FAZ14p: dolum beklemesi tick'ler arası; bekleyen dolum defteri izole.
+        self._orig_pf = auto_trader.PENDING_FILLS_JSON
+        auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
+        auto_trader._PENDING_FILLS.clear()
 
     def tearDown(self):
         for n, v in self._orig.items():
             setattr(auto_trader, n, v)
         auto_trader.time.sleep = self._slp
         auto_trader.MAX_OPEN_POSITIONS = self._orig_max
+        auto_trader.PENDING_FILLS_JSON = self._orig_pf
+        auto_trader._PENDING_FILLS.clear()
 
     def _cc(self, fb, hb):
         st = CloseIntentStore(self.db); st.init_schema()
@@ -142,13 +149,16 @@ class Faz21Base(unittest.TestCase):
 class TestPreOpenReconciliation(Faz21Base):
     def test_leftover_sl_cancelled_before_new(self):
         fb = FakeBinance(); hb = FakeHB()
+        cc = self._cc(fb, hb)
         r = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
-                                  coordinator=self._cc(fb, hb))
+                                  coordinator=cc)
+        self.assertTrue(r)                       # emir kabul edildi, dolum bekliyor
+        out = auto_trader._process_pending_fills(fb, hb, None, cc, None)
+        self.assertEqual(out["filled"], 1)       # dolum onaylandı, SL yolu çalıştı
         # the orphan SL (786683) was cancelled before placing the new one...
         self.assertIn(786683, fb.cancelled_algos,
                       "leftover orphan SL not cancelled -> duplicate SL risk")
         # ...and the position is held (new SL verified PRESENT, no emergency close).
-        self.assertTrue(r)
         self.assertEqual(hb.stopped, [])          # not emergency-closed
         self.assertEqual(fb.order_posts, [])      # no coordinated close
 

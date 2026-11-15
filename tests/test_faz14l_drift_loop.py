@@ -72,8 +72,11 @@ def test_position_amt_helper_reads_signed_amount():
 
 
 def test_adopts_executor_when_position_exists():
-    """Pozisyon varsa executor durdurulmamalı: durdurmak drift üretir."""
-    src = inspect.getsource(auto_trader.open_coin)
+    """Pozisyon varsa executor durdurulmamalı: durdurmak drift üretir.
+
+    FAZ14p: karar open_coin'den _process_pending_fills'e taşındı (bloklamayan tick işleyici).
+    """
+    src = inspect.getsource(auto_trader._process_pending_fills)
     assert "executor BENİMSENDİ" in src
     assert "_pos_amt != 0" in src
     # durdurma yalnız flat dalında olmalı
@@ -82,7 +85,7 @@ def test_adopts_executor_when_position_exists():
 
 
 def test_unknown_position_fails_closed():
-    src = inspect.getsource(auto_trader.open_coin)
+    src = inspect.getsource(auto_trader._process_pending_fills)
     assert "_pos_amt is None" in src
     assert "rezervasyon KORUNDU" in src
 

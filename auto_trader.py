@@ -80,6 +80,16 @@ TIME_LIMIT_SEC = 14400  # 4 saat
 # drift. Artık varsayılan 300 saniye beklenir ve karar BORSA GERÇEĞİNE göre verilir.
 FILL_WAIT_S = float(os.getenv("LIVE_FILL_WAIT_S", "300") or 300)
 FILL_POLL_S = float(os.getenv("LIVE_FILL_POLL_S", "5") or 5)
+# FAZ14p: bekleyen dolumlar süreç belleğinde DEĞİL, diskte tutulur. Restart bekleme
+# penceresine denk gelirse rezervasyon/executor bağlamı kaybolmaz; ilk tick geri yükler.
+PENDING_FILLS_JSON = Path.home() / ".pending_fills.json"
+_PENDING_FILLS = {}
+# FAZ14q: arşiv DB'si sabit "/root/.trading_archive.db" idi; servis ProtectHome=yes ve
+# HOME=/var/lib/auto_trader_faz9_live ile çalıştığı için her açılışta
+# "archive_symbols register failed: unable to open database file" veriyordu (sessiz
+# kayıp). archiver.py/archive_report.py ile aynı kural: HOME altında, env ile ezilebilir.
+TRADING_ARCHIVE_DB = Path(os.getenv("TRADING_ARCHIVE_DB")
+                          or (Path.home() / ".trading_archive.db"))
 TOP_N = int(_env_float("TOP_N", 2))   # FAZ13-A: env'e bağlı; picks altında kalırsa huniden geçen kadar probe edilir
 # Faz 9: WHALE_HUNTING=compare iken bu kadar aday DEĞERLENDİRİLİR (ilk TOP_N open_coin ile; kalanı compare_probe ile
 # YALNIZ loglanır — emir/blacklist/rezervasyon yok). 0 veya TOP_N altı → ek aday yok.
@@ -2219,46 +2229,137 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return False
     log.info(f"  executor={eid}")
 
-    # FAZ14l: dolum beklemesi (env, varsayılan 300s) ve BORSA GERÇEĞİNE dayalı karar.
-    # Eski davranış: 8 saniye bekle, dolmadıysa executor'ı keep_position=True ile durdur.
-    # Limit emir 8 saniyede dolmayınca pozisyon borsada açık kalıyor, HB onu unutuyor ve
-    # kalıcı drift oluşuyordu (52 döngü). Artık: pozisyon varsa executor DURDURULMAZ
-    # (benimsenir) ve SL yerleştirmeye devam edilir; yalnız borsa flat ise durdurulur.
-    _deadline = time.time() + max(0.0, FILL_WAIT_S)
-    filled, err = 0.0, 0
-    while True:
-        ex = hb.get_executor(eid)
-        filled = ex.get("filled_amount_quote", 0) if ex else 0
-        err = ex.get("error_count", 0) if ex else 999
-        if filled >= 1 or err > 0 or time.time() >= _deadline:
-            break
-        time.sleep(min(max(FILL_POLL_S, 0.1), max(0.0, _deadline - time.time())))
-    if filled < 1 or err > 0:
-        log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err} (bekleme={FILL_WAIT_S:.0f}s)")
-        _pos_amt = _exchange_position_amt(binance, symbol)
-        if _pos_amt is None:
-            # Pozisyon durumu okunamıyor: ne benimsenebilir ne flat sayılabilir.
-            log.critical(f"  🚨 {symbol}: pozisyon durumu okunamadı — executor DURDURULMADI, "
-                         f"rezervasyon KORUNDU (fail-closed)")
-            return False
-        if _pos_amt != 0:
-            # Borsada pozisyon var: executor'ı durdurmak drift üretir. Benimse ve devam et.
-            log.warning(f"  ♻️  {symbol}: borsada pozisyon var ({_pos_amt}) — executor BENİMSENDİ "
-                        f"(durdurulmadı), SL yerleştirmeye geçiliyor")
-        else:
-            # Borsa flat: durdurmak güvenli, drift oluşmaz.
-            try:
-                hb.stop_executor(eid, keep_position=True)
-            except Exception as e:
-                log.warning(f"  executor durdurma hatası (dolmadı): {e}")
-            if reserver is not None and _res_id is not None:
-                reserver.release(_res_id, reason="not_filled")
-                log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
-            add_blacklist(symbol, "dolmadı")
-            return False
-    else:
-        log.info(f"  ✅ doldu: {filled:.2f} USDT")
+    # FAZ14p: dolum beklemesi artık TICK'LER ARASINDA ilerler. Eski hâli ana thread'i
+    # FILL_WAIT_S (300s) boyunca time.sleep ile kilitliyordu: tarama, SL denetimi ve
+    # reconciliation 5 dakika boyunca duruyordu (strace: clock_nanosleep 300s). Artık
+    # open_coin beklemez; executor kaydedilir ve her tick'te bir kez sorgulanır.
+    _register_pending_fill(eid, {
+        "symbol": symbol, "side": side, "amount": amount, "sl_pct": sl_pct,
+        "tp_pct": tp_pct, "price": price, "dyn_lev": dyn_lev,
+        "target_notional": target_notional, "res_id": _res_id,
+        "deadline": time.time() + max(0.0, FILL_WAIT_S),
+        "opened_at": time.time(),
+    })
+    log.info(f"  ⏳ dolum bekleniyor (tick'ler arası, {FILL_WAIT_S:.0f}s): executor={eid}")
+    return True
 
+
+def _persist_pending_fills():
+    """Bekleyen dolumları diske yaz (atomik). Hata akışı durdurmaz."""
+    try:
+        tmp = PENDING_FILLS_JSON.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_PENDING_FILLS, indent=2, default=str))
+        tmp.replace(PENDING_FILLS_JSON)
+    except Exception as e:
+        log.warning(f"pending_fills persist: {e}")
+
+
+def _load_pending_fills():
+    """Diskteki bekleyen dolumları belleğe al (restart kurtarma)."""
+    global _PENDING_FILLS
+    try:
+        if PENDING_FILLS_JSON.exists():
+            raw = json.loads(PENDING_FILLS_JSON.read_text())
+            if isinstance(raw, dict):
+                _PENDING_FILLS = raw
+                if raw:
+                    log.info(f"  ♻️  {len(raw)} bekleyen dolum diskten geri yüklendi")
+    except Exception as e:
+        log.warning(f"pending_fills load: {e}")
+        _PENDING_FILLS = {}
+    return _PENDING_FILLS
+
+
+def _register_pending_fill(eid, ctx):
+    _PENDING_FILLS[str(eid)] = dict(ctx)
+    _persist_pending_fills()
+
+
+def _drop_pending_fill(eid):
+    _PENDING_FILLS.pop(str(eid), None)
+    _persist_pending_fills()
+
+
+def _process_pending_fills(binance, hb, risk, coordinator, reserver):
+    """Her tick'te bir kez: bekleyen dolumları sorgular, karar verir. BLOKLAMAZ.
+
+    Dönen sözlük: {'filled': n, 'adopted': n, 'cancelled': n, 'waiting': n, 'failed': n}
+    """
+    out = {"filled": 0, "adopted": 0, "cancelled": 0, "waiting": 0, "failed": 0}
+    if not _PENDING_FILLS:
+        return out
+    for eid in list(_PENDING_FILLS.keys()):
+        ctx = _PENDING_FILLS.get(eid) or {}
+        symbol = ctx.get("symbol")
+        try:
+            ex = hb.get_executor(eid)
+        except Exception as e:
+            log.warning(f"  bekleyen dolum sorgu hatası ({symbol}): {e}")
+            out["waiting"] += 1
+            continue
+        filled = float(ex.get("filled_amount_quote", 0) or 0) if ex else 0.0
+        err = int(ex.get("error_count", 0) or 0) if ex else 999
+        deadline = float(ctx.get("deadline") or 0)
+        if filled >= 1:
+            log.info(f"  ✅ doldu: {filled:.2f} USDT ({symbol}, executor={eid})")
+            _drop_pending_fill(eid)
+            try:
+                _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
+                                         float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
+                                         binance.filters(symbol), risk, coordinator, reserver,
+                                         ctx.get("res_id"), int(ctx.get("dyn_lev") or 1),
+                                         float(ctx.get("target_notional") or 0), None, eid)
+                out["filled" if _fin_ok else "failed"] += 1
+            except Exception as e:
+                log.error(f"  finalize hatası ({symbol}): {e}")
+                out["failed"] += 1
+            continue
+        if err > 0 or time.time() >= deadline:
+            _pos_amt = _exchange_position_amt(binance, symbol)
+            if _pos_amt is None:
+                log.critical(f"  🚨 {symbol}: pozisyon durumu okunamadı — executor DURDURULMADI, "
+                             f"rezervasyon KORUNDU (fail-closed)")
+                out["waiting"] += 1
+                continue
+            _drop_pending_fill(eid)
+            if _pos_amt != 0:
+                log.warning(f"  ♻️  {symbol}: borsada pozisyon var ({_pos_amt}) — executor BENİMSENDİ "
+                            f"(durdurulmadı), SL yerleştirmeye geçiliyor")
+                try:
+                    _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
+                                             float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
+                                             binance.filters(symbol), risk, coordinator, reserver,
+                                             ctx.get("res_id"), int(ctx.get("dyn_lev") or 1),
+                                             float(ctx.get("target_notional") or 0), None, eid)
+                    out["adopted" if _fin_ok else "failed"] += 1
+                except Exception as e:
+                    log.error(f"  benimseme finalize hatası ({symbol}): {e}")
+                    out["failed"] += 1
+            else:
+                log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err} "
+                            f"(bekleme={FILL_WAIT_S:.0f}s) — borsa flat, executor durduruldu")
+                try:
+                    hb.stop_executor(eid, keep_position=True)
+                except Exception as e:
+                    log.warning(f"  executor durdurma hatası (dolmadı): {e}")
+                if reserver is not None and ctx.get("res_id") is not None:
+                    reserver.release(ctx["res_id"], reason="not_filled")
+                    log.info(f"  🔓 rezervasyon serbest (id={ctx['res_id']}): dolmadı")
+                add_blacklist(symbol, "dolmadı")
+                out["cancelled"] += 1
+            continue
+        out["waiting"] += 1
+    return out
+
+
+def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, filt,
+                   risk, coordinator, reserver, _res_id, dyn_lev, target_notional,
+                   coin, eid):
+    """Dolum onaylandıktan (veya pozisyon benimsendikten) sonraki SL/kayıt yolu.
+
+    FAZ14p: open_coin'in bloklamayan gövdesinden çıkarıldı; hem ilk tick'te dolan
+    emirler hem de sonraki tick'lerde dolan bekleyen emirler bu yolu kullanır.
+    """
     tick = float(filt["PRICE_FILTER"]["tickSize"])
     if side == 1:
         trig = round(round((price * (1 - sl_pct)) / tick) * tick, 8)
@@ -2408,7 +2509,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # Permanent archive_symbols registration (independent of orphan_killer)
     try:
         import sqlite3
-        _adb = sqlite3.connect("/root/.trading_archive.db", timeout=10)
+        _adb = sqlite3.connect(str(TRADING_ARCHIVE_DB), timeout=10)
         _adb.execute("""CREATE TABLE IF NOT EXISTS archive_symbols (
             symbol TEXT PRIMARY KEY,
             first_seen_at TEXT NOT NULL,
@@ -2519,6 +2620,14 @@ def run_once(dry_run=False):
 
     # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir
     sync_risk_engine(risk, hb, binance=binance)
+
+    # FAZ14p: bekleyen dolumları tick'ler arası işle (BLOKLAMAZ). Reconcile'dan ÖNCE
+    # çalışır: benimsenen pozisyonun executor'ı durdurulmadığı için sahte drift üretmez.
+    _load_pending_fills()
+    _pf = _process_pending_fills(binance, hb, risk, coordinator, reserver)
+    if any(_pf.values()):
+        log.info(f"  📥 bekleyen dolumlar: doldu={_pf['filled']} benimsendi={_pf['adopted']} "
+                 f"iptal={_pf['cancelled']} bekliyor={_pf['waiting']} hata={_pf['failed']}")
 
     # cleanup_orphan_sl artık orphan_killer.py tarafından yapılıyor.
     # K6: compute drift/stale as FLAGS (do not early-return on them) so the
@@ -2684,11 +2793,15 @@ def main():
                 run_once(a.dry)
             except Exception as e:
                 log.exception(f"döngü: {e}")
-            # Uyku 60s'lik dilimlerde, her dilimde heartbeat yaz
-            chunks = max(1, a.interval // 60)
-            for _ in range(chunks):
+            # FAZ14p: uyku toplamda a.interval saniye olmalı. Eski `max(1, interval//60)`
+            # 30s için 1 tur = 60s uyuyordu (istenen aralığın iki katı). Artık kalan süre
+            # 60s'lik dilimlere bölünür, son dilim artığı kadar uyunur.
+            remaining = max(0.0, float(a.interval))
+            while remaining > 0:
                 heartbeat_tick()
-                time.sleep(60)
+                chunk = min(60.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
     else:
         run_once(a.dry)
 

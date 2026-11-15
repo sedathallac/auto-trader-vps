@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auto_trader
@@ -88,12 +89,18 @@ class Faz2Base(unittest.TestCase):
             setattr(auto_trader, name, val)
         self._orig_sleep = auto_trader.time.sleep
         auto_trader.time.sleep = lambda *a, **k: None
+        # FAZ14p: dolum beklemesi tick'ler arası; bekleyen dolum defteri izole.
+        self._orig_pf = auto_trader.PENDING_FILLS_JSON
+        auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
+        auto_trader._PENDING_FILLS.clear()
 
     def tearDown(self):
         for n, v in self._orig.items():
             setattr(auto_trader, n, v)
         auto_trader.time.sleep = self._orig_sleep
         auto_trader.MAX_OPEN_POSITIONS = self._orig_max
+        auto_trader.PENDING_FILLS_JSON = self._orig_pf
+        auto_trader._PENDING_FILLS.clear()
 
     def _coin(self):
         return {"symbol": SYM, "lastPrice": "3900", "quoteVolume": "1000000",
@@ -106,7 +113,9 @@ class TestExecutionRobustness(Faz2Base):
         hb = FakeHB()
         r = auto_trader.open_coin(fb, hb, self._coin(), risk=None,
                                   reserver=self.reserver, coordinator=None)
-        self.assertFalse(r)
+        self.assertTrue(r)          # FAZ14p: open_coin beklemez, dolum tick'te izlenir
+        out = auto_trader._process_pending_fills(fb, hb, None, None, self.reserver)
+        self.assertEqual(out["cancelled"], 1)
         # robustness: the leaked reservation must be freed...
         self.assertEqual(self.reserver.active_reservations(), [],
                          "reservation leaked on fill-failure")
@@ -117,8 +126,10 @@ class TestExecutionRobustness(Faz2Base):
     def test_slot_reusable_after_fill_failure(self):
         # after a fill-failure, both slots must be free again (no cap starvation).
         fb = FakeBinance()
-        auto_trader.open_coin(fb, FakeHB(), self._coin(), risk=None,
+        hb = FakeHB()
+        auto_trader.open_coin(fb, hb, self._coin(), risk=None,
                               reserver=self.reserver, coordinator=None)
+        auto_trader._process_pending_fills(fb, hb, None, None, self.reserver)
         self.assertEqual(self.reserver.used_slots([]), 0)   # full capacity restored
 
 

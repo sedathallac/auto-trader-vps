@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -130,16 +131,26 @@ class LiveWiringBase(unittest.TestCase):
             setattr(auto_trader, name, val)
         self._orig_sleep = auto_trader.time.sleep
         auto_trader.time.sleep = lambda *_a, **_k: None
+        # FAZ14p: dolum beklemesi tick'ler arası; bekleyen dolum defteri izole.
+        self._orig_pf = auto_trader.PENDING_FILLS_JSON
+        auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
+        auto_trader._PENDING_FILLS.clear()
 
     def tearDown(self):
         for name, val in self._orig.items():
             setattr(auto_trader, name, val)
         auto_trader.time.sleep = self._orig_sleep
         auto_trader.MAX_OPEN_POSITIONS = self._orig_max
+        auto_trader.PENDING_FILLS_JSON = self._orig_pf
+        auto_trader._PENDING_FILLS.clear()
 
     def _coin(self):
         return {"symbol": SYM, "lastPrice": "80", "quoteVolume": "1000000",
                 "_score": 0.5, "priceChangePercent": "2"}
+
+    def _drive_fill(self, binance, hb, cc):
+        """FAZ14p: open_coin bloklamaz; dolum sonraki tick'te işlenir."""
+        return auto_trader._process_pending_fills(binance, hb, None, cc, None)
 
 
 class TestOpenCoinReachesCoordinator(LiveWiringBase):
@@ -150,7 +161,9 @@ class TestOpenCoinReachesCoordinator(LiveWiringBase):
         # REAL open_coin, SL placement fails (-2021) -> emergency close branch.
         res = auto_trader.open_coin(binance, hb, self._coin(), dry_run=False,
                                     risk=None, reserver=None, coordinator=cc)
-        self.assertFalse(res)                              # open aborted (SL failed)
+        self.assertTrue(res)                               # emir kabul edildi
+        out = self._drive_fill(binance, hb, cc)
+        self.assertEqual(out["failed"], 1)                 # SL doğrulanamadı
         # Proof the CloseCoordinator handoff ran (not a raw market POST):
         self.assertEqual(hb.stopped, [("E1", True)])       # HB stopped keep_position
         self.assertEqual(len(binance.order_posts), 1)      # exactly ONE close
@@ -163,6 +176,7 @@ class TestOpenCoinReachesCoordinator(LiveWiringBase):
         hb = FakeHB()
         cc, store = _coordinator(binance, hb, self.db)
         auto_trader.open_coin(binance, hb, self._coin(), coordinator=cc)
+        self._drive_fill(binance, hb, cc)
         posts_after_first = len(binance.order_posts)
         # a duplicate close trigger (e.g. a re-scan) must send NO second POST
         r2 = coordinate_close(cc, binance, SYM, "DUP")
@@ -179,6 +193,7 @@ class TestNoDirectBypass(LiveWiringBase):
         hb = FakeHB()
         cc, _ = _coordinator(binance, hb, self.db)
         auto_trader.open_coin(binance, hb, self._coin(), coordinator=cc)
+        self._drive_fill(binance, hb, cc)
         self.assertNotEqual(hb.stopped, [], "close bypassed the coordinator handoff")
 
     def test_no_coordinator_no_direct_close(self):
