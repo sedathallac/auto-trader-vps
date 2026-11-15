@@ -29,7 +29,36 @@ class RiskEngine:
         self.margin_usage_pct = 0.0
         self.last_reset_date = None
         self.state = {}
+        self._ensure_schema()
         self._load_state()
+
+    def _ensure_schema(self):
+        """risk_state tablosunu garanti eder.
+
+        Eski kurulumlarda tablo başka bir araçla oluşturulmuştu; yeni bir state dizini
+        (shadow/live) açıldığında tablo yoktu ve `_load_state` FAIL-CLOSED halt'a düşüyordu.
+        Şema burada tanımlıdır: hiçbir kurulum adımı elle tablo yaratmak zorunda değil.
+        """
+        try:
+            with self._db() as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS risk_state (
+                        id INTEGER PRIMARY KEY,
+                        peak_equity REAL DEFAULT 0,
+                        consecutive_losses INTEGER DEFAULT 0,
+                        daily_trades INTEGER DEFAULT 0,
+                        daily_pnl REAL DEFAULT 0,
+                        last_reset_date TEXT,
+                        is_halted INTEGER DEFAULT 0,
+                        halt_reason TEXT,
+                        updated_at TEXT
+                    )
+                """)
+                conn.commit()
+        except Exception as e:
+            log.critical(f"🚨 C3: risk_state şeması oluşturulamadı, FAIL-CLOSED: {e}")
+            self.is_halted = True
+            self.halt_reason = f"DB schema error: {e}"
 
     @contextmanager
     def _db(self):

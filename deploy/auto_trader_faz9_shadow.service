@@ -11,6 +11,8 @@ WorkingDirectory=/opt/auto_trader_faz9/app
 Environment=HOME=/var/lib/auto_trader_faz9_shadow
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/auto_trader/shadow.env
+# Anahtarlar compare ile ayni dosyadan okunur (kopyalanmaz): piyasa verisi icin gerekli, emir izni kullanilmaz.
+EnvironmentFile=/etc/auto_trader/keys.env
 # Fail-closed koruma: HB_OFFLINE=1 degilse shadow servisi BASLAMAZ (compare ile ayni yon).
 ExecStartPre=/bin/sh -c "test \"$HB_OFFLINE\" = 1"
 ExecStart=/opt/auto_trader_faz9/venv/bin/python /opt/auto_trader_faz9/app/auto_trader.py --loop --interval 30
