@@ -81,7 +81,7 @@ def test_missing_calibration_db_falls_back_neutral(tmp_path):
 
 def test_faz6_uses_calibration_db():
     src = inspect.getsource(auto_trader._faz6_confirm)
-    assert "calib_db=_se.CALIB_DB" in src
+    assert "calib_db=_se.calib_db_path()" in src
     assert "adx15=" in src and "adx_trend=" in src
 
 
