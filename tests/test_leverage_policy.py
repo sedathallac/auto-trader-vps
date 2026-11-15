@@ -1,4 +1,6 @@
 """FAZ11 Katman 2 — kaldıraç politikası testleri."""
+import math
+
 import pytest
 
 import leverage_policy as lp
@@ -58,8 +60,12 @@ def test_compute_leverage_applies_the_drawdown_penalty():
 
 
 def test_compute_leverage_respects_the_kelly_cap():
+    # FAZ14k: round-half-to-even. Kelly tavanı 5.75 → 6x (floor 5 verirdi).
+    # Kelly yumuşak tavandır; sert güvenlik sınırı tasfiye tavanıdır ve o clamp'lenir.
     d = lp.compute_leverage(0.002, 0.02, f_star=0.25)
-    assert d.leverage == 5 and "kelly" in d.caps
+    assert d.raw == pytest.approx(5.75, abs=1e-6)
+    assert d.leverage == 6 and "kelly" in d.caps
+    assert d.leverage <= math.ceil(d.raw)
 
 
 def test_compute_leverage_respects_liquidation_safety():
