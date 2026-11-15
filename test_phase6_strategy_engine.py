@@ -394,19 +394,23 @@ def test_confirm_no_veto_when_trend_weak(patch_signals):
 
 
 def test_confirm_same_family_counts_once(patch_signals):
+    # FAZ14j: varsayılan eşik 1'e indi; bu test SAYMA mantığını doğrular, eşiği açıkça 2 verir.
     patch_signals(exh=[_reading("rsi_extreme"), _reading("bollinger_z"), _reading("rsi_divergence")])
-    v = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05))
+    v = se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05),
+                   cfg={"confirm_min_families": 2})
     assert not v.allow and "teyit yetersiz (1/2" in v.reason
 
 
 def test_confirm_opposite_direction_readings_do_not_count(patch_signals):
     patch_signals(exh=[_reading()], struct=[_reading("sr_proximity", se.FAM_STRUCTURE, d=-1)])
-    assert not se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05)).allow
+    assert not se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05),
+                          cfg={"confirm_min_families": 2}).allow
 
 
 def test_confirm_weak_strength_does_not_count(patch_signals):
     patch_signals(exh=[_reading(s=0.1)], struct=[_reading("sr_proximity", se.FAM_STRUCTURE)])
-    assert not se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05)).allow
+    assert not se.confirm(1, _flat_main(), _trend_cds(), _FakeStore(0.05),
+                          cfg={"confirm_min_families": 2}).allow
 
 
 def test_confirm_cold_start_uncalibrated_passes_at_new_threshold(patch_signals):

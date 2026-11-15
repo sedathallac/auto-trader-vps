@@ -102,7 +102,7 @@ def test_disabled_strategies_do_not_fire():
     v = se.evaluate(1, readings, FLAT_TRENDS, "trend", lambda n, g: (0.2, True), CFG,
                     regime_adx=30.0, policy=se.REVERSE_POLICY)
     assert v.allow is False and v.families == {}
-    assert "0/2" in v.reason
+    assert "0/1" in v.reason
     for r in readings:
         assert se.effective_direction(r, "trend", se.REVERSE_POLICY) == 0
 
