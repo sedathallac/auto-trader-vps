@@ -93,6 +93,20 @@ def test_compute_leverage_fails_safe_on_invalid_inputs():
     assert d.leverage == 1 and d.caps == ["invalid_inputs"]
 
 
+def test_caps_are_sorted_so_the_first_is_the_true_binding_cap():
+    # FAZ14q: drawdown>0 iken "drawdown" koşulsuz ilk sıraya yazılıyordu; canlı log
+    # binding=drawdown diyordu ama gerçek bağlayıcı stage/volatilite tavanıydı.
+    d = lp.compute_leverage(0.0001, 0.02, drawdown=0.05, stage_cap=2)
+    assert d.caps[0] == "stage" and "drawdown" in d.caps
+    assert d.caps_detail["stage"] < d.caps_detail["drawdown"]
+
+
+def test_caps_binding_is_volatility_when_no_penalty_binds():
+    d = lp.compute_leverage(0.0072, 0.0108, drawdown=0.0, quality=0.945)
+    assert d.caps[0] == "volatility"
+    assert d.caps_detail["volatility"] < d.caps_detail["liquidation"]
+
+
 def test_compute_leverage_reports_the_binding_cap():
     d = lp.compute_leverage(0.005, 0.02)
     assert d.reason.startswith("binding=")

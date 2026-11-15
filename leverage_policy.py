@@ -158,25 +158,32 @@ def compute_leverage(sigma, sl_pct, drawdown=0.0, f_star=None, stage_cap=None,
     _cfg_eff["c"] = _c_eff
     l_vol = volatility_leverage(sigma, _cfg_eff)
     l_dd = drawdown_penalty(l_vol, drawdown)
+    # FAZ14q: caps yalnız GERÇEKTEN kısıtlayan tavanları taşır ve değere göre ARTAN
+    # sıralanır; caps[0] = bağlayıcı tavan. Eski hâli drawdown>0 olduğunda "drawdown"ı
+    # koşulsuz ilk sıraya koyuyordu: canlı log "binding=drawdown" yazarken gerçek
+    # bağlayıcı volatilite tavanıydı (NEAR: volatility=10.83, drawdown=10.83).
+    caps = []
     if l_dd < l_vol:
-        caps.append("drawdown")
+        caps.append(("drawdown", l_dd))
     l_kelly = kelly_leverage_cap(f_star, cfg) if f_star is not None else hi
     if l_kelly < l_dd:
-        caps.append("kelly")
+        caps.append(("kelly", l_kelly))
     l_liq = liquidation_cap(sl_pct, cfg)
     if l_liq < min(l_dd, l_kelly):
-        caps.append("liquidation")
+        caps.append(("liquidation", l_liq))
 
     raw = min(l_dd, l_kelly, l_liq, hi)
     if stage_cap is not None and float(stage_cap) < raw:
         raw = float(stage_cap)
-        caps.append("stage")
+        caps.append(("stage", float(stage_cap)))
     if exchange_max is not None and float(exchange_max) < raw:
         raw = float(exchange_max)
-        caps.append("exchange")
+        caps.append(("exchange", float(exchange_max)))
     # Şeffaflık: hiçbir ceza/kademe tavanı bağlamadıysa bağlayan volatilitedir.
     if not caps:
-        caps.append("volatility")
+        caps.append(("volatility", l_vol))
+    caps.sort(key=lambda kv: kv[1])
+    caps = [name for name, _ in caps]
 
     # round-half-to-even: sürekli, sıçramasız. Python'un round()'u banker's rounding yapar.
     lev = int(round(raw))

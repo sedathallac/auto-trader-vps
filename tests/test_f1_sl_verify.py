@@ -12,6 +12,7 @@ import os
 import sys
 import unittest
 from decimal import Decimal
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auto_trader
@@ -123,12 +124,19 @@ class F1Base(unittest.TestCase):
             setattr(auto_trader, name, val)
         self._orig_sleep = auto_trader.time.sleep
         auto_trader.time.sleep = lambda *a, **k: None
+        # FAZ14p: dolum beklemesi tick'ler arası ilerler; testte bekleyen dolum
+        # defteri izole edilir (gerçek ~/.pending_fills.json'a yazılmaz).
+        self._orig_pf = auto_trader.PENDING_FILLS_JSON
+        auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
+        auto_trader._PENDING_FILLS.clear()
 
     def tearDown(self):
         for name, val in self._orig.items():
             setattr(auto_trader, name, val)
         auto_trader.time.sleep = self._orig_sleep
         auto_trader.MAX_OPEN_POSITIONS = self._orig_max
+        auto_trader.PENDING_FILLS_JSON = self._orig_pf
+        auto_trader._PENDING_FILLS.clear()
 
     def _coin(self):
         return {"symbol": SYM, "lastPrice": "80", "quoteVolume": "1000000",
@@ -138,6 +146,10 @@ class F1Base(unittest.TestCase):
         store = CloseIntentStore(self.db)
         store.init_schema()
         return CloseCoordinator(BinanceHBCloseAdapter(binance, hb), intent_store=store)
+
+    def _drive_fill(self, fb, hb, cc):
+        """FAZ14p: open_coin bloklamaz; dolum sonraki tick'te işlenir."""
+        return auto_trader._process_pending_fills(fb, hb, None, cc, None)
 
 
 class TestF1(F1Base):
@@ -149,7 +161,9 @@ class TestF1(F1Base):
         cc = self._cc(fb, hb)
         res = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
                                     coordinator=cc)
-        self.assertFalse(res)
+        self.assertTrue(res)          # emir kabul edildi, dolum bekliyor
+        out = self._drive_fill(fb, hb, cc)
+        self.assertEqual(out["failed"], 1, "SL doğrulanamadı -> başarısız sayılmalı")
         self.assertEqual(hb.stopped, [("E1", True)], "SL not re-verified: no emergency close")
         self.assertEqual(len(fb.order_posts), 1)
         self.assertEqual(fb.amt, Decimal("0"))
@@ -161,7 +175,9 @@ class TestF1(F1Base):
         cc = self._cc(fb, hb)
         res = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
                                     coordinator=cc)
-        self.assertFalse(res)
+        self.assertTrue(res)
+        out = self._drive_fill(fb, hb, cc)
+        self.assertEqual(out["failed"], 1)
         self.assertEqual(hb.stopped, [("E1", True)])
         self.assertEqual(len(fb.order_posts), 1)
 
