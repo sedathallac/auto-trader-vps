@@ -70,6 +70,26 @@ except ValueError:
     TOP_N_COMPARE = 20
 MAX_OPEN_POSITIONS = max(0, int(os.getenv("MAX_OPEN_POSITIONS", "0")))  # 0 = EMERGENCY (yeni giris durdu)
 
+
+def _effective_max_positions():
+    """Pozisyon tavanı: canlıda LIVE_MAX_OPEN_POSITIONS, compare'da MAX_OPEN_POSITIONS.
+
+    Modül düzeyi MAX_OPEN_POSITIONS yalnız compare servisi içindir (env'de taşınır).
+    Canlı servis limiti LIVE_MAX_OPEN_POSITIONS ile verir; eski kod kapılarda modül
+    düzeyini okuduğu için canlıda limit 0 görünüyor ve `len(active) >= 0` her zaman
+    doğru olup tarama hiç başlamıyordu.
+    """
+    try:
+        cfg = _live_cfg()
+    except Exception:
+        return MAX_OPEN_POSITIONS
+    if getattr(cfg, "is_live", False):
+        try:
+            return max(0, int(cfg.max_open_positions))
+        except (TypeError, ValueError):
+            return 0
+    return MAX_OPEN_POSITIONS
+
 RISK_CONFIG = {
     "max_drawdown_pct": 0.20,
     "max_total_margin_pct": 0.40,
@@ -1701,8 +1721,8 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         except Exception as e:
             log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
             return False
-    if not HB_OFFLINE and len(_cur) >= MAX_OPEN_POSITIONS:
-        log.info(f"  C6: limit dolu ({len(_cur)}/{MAX_OPEN_POSITIONS}), atlanıyor")
+    if not HB_OFFLINE and len(_cur) >= _effective_max_positions():
+        log.info(f"  C6: limit dolu ({len(_cur)}/{_effective_max_positions()}), atlanıyor")
         return False
     symbol = coin["symbol"]
     pair = symbol.replace("USDT", "-USDT")
@@ -2242,8 +2262,8 @@ def run_once(dry_run=False):
         except Exception as e:
             log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
             active = set()
-    if not HB_OFFLINE and len(active) >= MAX_OPEN_POSITIONS:
-        log.info(f"Maks pozisyon limiti ({MAX_OPEN_POSITIONS}) dolu → yeni açmıyorum")
+    if not HB_OFFLINE and len(active) >= _effective_max_positions():
+        log.info(f"Maks pozisyon limiti ({_effective_max_positions()}) dolu → yeni açmıyorum")
         return
 
     try:
@@ -2313,8 +2333,8 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
             except Exception as e:
                 log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
                 break
-        if not HB_OFFLINE and len(_cur_active) >= MAX_OPEN_POSITIONS:
-            log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{MAX_OPEN_POSITIONS}), döngüden çıkılıyor")
+        if not HB_OFFLINE and len(_cur_active) >= _effective_max_positions():
+            log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{_effective_max_positions()}), döngüden çıkılıyor")
             break
         try:
             # HB_OFFLINE: open_coin dry-run'a zorlanır — compare log üretilir ama GERÇEK
