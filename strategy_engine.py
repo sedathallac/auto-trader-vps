@@ -482,8 +482,14 @@ def resolve_side(side_dir, readings, regime, policy=None, cfg=None):
     # Yön YALNIZ politika gerçekten bir sinyali çevirdiyse değişir. Aksi halde oy
     # dengesizliği decide_side'ın kararını sessizce ezerdi (regime=range'de ters politika
     # yokken bile yön değişiyordu).
-    if not reversed_names or net == 0:
-        return side_dir, tuple(reversed_names)
+    if not reversed_names:
+        return side_dir, ()
+    # FAZ14: beraberlikte (net == 0) politika yönü HONOR edilir. Önceki kod orijinal yönü
+    # döndürüyor ama reversed_names'i dolu bırakıyordu; sonuç: sinyal "ters" olarak
+    # etiketleniyor, trend vetosu ise ORİJİNAL yönde hesaplanıyordu (against=0.60 → RED,
+    # oysa ters yönde against=0.00). Etiket ile karar aynı yönü göstermek zorunda.
+    if net == 0:
+        return -side_dir, tuple(reversed_names)
     return (1 if net > 0 else -1), tuple(reversed_names)
 
 
