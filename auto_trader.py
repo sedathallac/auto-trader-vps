@@ -20,6 +20,8 @@ from risk_engine import RiskEngine
 from position_reservation import PositionReserver
 import coin_quality
 import leverage_policy
+import sizing_policy
+import preflight
 import requests
 
 BINANCE_FAPI = "https://fapi.binance.com"
@@ -108,7 +110,7 @@ RISK_CONFIG = {
     "min_leverage": 1,
     "max_leverage": 5,
     "min_notional": 5.5,
-    "max_notional": 25.0,   # C1-FIX: Hard cap 25 USDT (önceden 10000 idi ve bypass ediliyordu)
+    "max_notional": 200.0,   # FAZ12: 25 USDT tavani kaldirildi; Asama 1 = 200 USDT (equity 2524, %0.5 risk / %1.5 SL)
     # ATR-bazlı dinamik SL/TP
     "atr_sl_multiplier": 1.5,
     "atr_tp_multiplier": 2.5,
@@ -146,7 +148,7 @@ SECTOR_MAP = {
 # --- Pozisyon Boyutlandırma Beyni ---
 TARGET_MARGIN_USAGE_PCT = 0.30   # Bakiyenin %30'u toplam marjin
 MIN_NOTIONAL_USDT = 5.5           # Binance min
-MAX_NOTIONAL_USDT = 25.0          # İşlem başına üst sınır
+MAX_NOTIONAL_USDT = 200.0         # İşlem başına üst sınır (FAZ12: Asama 1)
 USE_SHORTS = True          # short işlemleri aktif
 LONG_ON_DIP_PCT = -3.0     # %3+ düşmüşse LONG (mean reversion)
 SHORT_ON_PUMP_PCT = 3.0    # %3+ yükselmişse SHORT (mean reversion)
@@ -889,11 +891,10 @@ def ensure_sl_coverage(binance):
                 side = 1 if is_long else 2
                 filt = binance.filters(sym)
                 tick = float(filt["PRICE_FILTER"]["tickSize"]) if filt else 0.01
-                # FAZ 2.3: ATR bazli SL (open_coin ile tutarli)
+                # FAZ 2.3 + FAZ11 L3: ATR bazli SL (open_coin ile tutarli, sizing_policy)
                 atr_pct = calculate_atr(binance, sym) or 0.02
-                sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"],
-                                 RISK_CONFIG["sl_min_pct"]),
-                             RISK_CONFIG["sl_max_pct"])
+                sl_pct = sizing_policy.suggest_sl_tp(
+                    atr_pct, direction=1 if is_long else -1, cfg=RISK_CONFIG).sl_pct
                 if is_long:
                     trig = round(round((entry * (1 - sl_pct)) / tick) * tick, 8)
                 else:
@@ -1240,10 +1241,11 @@ def calculate_position_size(balance_usdt, coin):
 
     # Hedef marjin (tüm işlemler için)
     total_target_margin = balance_usdt * TARGET_MARGIN_USAGE_PCT
-    if MAX_OPEN_POSITIONS <= 0:
-        log.warning("calculate_position_size: MAX_OPEN_POSITIONS <= 0, returning 0")
+    _cap = _effective_max_positions()
+    if _cap <= 0:
+        log.warning("calculate_position_size: pozisyon tavani <= 0, returning 0")
         return 0.0, 0.0
-    margin_per_trade = total_target_margin / MAX_OPEN_POSITIONS
+    margin_per_trade = total_target_margin / _cap
     base_notional = margin_per_trade * LEVERAGE
 
     # Volatilite ayarı
@@ -1254,8 +1256,8 @@ def calculate_position_size(balance_usdt, coin):
     notional = max(notional, MIN_NOTIONAL_USDT)
 
     # Bakiye güvenlik kontrolü (toplam marjin bakiyenin %90'ını aşmasın)
-    if margin_per_trade * MAX_OPEN_POSITIONS > balance_usdt * 0.9:
-        safe_margin = (balance_usdt * 0.9) / MAX_OPEN_POSITIONS
+    if margin_per_trade * _cap > balance_usdt * 0.9:
+        safe_margin = (balance_usdt * 0.9) / _cap
         notional = safe_margin * LEVERAGE
 
     return notional, vol_mult
@@ -1286,18 +1288,26 @@ def calc_amount(price, filters):
     return round(amt, 8)
 
 
-def calculate_dynamic_leverage(atr_pct):
+def calculate_dynamic_leverage(atr_pct, *, drawdown=0.0, f_star=None, stage_cap=None):
+    """FAZ11 Katman 2: leverage_policy.compute_leverage delege eder.
+
+    Beş tavanın en küçüğü (volatilite, drawdown, Kelly, tasfiye, kademe/borsa) ve
+    tam sayıya AŞAĞI yuvarlama. Eski `target_risk/ATR%` formülü yalnız volatilite
+    tavanını görüyordu; tasfiye güvenliği ve Kelly hesaba katılmıyordu.
     """
-    Dinamik kaldıraç: leverage = target_risk / ATR%
-    Referans: Moreira & Muir (2017), Alexander & Dakos (2022)
-    """
-    if atr_pct <= 0:
+    if atr_pct is None or atr_pct <= 0:
         return RISK_CONFIG["min_leverage"]
-    target = RISK_CONFIG["target_risk_units"]
-    raw = target / (atr_pct * 100.0)
-    lev = int(round(raw))
-    lev = max(RISK_CONFIG["min_leverage"], min(RISK_CONFIG["max_leverage"], lev))
-    return lev
+    sigma = float(atr_pct)
+    sl_pct = min(max(sigma * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]),
+                 RISK_CONFIG["sl_max_pct"])
+    d = leverage_policy.compute_leverage(
+        sigma, sl_pct,
+        drawdown=float(drawdown or 0.0),
+        f_star=f_star,
+        stage_cap=stage_cap if stage_cap is not None else RISK_CONFIG["max_leverage"],
+        exchange_max=RISK_CONFIG["max_leverage"],
+    )
+    return max(RISK_CONFIG["min_leverage"], min(RISK_CONFIG["max_leverage"], d.leverage))
 
 
 def get_real_slippage(binance, symbol):
@@ -1687,8 +1697,9 @@ def compare_probe(binance, coin, risk=None):
     atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
     if atr_pct is None:
         atr_pct = 0.02
-    sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
-    tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
+    _geo = sizing_policy.suggest_sl_tp(atr_pct, direction=1 if side == 1 else -1,
+                                       cfg=RISK_CONFIG)
+    sl_pct, tp_pct = _geo.sl_pct, _geo.tp_pct
     log.info(f"→ 🔎 probe {symbol} yön={side_name} (yalnız compare verisi; emir YOK)")
     if STRATEGY_CONFIRMATION in ("compare", "on"):
         _faz6_confirm(binance, symbol, side, sl_pct, "compare")
@@ -1763,15 +1774,21 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return False
     log.info(f"  yön={side_name}")
 
-    # ATR-bazlı dinamik SL/TP
+    # ATR-bazlı dinamik SL/TP — FAZ11 Katman 3: sizing_policy.suggest_sl_tp
     atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
     if atr_pct is None:
         atr_pct = 0.02
         log.warning("  ATR alınamadı, fallback %2.0 kullanılıyor")
 
-    sl_pct = min(max(atr_pct * RISK_CONFIG["atr_sl_multiplier"], RISK_CONFIG["sl_min_pct"]), RISK_CONFIG["sl_max_pct"])
-    tp_pct = min(max(atr_pct * RISK_CONFIG["atr_tp_multiplier"], RISK_CONFIG["tp_min_pct"]), RISK_CONFIG["tp_max_pct"])
-    log.info(f"  📊 ATR=%{atr_pct*100:.2} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f}")
+    _geo = sizing_policy.suggest_sl_tp(atr_pct, direction=1 if side == 1 else -1,
+                                       cfg=RISK_CONFIG)
+    sl_pct, tp_pct = _geo.sl_pct, _geo.tp_pct
+    log.info(f"  📊 ATR=%{atr_pct*100:.2} → SL=%{sl_pct*100:.2f} TP=%{tp_pct*100:.2f} "
+             f"(net_rr={_geo.net_rr:.2f})")
+    # Canlıda net R/R kapısı serttir; compare veri toplamaya devam eder (dokunulmaz).
+    if not HB_OFFLINE and not _geo.ok:
+        log.warning(f"  atlandı: SL/TP geometrisi ({_geo.reason})")
+        return False
 
     # === Faz 6: strateji teyit FİLTRESİ ('off' → atlanır, ek API çağrısı yok) ===
     if STRATEGY_CONFIRMATION in ("compare", "on"):
@@ -1892,12 +1909,16 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         return True
 
     # Dinamik kaldıraç (flag açıksa ATR-bazlı, kapalıysa sabit 3x)
+    _dd_now = float(getattr(risk, "current_drawdown", 0.0) or 0.0)
+    _stage_cap = _live_cfg().leverage if _live_cfg().is_live else None
     if SCIENTIFIC_SIZING == "on" and _new_lev is not None:
         dyn_lev = max(1, int(round(_new_lev)))
         log.info(f"  🔬 Faz3 kaldıraç uygulandı: {dyn_lev}x (bilimsel formül)")
     elif RISK_CONFIG.get("risk_guards_enabled", False):
-        dyn_lev = calculate_dynamic_leverage(atr_pct)
-        log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} → {dyn_lev}x")
+        dyn_lev = calculate_dynamic_leverage(atr_pct, drawdown=_dd_now,
+                                             stage_cap=_stage_cap)
+        log.info(f"  🧠 Dinamik kaldıraç: ATR=%{atr_pct*100:.2f} DD=%{_dd_now*100:.1f} "
+                 f"→ {dyn_lev}x (leverage_policy)")
     else:
         dyn_lev = LEVERAGE
 
@@ -1906,6 +1927,34 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if not _lev_ok:
         log.warning(f"  atlandı: kaldıraç güvenli değil ({_lev_detail})")
         return False
+
+    # FAZ11 Katman 4: 12 adımlı uçuş öncesi kontrol (yalnız canlı; compare dokunulmaz).
+    if not HB_OFFLINE and _live_cfg().is_live:
+        from types import SimpleNamespace as _NS
+        _pf = preflight.pre_flight_check(
+            cfg=_live_cfg(),
+            hb_offline=0,
+            account=lambda: binance.account(),
+            exchange_info=lambda: binance.exchange_info(),
+            symbol=symbol,
+            filters=filt,
+            quality=coin,
+            leverage=dyn_lev,
+            sl_pct=sl_pct,
+            size=_NS(ok=target_notional is not None,
+                     reason=f"notional={target_notional}"),
+            geometry=_geo,
+            risk=(target_notional, "approved"),
+            exposure={"open_positions": len(_cur),
+                      "max_positions": _effective_max_positions(),
+                      "margin_usage": float(getattr(risk, "margin_usage", 0.0) or 0.0),
+                      "margin_limit": 0.4},
+            edge=(_edge_ok, _edge_reason),
+        )
+        if not _pf.ok:
+            log.warning(f"  atlandı: preflight {_pf.failed_at} ({_pf.reason})")
+            return False
+        log.info(f"  ✅ preflight 12/12 adım geçti")
 
     lr = binance.set_leverage(symbol, dyn_lev)
     if isinstance(lr, dict) and "leverage" in lr:
@@ -2364,7 +2413,7 @@ def main():
     )
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
-    ap.add_argument("--interval", type=int, default=900)
+    ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
     if a.loop:

@@ -20,10 +20,10 @@ FUTURES_TESTNET = "https://testnet.binancefuture.com"
 # stage it declares. Stage 4 is the only one that reaches the full 2500 USDT book, and it needs an explicit operator
 # confirmation flag on top of the stage number.
 STAGE_CAPS = {
-    1: {"capital_usdt": 0.0, "max_notional": 25.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
-    2: {"capital_usdt": 100.0, "max_notional": 25.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
-    3: {"capital_usdt": 500.0, "max_notional": 60.0, "daily_loss": 50.0, "leverage": 3, "max_positions": 3},
-    4: {"capital_usdt": 2500.0, "max_notional": 150.0, "daily_loss": 150.0, "leverage": 5, "max_positions": 4},
+    1: {"capital_usdt": 0.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
+    2: {"capital_usdt": 100.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
+    3: {"capital_usdt": 500.0, "max_notional": 400.0, "daily_loss": 50.0, "leverage": 3, "max_positions": 3},
+    4: {"capital_usdt": 2500.0, "max_notional": 840.0, "daily_loss": 150.0, "leverage": 5, "max_positions": 4},
 }
 
 # Deterministic winner rule, fixed before looking at the data so the answer cannot be fitted to it.

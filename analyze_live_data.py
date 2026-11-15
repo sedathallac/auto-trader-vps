@@ -337,12 +337,38 @@ def run(whale_db, signal_db, getter, *, cache_dir=None, now_ms=None, sleeper=tim
                           min_p_real=kw.get("min_p_real", 0.65), n_perm=kw.get("n_perm", 2000),
                           horizon=kw.get("horizon", 8))
     s["persist_bars"] = persist_bars_analysis(srows, cost=kw.get("cost", DEFAULT_COST))
+    s["benchmark"] = benchmark_summary(srows, cost=kw.get("cost", DEFAULT_COST))
     s["real_filter"] = ("real_only=True: tautolojik filtre ACIK, sonuc performans kaniti degil"
                         if kw.get("real_only", False) else
                         "real filtresi KULLANILMADI; kazanc olcutu fwd_ret > cost")
     verdict, text = overall(w, s)
     return {"verdict": verdict, "decision": text, "whale": w, "whale_pwin_posterior": pw,
             "strategy": s}, pw
+
+
+def benchmark_summary(rows, *, cost=DEFAULT_COST, periods_per_year=365):
+    """FAZ11 Katman 5: getiri serisi + kalibrasyon doğruluğu tek blokta.
+
+    Getiri serisi: çözülmüş satırların maliyet sonrası fwd_ret'i (bileşik equity).
+    Doğruluk: `strength` olasılık vekili, gerçek = fwd_ret > cost. Brier/ECE/log-loss
+    modelin "kazanç" tahmininin gerçekle ne kadar örtüştüğünü ölçer.
+    """
+    import benchmark
+    resolved = [r for r in rows if r.get("fwd_ret") is not None]
+    rets = [float(r["fwd_ret"]) - cost for r in resolved]
+    eq = benchmark.benchmark_equity(rets, periods_per_year=periods_per_year)
+    probs, outs = [], []
+    for r in resolved:
+        s = r.get("strength")
+        if s is None:
+            continue
+        probs.append(min(1.0, max(0.0, float(s))))
+        outs.append(float(r["fwd_ret"]) > cost)
+    acc = benchmark.accuracy_report(probs, outs)
+    base = (sum(outs) / len(outs)) if outs else 0.0
+    return {"equity": eq.as_dict(), "accuracy": acc.as_dict(),
+            "skill": benchmark.skill_score(acc.brier, base),
+            "baseline": benchmark.compare_to_baseline(rets).as_dict()}
 
 
 def render(rep):
@@ -370,6 +396,16 @@ def render(rep):
             L.append(f"  {name}: {d['reason']}")
         if d.get("checks"):
             L.append(f"  {name} ölçütler: {d['checks']}")
+    bm = s.get("benchmark")
+    if bm:
+        eq, acc = bm["equity"], bm["accuracy"]
+        L.append(f"  BENCHMARK n={eq['n']} total={f(eq['total_return'], 5)} "
+                 f"MDD={f(eq['max_drawdown'], 4)} Sharpe={f(eq['sharpe'], 2)} "
+                 f"Sortino={f(eq['sortino'], 2)} Calmar={f(eq['calmar'], 2)} "
+                 f"win={f(eq['win_rate'], 3)}")
+        L.append(f"  DOĞRULUK n={acc['n']} hit={f(acc['hit_rate'], 3)} "
+                 f"Brier={f(acc['brier'], 4)} logloss={f(acc['log_loss'], 4)} "
+                 f"ECE={f(acc['ece'], 4)} skill={f(bm['skill'], 4)}")
     return "\n".join(L)
 
 
