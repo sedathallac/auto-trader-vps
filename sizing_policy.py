@@ -27,6 +27,8 @@ SIZING_DEFAULTS = {
     "slippage_pct_round_trip": 0.0004,
     "min_notional": 5.5,
     "max_notional": 25.0,
+    "max_position_pct": 20.0,   # FAZ14: equity yuzdesi tavani (0 = tavan yok)
+    "max_leverage": 5,          # FAZ14: kaldiracli marjin tavani
     "min_net_reward_risk": 1.20,
     "quality_floor": 0.55,
     "sl_atr_mult": 1.5,
@@ -105,9 +107,26 @@ def size_position(balance, sl_pct, *, quality=None, funding_bps=0.0, kelly_fract
         caps.append("quality")
 
     max_n = float(_cfg(c, "max_notional"))
-    if notional > max_n:
+    if max_n > 0 and notional > max_n:
         notional = max_n
         caps.append("max_notional")
+
+    # FAZ14: equity yüzdesi tavanı. Sabit USDT tavanı yerine ölçeklenen matematik:
+    # hesap büyüdükçe boyut da büyür, küçüldükçe küçülür. 0/None = tavan yok.
+    pct = _cfg(c, "max_position_pct")
+    if pct:
+        pct_cap = float(balance) * float(pct) / 100.0
+        if pct_cap > 0 and notional > pct_cap:
+            notional = pct_cap
+            caps.append("max_position_pct")
+
+    # Kaldıraçlı marjin tavanı: notional equity×leverage'ı aşamaz (tasfiye güvenliği).
+    lev = float(_cfg(c, "max_leverage"))
+    if lev > 0:
+        lev_cap = float(balance) * lev
+        if notional > lev_cap:
+            notional = lev_cap
+            caps.append("leverage_cap")
 
     min_n = float(_cfg(c, "min_notional"))
     if notional < min_n:
