@@ -2390,9 +2390,7 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
             try:
                 _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
                                          float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
-                                         binance.filters(symbol), risk, coordinator, reserver,
-                                         ctx.get("res_id"), int(ctx.get("dyn_lev") or 1),
-                                         float(ctx.get("target_notional") or 0), None, eid)
+                                         binance.filters(symbol), risk, coordinator, eid)
                 out["filled" if _fin_ok else "failed"] += 1
             except Exception as e:
                 log.error(f"  finalize hatası ({symbol}): {e}")
@@ -2412,9 +2410,7 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
                 try:
                     _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
                                              float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
-                                             binance.filters(symbol), risk, coordinator, reserver,
-                                             ctx.get("res_id"), int(ctx.get("dyn_lev") or 1),
-                                             float(ctx.get("target_notional") or 0), None, eid)
+                                             binance.filters(symbol), risk, coordinator, eid)
                     out["adopted" if _fin_ok else "failed"] += 1
                 except Exception as e:
                     log.error(f"  benimseme finalize hatası ({symbol}): {e}")
@@ -2437,8 +2433,7 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
 
 
 def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, filt,
-                   risk, coordinator, reserver, _res_id, dyn_lev, target_notional,
-                   coin, eid):
+                   risk, coordinator, eid):
     """Dolum onaylandıktan (veya pozisyon benimsendikten) sonraki SL/kayıt yolu.
 
     FAZ14p: open_coin'in bloklamayan gövdesinden çıkarıldı; hem ilk tick'te dolan
@@ -2758,8 +2753,13 @@ def run_once(dry_run=False):
         try:
             active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
         except Exception as e:
-            log.error(f"aktif executor sayısı alınamadı, pozisyon limiti kontrolü ATLANDI: {e}")
-            active = set()
+            # FAZ14u: FAIL-CLOSED. Eski kod burada active=set() yapıp devam ediyordu;
+            # HB'ye ulaşılamadığında pozisyon limiti "0/5" görünüp yeni emir açılıyordu
+            # (canlı: 22:40:21 RemoteDisconnected -> limit kontrolü ATLANDI). Executor
+            # sayısı bilinmiyorsa yeni giriş yok.
+            log.critical(f"🚨 aktif executor sayısı alınamadı — pozisyon limiti "
+                         f"doğrulanamıyor, yeni giriş fail-closed engellendi: {e}")
+            return
     if not HB_OFFLINE and len(active) >= _effective_max_positions():
         log.info(f"Maks pozisyon limiti ({_effective_max_positions()}) dolu → yeni açmıyorum")
         return
@@ -2777,7 +2777,11 @@ def run_once(dry_run=False):
             log.critical(f"🚨 Sistem DURDU: {risk.halt_reason}")
             return
     except Exception as e:
-        log.warning(f"Risk kontrol hatası: {e}")
+        # FAZ14u: FAIL-CLOSED. Eski kod yalnız uyarı basıp devam ediyordu; equity/DD/halt
+        # durumu okunamazken yeni emir açılabiliyordu. Risk durumu doğrulanamıyorsa
+        # yeni giriş yok (açık pozisyonların SL koruması yukarıda zaten çalıştı).
+        log.critical(f"🚨 Risk kontrolü yapılamadı — yeni giriş fail-closed engellendi: {e}")
+        return
     bl = load_blacklist()
     log.info(f"Aktif: {sorted(active) if active else 'yok'}")
     log.info(f"Blacklist: {sorted(bl.keys())}")

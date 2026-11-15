@@ -48,6 +48,15 @@ class FakeBinance:
     def get_available_balance(self, asset):
         return 1000.0
 
+    # FAZ14u: run_once artık risk kontrolü başarısızsa fail-closed dönüyor; bu yüzden
+    # sınır fake'i gerçek API yüzeyini (bakiye + positionRisk) sağlamak zorunda.
+    def get_balance(self, asset="USDT"):
+        return 1000.0
+
+    def position_risk(self):
+        return [{"symbol": "SOLUSDT", "positionAmt": str(self.amt),
+                 "entryPrice": self.entry, "unRealizedProfit": "0"}]
+
     def set_leverage(self, symbol, lev):
         return {"leverage": lev}
 
@@ -228,6 +237,9 @@ class TestRunOnceWiresCoordinator(LiveWiringBase):
         fake_risk.db_file = self.db          # temp db, NOT the real home ledger
         fake_risk.is_halted = False
         fake_risk.state = {}
+        # FAZ14u: run_once equity/DD logluyor; MagicMock formatlanamaz -> sayısal değerler.
+        fake_risk.current_drawdown = 0.0
+        fake_risk.peak_equity = 1000.0
 
         class _HB:
             def active_executors(self):
