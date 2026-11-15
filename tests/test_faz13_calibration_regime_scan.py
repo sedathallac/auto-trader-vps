@@ -185,7 +185,7 @@ def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
     monkeypatch.setattr(auto_trader, "_live_regime_gate", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(auto_trader, "_live_edge_gate", lambda *a, **k: (True, "shadow"))
     monkeypatch.setattr(auto_trader, "_live_cfg", lambda: type("C", (), {
-        "is_live": True, "leverage": 2, "max_open_positions": 2, "stage": 1, "testnet": True,
+        "is_live": True, "leverage": 2, "max_leverage": 5, "max_open_positions": 5, "stage": 1, "testnet": True,
         "strategy_family": "", "max_notional": 200.0, "daily_loss_limit": 20.0,
         "base_url": "https://testnet.binancefuture.com", "risk_overrides": lambda self=None: {}})())
     monkeypatch.setattr(auto_trader.preflight, "pre_flight_check",

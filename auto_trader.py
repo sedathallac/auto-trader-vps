@@ -108,7 +108,7 @@ RISK_CONFIG = {
     "max_drawdown_pct": 0.20,
     "max_total_margin_pct": 0.40,
     "max_consecutive_losses": 3,
-    "max_trades_per_day": 20,
+    "max_trades_per_day": 10000,  # FAZ14: gunluk islem SAYISI sinirsiz; tek sinir zarar limiti
     "risk_per_trade_pct": 0.015,
     "kelly_fraction": 0.25,
     "fee_pct_round_trip": 0.0008,
@@ -123,6 +123,7 @@ RISK_CONFIG = {
     "max_leverage": 5,
     "min_notional": 5.5,
     "max_notional": 200.0,   # FAZ12: 25 USDT tavani kaldirildi; Asama 1 = 200 USDT (equity 2524, %0.5 risk / %1.5 SL)
+    "max_position_pct": 20.0,  # FAZ14: equity yuzdesi tavani (sabit USDT yerine olceklenen matematik)
     # ATR-bazlı dinamik SL/TP
     "atr_sl_multiplier": 1.5,
     "atr_tp_multiplier": 2.5,
@@ -1357,9 +1358,19 @@ def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
     Eski gövde `max(notional, min_notional)` ile kayıp bütçesini aşabiliyordu;
     `sizing_policy.size_position` bütçe minimumu karşılamıyorsa None döner.
     Dönen üçlü geriye uyumludur: (notional|None, risk_amount, effective_sl).
+
+    FAZ14: canlıda sabit USDT tavanı yerine equity yüzdesi (`LIVE_MAX_POSITION_PCT`)
+    uygulanır; kademe override'ları global RISK_CONFIG'i kirletmeden yerel kopyaya girer.
     """
     import sizing_policy
-    d = sizing_policy.size_position(balance_usdt, sl_pct + slippage_pct, cfg=RISK_CONFIG)
+    cfg = dict(RISK_CONFIG)
+    try:
+        _lc = _live_cfg()
+        if getattr(_lc, "is_live", False):
+            cfg.update(_lc.risk_overrides())
+    except Exception:
+        pass
+    d = sizing_policy.size_position(balance_usdt, sl_pct + slippage_pct, cfg=cfg)
     return d.notional, d.budget, d.effective_sl
 
 
@@ -1995,7 +2006,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
 
     # Dinamik kaldıraç (flag açıksa ATR-bazlı, kapalıysa sabit 3x)
     _dd_now = float(getattr(risk, "current_drawdown", 0.0) or 0.0)
-    _stage_cap = _live_cfg().leverage if _live_cfg().is_live else None
+    # FAZ14: kademe tavanı sabit LIVE_LEVERAGE değil, LIVE_MAX_LEVERAGE'dir. compute_leverage
+    # çıktısı kırpılmaz; yalnız borsa/kademe tavanına clamp edilir.
+    _lc_lev = _live_cfg()
+    _stage_cap = _lc_lev.max_leverage if _lc_lev.is_live else None
     if SCIENTIFIC_SIZING == "on" and _new_lev is not None:
         dyn_lev = max(1, int(round(_new_lev)))
         log.info(f"  🔬 Faz3 kaldıraç uygulandı: {dyn_lev}x (bilimsel formül)")
@@ -2006,6 +2020,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
                  f"→ {dyn_lev}x (leverage_policy)")
     else:
         dyn_lev = LEVERAGE
+    if not HB_OFFLINE:
+        log.info(f"[LIVE] leverage: {symbol} ATR=%{atr_pct*100:.2f} → {dyn_lev}x "
+                 f"(cap={_stage_cap if _stage_cap is not None else '-'})")
 
     # FAZ11 Katman 2: kaldıraç politikası — tasfiye tavanını aşan kaldıraçla emir açılmaz.
     _lev_ok, _lev_detail = leverage_policy.leverage_ok(dyn_lev, sl_pct)
@@ -2040,6 +2057,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             log.warning(f"  atlandı: preflight {_pf.failed_at} ({_pf.reason})")
             return False
         log.info(f"  ✅ preflight 12/12 adım geçti")
+        _pf_passed = len(_pf.steps) if getattr(_pf, "steps", None) else 12
+    else:
+        _pf_passed = 0
 
     lr = binance.set_leverage(symbol, dyn_lev)
     if isinstance(lr, dict) and "leverage" in lr:
@@ -2066,6 +2086,18 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         _res_id = _rr.reservation_id
         log.info(f"  🔒 slot rezerve (id={_res_id}, kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
 
+    # FAZ14: her emirde beş beynin kararı loglanır (denetim izi).
+    if not HB_OFFLINE:
+        _cq = coin.get("CQ")
+        log.info(f"[LIVE] coin_quality: {symbol} cq={'n/a' if _cq is None else f'{float(_cq):.3f}'} "
+                 f"vetoes={coin.get('quality_vetoes') or '-'}")
+        log.info(f"[LIVE] sizing: risk_budget={target_notional * (sl_pct + slippage_pct):.2f} "
+                 f"size_usdt={target_notional:.2f} "
+                 f"cap_pct={RISK_CONFIG.get('max_position_pct')}% equity={balance:.2f}")
+        log.info(f"[LIVE] preflight: {_pf_passed} adım geçti")
+        log.info(f"[LIVE] open {symbol} {'LONG' if side == 1 else 'SHORT'} qty={amount} "
+                 f"notional={target_notional:.2f} entry={coin.get('lastPrice')} "
+                 f"sl={sl_pct:.4f} tp={tp_pct:.4f} lev={dyn_lev}")
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
@@ -2289,8 +2321,10 @@ def run_once(dry_run=False):
         _risk_cfg.update(_cfg.risk_overrides())
         _max_positions = _cfg.max_open_positions
         log.info(f"🔴 LIVE stage={_cfg.stage} testnet={_cfg.testnet} family={_cfg.strategy_family} "
-                 f"max_notional={_cfg.max_notional} daily_loss={_cfg.daily_loss_limit} "
-                 f"lev={_cfg.leverage} max_pos={_max_positions} base={_cfg.base_url}")
+                 f"max_position_pct={_cfg.max_position_pct}% daily_loss_pct={_cfg.daily_loss_pct}% "
+                 f"max_lev={_cfg.max_leverage} max_pos={_max_positions} base={_cfg.base_url}")
+        log.info(f"[LIVE] daily_loss_limit={_cfg.daily_loss_pct:.2f}% of day-start equity "
+                 f"(equity {_cfg.max_position_pct:.0f}% per position, no daily trade count limit)")
     risk = RiskEngine(_risk_cfg)
     reserver = PositionReserver(risk.db_file, _max_positions)
     try:

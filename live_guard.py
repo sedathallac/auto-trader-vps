@@ -20,10 +20,10 @@ FUTURES_TESTNET = "https://testnet.binancefuture.com"
 # stage it declares. Stage 4 is the only one that reaches the full 2500 USDT book, and it needs an explicit operator
 # confirmation flag on top of the stage number.
 STAGE_CAPS = {
-    1: {"capital_usdt": 0.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
-    2: {"capital_usdt": 100.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 2, "max_positions": 2},
-    3: {"capital_usdt": 500.0, "max_notional": 400.0, "daily_loss": 50.0, "leverage": 3, "max_positions": 3},
-    4: {"capital_usdt": 2500.0, "max_notional": 840.0, "daily_loss": 150.0, "leverage": 5, "max_positions": 4},
+    1: {"capital_usdt": 0.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 5, "max_positions": 2},
+    2: {"capital_usdt": 100.0, "max_notional": 200.0, "daily_loss": 20.0, "leverage": 5, "max_positions": 5},
+    3: {"capital_usdt": 500.0, "max_notional": 400.0, "daily_loss": 50.0, "leverage": 5, "max_positions": 5},
+    4: {"capital_usdt": 2500.0, "max_notional": 840.0, "daily_loss": 150.0, "leverage": 5, "max_positions": 5},
 }
 
 # Deterministic winner rule, fixed before looking at the data so the answer cannot be fitted to it.
@@ -91,6 +91,10 @@ class LiveConfig:
     allow_unproven_family: bool
     base_url: str
     stage_confirmed: bool = False
+    # FAZ14: sabit USDT tavanları yerine equity yüzdeleri. 0 = tavan yok.
+    max_position_pct: float = 20.0
+    daily_loss_pct: float = 2.0
+    max_leverage: int = 5
     notes: list = field(default_factory=list)
 
     @property
@@ -131,6 +135,9 @@ class LiveConfig:
             allow_unproven_family=_env_bool(env, "LIVE_ALLOW_UNPROVEN_FAMILY", False),
             base_url=base.rstrip("/"),
             stage_confirmed=_env_bool(env, "LIVE_STAGE_CONFIRMED", False),
+            max_position_pct=_env_float(env, "LIVE_MAX_POSITION_PCT", 20.0),
+            daily_loss_pct=_env_float(env, "LIVE_DAILY_LOSS_PCT", 2.0),
+            max_leverage=_env_int(env, "LIVE_MAX_LEVERAGE", caps["leverage"]),
         )
 
     def validate(self) -> "LiveConfig":
@@ -150,19 +157,26 @@ class LiveConfig:
             raise LiveConfigError(f"stage {self.stage} is mainnet: BINANCE_TESTNET must be 0")
         if self.stage >= 2 and not self.stage_confirmed:
             raise LiveConfigError(f"stage {self.stage} needs LIVE_STAGE_CONFIRMED=1 (operator sign-off)")
-        if self.max_notional > caps["max_notional"]:
+        if self.max_notional > 0 and self.max_notional > caps["max_notional"]:
             raise LiveConfigError(
                 f"LIVE_MAX_NOTIONAL_USDT={self.max_notional} exceeds stage {self.stage} cap {caps['max_notional']}")
-        if self.daily_loss_limit > caps["daily_loss"]:
+        if self.daily_loss_limit > 0 and self.daily_loss_limit > caps["daily_loss"]:
             raise LiveConfigError(
                 f"LIVE_DAILY_LOSS_LIMIT_USDT={self.daily_loss_limit} exceeds stage {self.stage} cap {caps['daily_loss']}")
         if self.leverage > caps["leverage"]:
             raise LiveConfigError(f"LIVE_LEVERAGE={self.leverage} exceeds stage {self.stage} cap {caps['leverage']}")
+        if self.max_leverage > caps["leverage"]:
+            raise LiveConfigError(
+                f"LIVE_MAX_LEVERAGE={self.max_leverage} exceeds stage {self.stage} cap {caps['leverage']}")
         if self.max_open_positions > caps["max_positions"]:
             raise LiveConfigError(
                 f"LIVE_MAX_OPEN_POSITIONS={self.max_open_positions} exceeds stage {self.stage} cap "
                 f"{caps['max_positions']}")
-        if self.max_notional <= 0 or self.daily_loss_limit <= 0 or self.leverage < 1 or self.max_open_positions < 1:
+        if not (0 < self.max_position_pct <= 100):
+            raise LiveConfigError(f"LIVE_MAX_POSITION_PCT must be in (0, 100], got {self.max_position_pct}")
+        if not (0 < self.daily_loss_pct <= 100):
+            raise LiveConfigError(f"LIVE_DAILY_LOSS_PCT must be in (0, 100], got {self.daily_loss_pct}")
+        if self.leverage < 1 or self.max_open_positions < 1:
             raise LiveConfigError("live limits must be positive")
         if not self.strategy_family and not self.winning_regimes:
             raise LiveConfigError(
@@ -178,14 +192,24 @@ class LiveConfig:
         return self
 
     def risk_overrides(self) -> dict:
-        """The RiskEngine keys this stage pins. Everything else keeps the shared RISK_CONFIG value."""
-        return {
-            "max_notional": self.max_notional,
-            "min_notional": min(5.5, self.max_notional),
-            "max_leverage": self.leverage,
+        """The RiskEngine keys this stage pins. Everything else keeps the shared RISK_CONFIG value.
+
+        FAZ14: sabit USDT tavanları yerine equity yüzdeleri. `max_notional`/`max_daily_loss_usdt`
+        yalnız operatör açıkça sabit bir tavan verdiyse döner; verilmediyse (0) RiskEngine
+        yüzde tavanlarını kullanır.
+        """
+        out = {
+            "max_position_pct": self.max_position_pct,
+            "max_daily_loss_pct": self.daily_loss_pct / 100.0,
+            "max_leverage": self.max_leverage,
             "min_leverage": 1,
-            "max_daily_loss_usdt": self.daily_loss_limit,
         }
+        if self.max_notional > 0:
+            out["max_notional"] = self.max_notional
+            out["min_notional"] = min(5.5, self.max_notional)
+        if self.daily_loss_limit > 0:
+            out["max_daily_loss_usdt"] = self.daily_loss_limit
+        return out
 
 
 def family_stats(db_path, min_sample=MIN_SAMPLE):

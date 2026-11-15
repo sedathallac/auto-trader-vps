@@ -197,10 +197,12 @@ class RiskEngine:
         if self.day_start_equity > 0:
             day_loss = (self.day_start_equity - current_equity) / self.day_start_equity
             limit = float(self.cfg.get("max_daily_loss_pct", 0.05))
+            # FAZ14: limit equity yuzdesidir; USDT karsiligi gun basi equity'den turetilir.
+            _limit_usdt = self.day_start_equity * limit
             if day_loss >= limit and not self.is_halted:
                 self.is_halted = True
                 self.halt_reason = (f"daily_loss_pct %{day_loss*100:.2f} "
-                                    f"(limit %{limit*100:.0f}%)")
+                                    f"(limit %{limit*100:.0f}% = {_limit_usdt:.2f} USDT)")
                 log.critical(f"🚨 GÜNLÜK EQUITY KESİCİ: {self.halt_reason}")
         if self.current_drawdown >= self.cfg["max_drawdown_pct"] and not self.is_halted:
             self.is_halted = True

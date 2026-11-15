@@ -137,7 +137,7 @@ class PreflightWiringTest(unittest.TestCase):
         auto_trader._live_regime_gate = lambda *a, **k: (True, "ok")
         auto_trader._live_edge_gate = lambda *a, **k: (True, "shadow")
         auto_trader._live_cfg = lambda: type("C", (), {
-            "is_live": True, "leverage": 2, "max_open_positions": 2,
+            "is_live": True, "leverage": 2, "max_leverage": 5, "max_open_positions": 5,
             "stage": 1, "testnet": True, "strategy_family": "",
             "max_notional": 200.0, "daily_loss_limit": 20.0,
             "base_url": "https://testnet.binancefuture.com",

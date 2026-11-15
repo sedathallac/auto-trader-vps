@@ -220,7 +220,9 @@ class LeverageCapTest(unittest.TestCase):
             cfg(LIVE_LEVERAGE=10)
 
     def test_the_stage_cap_reaches_the_risk_engine(self):
-        self.assertEqual(cfg(LIVE_LEVERAGE=2).risk_overrides()["max_leverage"], 2)
+        # FAZ14: kademe tavani artik LIVE_MAX_LEVERAGE'dir; LIVE_LEVERAGE sabit kirpma yapmaz.
+        self.assertEqual(cfg(LIVE_MAX_LEVERAGE=5).risk_overrides()["max_leverage"], 5)
+        self.assertEqual(cfg(LIVE_MAX_LEVERAGE=3).risk_overrides()["max_leverage"], 3)
 
     def test_stage_4_allows_five(self):
         c = cfg(BINANCE_TESTNET=0, LIVE_STAGE=4, LIVE_STAGE_CONFIRMED=1, LIVE_LEVERAGE=5,
