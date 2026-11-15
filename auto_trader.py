@@ -648,6 +648,8 @@ def reconcile_positions(binance, hb):
         if not isinstance(exchange_positions, list):
             log.error(f"positionRisk alınamadı: {exchange_positions}")
             return False
+        from close_adapter import (BinanceHBCloseAdapter,
+                                   SL_PRESENT, SL_UNKNOWN)
         open_exchange_pos = {
             p["symbol"]: float(p["positionAmt"])
             for p in exchange_positions
@@ -673,7 +675,31 @@ def reconcile_positions(binance, hb):
 
         drift = False
         for sym in orphaned_on_exchange:
-            log.critical(f"🚨 DRIFT: Borsada {sym} var ({open_exchange_pos[sym]}), HB'de executor yok")
+            # FAZ14r: borsada pozisyon var ama HB executor yok. Bu HER ZAMAN drift
+            # değildir: executor ömrü bitmiş/yeniden başlatılmış olabilir ve pozisyon
+            # borsadaki algo SL ile tam korunuyor olabilir. Eski kod bunu koşulsuz
+            # drift sayıp TÜM yeni girişleri kilitliyordu (canlı: restart sonrası
+            # NEAR/WLD/BNB -> "DRIFT! Bu döngüde yeni işlem açılmayacak", sonsuza dek).
+            # Artık karar SL durumuna bağlı: PRESENT -> BENİMSENDİ (drift değil),
+            # ABSENT/UNKNOWN -> drift (fail-closed; ensure_sl_coverage aynı tick'te
+            # SL yerleştirir, sonraki tick'te benimsenir).
+            _amt = open_exchange_pos[sym]
+            _side = "LONG" if _amt > 0 else "SHORT"
+            _st = SL_UNKNOWN
+            try:
+                _ok_mode, _mode = _verify_oneway(binance)
+                if _mode != "UNKNOWN":
+                    _st = BinanceHBCloseAdapter(binance, None).sl_status(
+                        sym, _side, mode=_mode, position_amt=abs(_amt))
+            except Exception as e:
+                log.warning(f"  drift SL sorgusu hatası ({sym}): {e}")
+                _st = SL_UNKNOWN
+            if _st == SL_PRESENT:
+                log.warning(f"♻️  BENİMSENDİ: borsada {sym} var ({_amt}), HB executor yok "
+                            f"ama algo SL TAM koruyor — drift sayılmadı")
+                continue
+            log.critical(f"🚨 DRIFT: Borsada {sym} var ({_amt}), HB'de executor yok "
+                         f"(SL={_st})")
             drift = True
         for sym in orphaned_on_hb:
             log.critical(f"🚨 DRIFT: HB'de {sym} executor var, borsada pozisyon yok")
