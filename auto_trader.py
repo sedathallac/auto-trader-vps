@@ -83,6 +83,7 @@ try:
 except ValueError:
     TOP_N_COMPARE = 20
 MAX_OPEN_POSITIONS = max(0, int(os.getenv("MAX_OPEN_POSITIONS", "0")))  # 0 = EMERGENCY (yeni giris durdu)
+_HB_AUTH_BROKEN = False  # FAZ14f: Hummingbot kimlik hatasi sonrasi surecte yeni emir denenmez
 
 
 def _effective_max_positions():
@@ -1409,6 +1410,24 @@ def _exchange_open_symbols(binance):
     return out
 
 
+def _is_hb_auth_error(create_result) -> bool:
+    """Hummingbot kimlik/konfig hatası mı? (401/403 veya 'Incorrect username or password')
+
+    FAZ14f: bu hata sembolün özelliği değildir. Sembolü karalisteye yazmak, kimlik
+    düzeltildiğinde bile o sembolün TTL boyunca işlem görmemesine yol açıyordu.
+    """
+    if not isinstance(create_result, dict):
+        return False
+    detail = str(create_result.get("detail") or create_result.get("error") or "").lower()
+    if "incorrect username or password" in detail or "unauthorized" in detail:
+        return True
+    code = create_result.get("status_code") or create_result.get("status")
+    try:
+        return int(code) in (401, 403)
+    except (TypeError, ValueError):
+        return False
+
+
 def _reservation_should_keep(create_result) -> bool:
     """Fate of a slot reservation after create_executor returns.
 
@@ -2081,10 +2100,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             return False
         _rr = reserver.reserve(symbol, _eos)
         if not _rr.ok:
-            log.info(f"  🔒 rezervasyon reddetti: {_rr.reason} (kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
+            log.info(f"  🔒 rezervasyon reddetti: {_rr.reason} (kullanım={_rr.used}/{_effective_max_positions()})")
             return False
         _res_id = _rr.reservation_id
-        log.info(f"  🔒 slot rezerve (id={_res_id}, kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
+        log.info(f"  🔒 slot rezerve (id={_res_id}, kullanım={_rr.used}/{_effective_max_positions()})")
 
     # FAZ14: her emirde beş beynin kararı loglanır (denetim izi).
     if not HB_OFFLINE:
@@ -2107,6 +2126,13 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             else:
                 reserver.release(_res_id, reason="executor_not_created")
                 log.info(f"  🔓 rezervasyon serbest (id={_res_id}): executor oluşmadı")
+        # FAZ14f: kimlik/konfig hatası sembolün suçu değil — karalisteye YAZMA.
+        if _is_hb_auth_error(er):
+            global _HB_AUTH_BROKEN
+            _HB_AUTH_BROKEN = True
+            log.critical(f"  🚨 Hummingbot kimlik doğrulaması başarısız: {er} — sembol karalisteye "
+                         f"YAZILMADI; bu süreçte yeni emir denemesi durduruldu")
+            return False
         add_blacklist(symbol, f"executor: {er}")
         log.error(f"  executor açılamadı: {er}")
         return False
@@ -2333,10 +2359,19 @@ def run_once(dry_run=False):
         log.error(f"rezervasyon şeması init hatası: {e}")
     bk = os.environ.get("BINANCE_KEY")
     bs = os.environ.get("BINANCE_SECRET")
-    hu = os.environ.get("HB_USERNAME", "FURKAN")
-    hp = os.environ.get("HB_PASSWORD", "1973")
+    # FAZ14f: kimlik bilgileri env'den gelir; gömülü varsayılan YOK. Canlıda eksikse
+    # fail-closed (exit 1) — yanlış varsayılanla Hummingbot'a gidip 401 almak yerine
+    # hiç başlamamak doğrudur. HB_OFFLINE=1 iken HB API hiç çağrılmaz, boş olabilir.
+    hu = (os.environ.get("HB_USERNAME") or "").strip()
+    hp = (os.environ.get("HB_PASSWORD") or "").strip()
     if not bk or not bs:
         log.error("BINANCE_KEY/SECRET yok")
+        return
+    if not HB_OFFLINE and (not hu or not hp):
+        global _HB_AUTH_BROKEN
+        _HB_AUTH_BROKEN = True
+        log.critical("[LIVE] HB_USERNAME/HB_PASSWORD yok — Hummingbot API kimlik dogrulamasi "
+                     "yapilamaz, emir yolu kapatildi (fail-closed). Servis ayakta kalir, emir gitmez.")
         return
 
     binance = BinanceAPI(bk, bs, base=_cfg.base_url)
@@ -2422,6 +2457,10 @@ def run_once(dry_run=False):
                      "(açık pozisyonların borsa SL koruma denetimi çalıştı)")
         return
 
+    if _HB_AUTH_BROKEN:
+        log.warning("Hummingbot kimlik doğrulaması bozuk — bu süreçte yeni emir denenmiyor "
+                    "(live.env HB_USERNAME/HB_PASSWORD düzeltilip servis yeniden başlatılmalı)")
+        return
     if HB_OFFLINE:
         active = set()  # HB_OFFLINE: HB'siz; aktif executor yok sayılır (kalibrasyon modu)
     else:
@@ -2433,7 +2472,6 @@ def run_once(dry_run=False):
     if not HB_OFFLINE and len(active) >= _effective_max_positions():
         log.info(f"Maks pozisyon limiti ({_effective_max_positions()}) dolu → yeni açmıyorum")
         return
-
     try:
         eq = binance.get_balance("USDT")
         risk.update_equity(eq)

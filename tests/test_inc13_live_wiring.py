@@ -201,8 +201,12 @@ class TestRunOnceWiresCoordinator(LiveWiringBase):
             captured["coordinator"] = coordinator
             return False
         auto_trader.open_coin = spy
-        orig_env = {k: os.environ.get(k) for k in ("BINANCE_KEY", "BINANCE_SECRET")}
+        orig_env = {k: os.environ.get(k) for k in ("BINANCE_KEY", "BINANCE_SECRET",
+                                                   "HB_USERNAME", "HB_PASSWORD")}
         os.environ["BINANCE_KEY"] = "k"
+        os.environ["BINANCE_SECRET"] = "s"
+        os.environ["HB_USERNAME"] = "u"
+        os.environ["HB_PASSWORD"] = "p"
         os.environ["BINANCE_SECRET"] = "s"
 
         fake_risk = MagicMock()
