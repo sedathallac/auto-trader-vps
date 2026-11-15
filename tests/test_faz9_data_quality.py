@@ -45,6 +45,17 @@ class ResolvedAtTest(unittest.TestCase):
         self.assertIsNone(c.execute("SELECT resolved_at FROM signal_outcomes WHERE id=1").fetchone()[0])
         c.close()
 
+    def test_resolved_at_column_exists(self):
+        """PRAGMA table_info must list resolved_at after the migration."""
+        tmp = tempfile.mkdtemp()
+        db = os.path.join(tmp, "s.db")
+        make_old_db(db)
+        se.SignalStore(db)._conn().close()
+        c = sqlite3.connect(db)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(signal_outcomes)")]
+        c.close()
+        self.assertIn("resolved_at", cols, f"resolved_at missing after migration; columns={cols}")
+
     def test_the_migration_is_idempotent(self):
         tmp = tempfile.mkdtemp()
         db = os.path.join(tmp, "s.db")
@@ -90,6 +101,18 @@ class ResolverStampTest(unittest.TestCase):
         self.assertIsNotNone(row[1])
         self.assertTrue(row[1].endswith("Z"), row[1])
 
+    def test_resolver_sets_resolved_at(self):
+        """Every row the resolver closes must carry a UTC timestamp, not NULL."""
+        tmp = tempfile.mkdtemp()
+        store, db = self._store_with_pending(tmp)
+        cd = se.Candles(t=[1000, 1060, 1120], o=[100, 100, 100], h=[101, 102, 103],
+                        l=[99, 98, 97], c=[100, 101, 102], v=[1, 1, 1])
+        store.resolve_pending_detailed("BTCUSDT", cd, 0.0008)
+        c = sqlite3.connect(db)
+        n_null = c.execute("SELECT COUNT(*) FROM signal_outcomes WHERE resolved=1 AND resolved_at IS NULL").fetchone()[0]
+        c.close()
+        self.assertEqual(n_null, 0, f"{n_null} resolved rows have no resolved_at stamp")
+
     def test_an_unresolved_row_keeps_resolved_at_null(self):
         tmp = tempfile.mkdtemp()
         store, db = self._store_with_pending(tmp)
@@ -134,6 +157,25 @@ class RealFilterTest(unittest.TestCase):
         self.assertEqual(out["all"]["n"], 3)
         self.assertEqual(out["persistent"]["n"], 2)
         self.assertGreater(out["persistent"]["ev_pct"], out["all"]["ev_pct"])
+
+    def test_persist_bars_analysis_returns_ev(self):
+        """The comparison must expose an EV for both blocks, not just counts."""
+        db = self._db(tempfile.mkdtemp())
+        out = ald.persist_bars_analysis(ald.load_signal_rows(db))
+        self.assertIn("ev_pct", out["all"])
+        self.assertIn("ev_pct", out["persistent"])
+        self.assertIsNotNone(out["all"]["ev_pct"])
+        self.assertIsNotNone(out["persistent"]["ev_pct"])
+
+    def test_real_filter_not_used_in_performance_report(self):
+        """The report must not select on real=1: win is fwd_ret>cost and the note says so."""
+        db = self._db(tempfile.mkdtemp())
+        rep, _ = ald.run("/nonexistent/whale.db", db, None, n_perm=10)
+        s = rep["strategy"]
+        self.assertIn("real filtresi KULLANILMADI", s["real_filter"])
+        self.assertIn("fwd_ret > cost", s["win_definition"])
+        self.assertEqual(s["persist_bars"]["all"]["n"], 3,
+                         "report dropped rows that real=1 would have excluded")
 
     def test_the_report_states_that_real_was_not_used(self):
         db = self._db(tempfile.mkdtemp())

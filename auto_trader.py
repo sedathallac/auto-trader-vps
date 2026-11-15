@@ -1319,6 +1319,9 @@ def _live_family_gate(symbol, side):
         return False, f"live config error: {e}"
     if not cfg.is_live:
         return True, "not live: gate open"
+    if not cfg.strategy_family:
+        # Regime-only configuration: the regime gate decides, the family gate stays open.
+        return True, "no family filter: regime gate only"
     families = list((_LAST_CONFIRM.get("families") or {}).keys())
     if not families:
         return False, "no confirming family for this side"
@@ -1965,14 +1968,14 @@ def run_once(dry_run=False):
             import live_guard
             _sc = live_guard.startup_check(binance, _cfg)
             _startup_checked[0] = True
-            log.info(f"✅ live startup check: balance={_sc['balance_usdt']:.2f} USDT "
-                     f"symbols={_sc['symbols']} canTrade={_sc['can_trade']} testnet={_sc['testnet']}")
+            log.info(f"[LIVE] startup check ok equity={_sc['balance_usdt']:.2f} symbols={_sc['symbols']} "
+                     f"canTrade={_sc['can_trade']} testnet={_sc['testnet']}")
         except Exception as e:
-            log.critical(f"🚨 live startup check BAŞARISIZ, fail-closed (emir yok): {e}")
+            log.critical(f"[LIVE] startup check FAILED reason={e}")
             risk.is_halted = True
             risk.halt_reason = f"live startup check failed: {e}"
             risk._save_state()
-            return
+            raise SystemExit(1)
     if HB_OFFLINE:
         log.warning("🔌 HB_OFFLINE aktif — Hummingbot API atlanıyor; open_coin dry-run'a "
                     "zorlanacak (gerçek emir YOK). Kalibrasyon/log toplama modu.")

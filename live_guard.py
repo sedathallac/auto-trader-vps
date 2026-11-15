@@ -164,9 +164,13 @@ class LiveConfig:
                 f"{caps['max_positions']}")
         if self.max_notional <= 0 or self.daily_loss_limit <= 0 or self.leverage < 1 or self.max_open_positions < 1:
             raise LiveConfigError("live limits must be positive")
-        if not self.strategy_family:
+        if not self.strategy_family and not self.winning_regimes:
             raise LiveConfigError(
-                "LIVE_STRATEGY_FAMILY is empty: no family passed the winner rule, so no order may be sent")
+                "neither LIVE_STRATEGY_FAMILY nor LIVE_WINNING_REGIMES is set: no gate would stop an order")
+        if not self.strategy_family:
+            # Regime filter only. Allowed on purpose: the regime gate is the narrower of the two, and an empty family
+            # must not silently mean "every family".
+            self.notes.append("LIVE_STRATEGY_FAMILY empty: regime gate only")
         if self.allow_unproven_family and not self.testnet:
             raise LiveConfigError("LIVE_ALLOW_UNPROVEN_FAMILY is testnet-only")
         if self.testnet:
@@ -229,7 +233,8 @@ def family_gate(family, cfg: LiveConfig):
     if not cfg.is_live:
         return True, "not live: gate open"
     if not cfg.strategy_family:
-        return False, "no LIVE_STRATEGY_FAMILY configured"
+        # Regime-only configuration: the regime gate decides, the family gate stays open.
+        return True, "no family filter: regime gate only"
     if (family or "").strip().lower() != cfg.strategy_family:
         return False, f"family {family!r} is not the live family {cfg.strategy_family!r}"
     return True, "live family"

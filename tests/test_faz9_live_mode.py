@@ -92,6 +92,14 @@ class HbOfflineTest(unittest.TestCase):
         self.assertIn('test \\"$HB_OFFLINE\\" = 0', text)
         self.assertNotIn('test \\"$HB_OFFLINE\\" = 1', text)
 
+    def test_live_service_execstartpre_requires_hb_offline_0(self):
+        """The live unit must refuse to start when HB_OFFLINE is anything but 0."""
+        text = UNIT_LIVE.read_text()
+        pre = [ln for ln in text.splitlines() if ln.startswith("ExecStartPre=")]
+        self.assertEqual(len(pre), 1, f"expected exactly one ExecStartPre, got {pre}")
+        self.assertIn('test \\"$HB_OFFLINE\\" = 0', pre[0],
+                      f"live ExecStartPre does not require HB_OFFLINE=0: {pre[0]}")
+
 
 class TestnetUrlTest(unittest.TestCase):
     """test_live_uses_testnet_url_when_testnet_flag"""
@@ -125,9 +133,16 @@ class FamilyGateTest(unittest.TestCase):
         self.assertIn("not the live family", reason)
 
     def test_an_empty_family_refuses_every_order(self):
-        c = LiveConfig.from_env(env(LIVE_STRATEGY_FAMILY=""))
+        """Empty family AND empty regimes: nothing would gate an order, so the config is refused."""
+        c = LiveConfig.from_env(env(LIVE_STRATEGY_FAMILY="", LIVE_WINNING_REGIMES=""))
         with self.assertRaises(LiveConfigError):
             c.validate()
+
+    def test_an_empty_family_is_allowed_when_a_regime_set_exists(self):
+        c = cfg(LIVE_STRATEGY_FAMILY="")
+        self.assertTrue(c.is_live)
+        self.assertIn("regime gate only", " ".join(c.notes))
+        self.assertTrue(live_guard.family_gate("volume", c)[0])
 
     def test_compare_mode_keeps_the_gate_open(self):
         c = LiveConfig.from_env(env(LIVE_MODE=0)).validate()
@@ -234,6 +249,15 @@ class StateIsolationTest(unittest.TestCase):
         self.assertIn("HOME=/var/lib/auto_trader_faz9_live", live)
         self.assertNotIn("HOME=/var/lib/auto_trader_faz9\n", live)
 
+    def test_live_and_compare_use_different_home_dirs(self):
+        """State isolation: the live unit must never resolve HOME to the compare directory."""
+        compare_home = [ln for ln in (ROOT / "deploy" / "auto_trader_faz9.service").read_text().splitlines()
+                        if ln.startswith("Environment=HOME=")]
+        live_home = [ln for ln in UNIT_LIVE.read_text().splitlines() if ln.startswith("Environment=HOME=")]
+        self.assertEqual(compare_home, ["Environment=HOME=/var/lib/auto_trader_faz9"])
+        self.assertEqual(live_home, ["Environment=HOME=/var/lib/auto_trader_faz9_live"])
+        self.assertNotEqual(compare_home[0], live_home[0], "compare and live share a HOME directory")
+
     def test_the_two_units_use_different_env_files(self):
         compare = (ROOT / "deploy" / "auto_trader_faz9.service").read_text()
         live = UNIT_LIVE.read_text()
@@ -277,6 +301,22 @@ class RegimeGateTest(unittest.TestCase):
         e.pop("LIVE_WINNING_REGIMES")
         self.assertEqual(LiveConfig.from_env(e).winning_regimes, frozenset({"range", "mid"}))
 
+    def test_live_winning_regimes_default(self):
+        """Unset LIVE_WINNING_REGIMES must default to exactly {range, mid}, not to everything."""
+        e = env()
+        e.pop("LIVE_WINNING_REGIMES")
+        c = LiveConfig.from_env(e).validate()
+        self.assertEqual(c.winning_regimes, frozenset({"range", "mid"}),
+                         f"default winning regimes are {sorted(c.winning_regimes)}, expected ['mid', 'range']")
+
+    def test_live_refuses_trend_orders(self):
+        """A trend signal must be refused in live mode even when its family is the live family."""
+        c = cfg(LIVE_STRATEGY_FAMILY="")
+        self.assertTrue(live_guard.family_gate("exhaustion", c)[0])
+        ok, reason = live_guard.regime_gate("trend", c)
+        self.assertFalse(ok, "trend regime was allowed to place an order in live mode")
+        self.assertIn("not in winning set", reason)
+
     def test_the_set_is_parsed_case_and_space_insensitively(self):
         self.assertEqual(cfg(LIVE_WINNING_REGIMES=" Range , MID ").winning_regimes,
                          frozenset({"range", "mid"}))
@@ -292,6 +332,23 @@ class StartupCheckTest(unittest.TestCase):
     def test_a_zero_balance_refuses_the_start(self):
         with self.assertRaises(LiveConfigError):
             live_guard.startup_check(FakeClient(balance=0.0), cfg())
+
+    def test_startup_check_fail_closed(self):
+        """Any startup failure must raise, never return a usable result."""
+        for client in (FakeClient(balance=0.0), FakeClient(fail="account"), FakeClient(fail="info"),
+                       FakeClient(can_trade=False)):
+            with self.assertRaises(LiveConfigError):
+                live_guard.startup_check(client, cfg())
+
+    def test_account_error_refuses_start(self):
+        with self.assertRaises(LiveConfigError) as ctx:
+            live_guard.startup_check(FakeClient(fail="account"), cfg())
+        self.assertIn("account() failed", str(ctx.exception))
+
+    def test_exchange_info_error_refuses_start(self):
+        with self.assertRaises(LiveConfigError) as ctx:
+            live_guard.startup_check(FakeClient(fail="info"), cfg())
+        self.assertIn("exchangeInfo() failed", str(ctx.exception))
 
     def test_an_account_error_refuses_the_start(self):
         with self.assertRaises(LiveConfigError):
