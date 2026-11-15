@@ -395,6 +395,10 @@ def build_executor_config(symbol, amount, lev, side):
     values passed to create_executor are accepted for signature compatibility and
     ignored (never handed to HB as barriers).
     """
+    # Hummingbot PositionExecutorConfig yalnız 1 (LONG), 2 (SHORT), 3 (HEDGE) kabul eder.
+    # ±1 konvansiyonu sızarsa executor reddedilir; burada fail-closed durdurulur.
+    if side not in (1, 2, 3):
+        raise ValueError(f"invalid executor side={side!r}: Hummingbot expects 1, 2 or 3")
     return {
         "type": "position_executor",
         "connector_name": "binance_perpetual",
@@ -1903,12 +1907,18 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         if not _faz6_confirm(binance, symbol, side, sl_pct, STRATEGY_CONFIRMATION):
             return False
         # FAZ14: ters politika nihai yönü çevirdiyse emir de o yönde açılır.
+        # strategy_engine ±1 konvansiyonu kullanır (1=LONG, -1=SHORT); auto_trader ve
+        # Hummingbot ise 1=LONG, 2=SHORT bekler. Dönüştürmeden geçirilirse SHORT
+        # sinyaller HB'ye side=-1 olarak gider ve executor reddedilir
+        # ("Input should be 1, 2 or 3").
         _eff_side = _LAST_CONFIRM.get("effective_side")
-        if _eff_side in (1, -1) and _eff_side != side:
-            side = _eff_side
-            side_name = "LONG" if side == 1 else "SHORT"
-            log.info(f"  🔄 ters politika: yön {side_name} olarak uygulandı "
-                     f"(ters={list(_LAST_CONFIRM.get('reversed') or [])})")
+        if _eff_side in (1, -1):
+            _hb_side = 1 if _eff_side == 1 else 2
+            if _hb_side != side:
+                side = _hb_side
+                side_name = "LONG" if side == 1 else "SHORT"
+                log.info(f"  🔄 ters politika: yön {side_name} olarak uygulandı "
+                         f"(ters={list(_LAST_CONFIRM.get('reversed') or [])})")
 
     # FAZ9 live: yalnız kazanan aile emir verebilir. Compare/dry-run'da kapı açık; canlıda kapalı = sinyal
     # signal_outcomes'a yazıldı, emir yok.
