@@ -80,10 +80,15 @@ TIME_LIMIT_SEC = 14400  # 4 saat
 # drift. Artık varsayılan 300 saniye beklenir ve karar BORSA GERÇEĞİNE göre verilir.
 FILL_WAIT_S = float(os.getenv("LIVE_FILL_WAIT_S", "300") or 300)
 FILL_POLL_S = float(os.getenv("LIVE_FILL_POLL_S", "5") or 5)
+# FAZ14s: diskte kalan bir dolum kaydı, deadline'ı bu kadar geçtikten sonra bayat sayılır
+# ve yüklemede düşürülür (test artığı/ölü executor sonsuza dek "bekliyor" kalmasın).
+STALE_PENDING_GRACE_S = float(os.getenv("LIVE_STALE_PENDING_GRACE_S", "3600") or 3600)
 # FAZ14p: bekleyen dolumlar süreç belleğinde DEĞİL, diskte tutulur. Restart bekleme
 # penceresine denk gelirse rezervasyon/executor bağlamı kaybolmaz; ilk tick geri yükler.
-PENDING_FILLS_JSON = Path.home() / ".pending_fills.json"
+PENDING_FILLS_JSON = Path(os.getenv("PENDING_FILLS_JSON")
+                          or (Path.home() / ".pending_fills.json"))
 _PENDING_FILLS = {}
+_PENDING_LOADED = [False]   # FAZ14s: diskten yükleme süreç başına BİR kez
 # FAZ14q: arşiv DB'si sabit "/root/.trading_archive.db" idi; servis ProtectHome=yes ve
 # HOME=/var/lib/auto_trader_faz9_live ile çalıştığı için her açılışta
 # "archive_symbols register failed: unable to open database file" veriyordu (sessiz
@@ -2281,13 +2286,35 @@ def _persist_pending_fills():
 
 
 def _load_pending_fills():
-    """Diskteki bekleyen dolumları belleğe al (restart kurtarma)."""
+    """Diskteki bekleyen dolumları belleğe al (restart kurtarma).
+
+    FAZ14s: iki hata düzeltildi.
+    1) Her tick'te yeniden yükleniyordu: diskte kalan bir kayıt her tick'te
+       "♻️ 1 bekleyen dolum diskten geri yüklendi" logu üretip HB'ye boşa sorgu
+       atıyordu (canlı: 00:18-00:20 arası her tick). Artık süreç başına bir kez.
+    2) Bayat kayıt ayıklanmıyordu: deadline'ı saatler önce geçmiş bir kayıt
+       (test artığı) sonsuza dek "bekliyor" sayılıyordu. Artık deadline'ı
+       STALE_PENDING_GRACE_S'den fazla geçmiş kayıtlar yüklemede düşürülür.
+    """
     global _PENDING_FILLS
+    if _PENDING_LOADED[0]:
+        return _PENDING_FILLS
+    _PENDING_LOADED[0] = True
     try:
         if PENDING_FILLS_JSON.exists():
             raw = json.loads(PENDING_FILLS_JSON.read_text())
             if isinstance(raw, dict):
+                _now = time.time()
+                _stale = [k for k, v in raw.items()
+                          if float((v or {}).get("deadline") or 0)
+                          + STALE_PENDING_GRACE_S < _now]
+                for k in _stale:
+                    raw.pop(k, None)
                 _PENDING_FILLS = raw
+                if _stale:
+                    log.warning(f"  🧹 {len(_stale)} bayat bekleyen dolum düşürüldü "
+                                f"(deadline > {STALE_PENDING_GRACE_S:.0f}s geçmiş)")
+                    _persist_pending_fills()
                 if raw:
                     log.info(f"  ♻️  {len(raw)} bekleyen dolum diskten geri yüklendi")
     except Exception as e:
@@ -2326,6 +2353,15 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
         filled = float(ex.get("filled_amount_quote", 0) or 0) if ex else 0.0
         err = int(ex.get("error_count", 0) or 0) if ex else 999
         deadline = float(ctx.get("deadline") or 0)
+        # FAZ14s: executor HB'de ARTIK YOK (silinmiş/expire olmuş). Dolum bekleyemez;
+        # kayıt düşürülür. Eski kod err=999 ile "dolmadı" dalına girip sembolü
+        # karalisteye yazıyordu — ölü bir executor yüzünden sağlam sembol kapanıyordu.
+        if ex is None:
+            log.warning(f"  🧹 bekleyen dolum düşürüldü: {symbol} executor={eid} HB'de yok "
+                        f"(dolamaz; karalisteye YAZILMADI)")
+            _drop_pending_fill(eid)
+            out["cancelled"] += 1
+            continue
         if filled >= 1:
             log.info(f"  ✅ doldu: {filled:.2f} USDT ({symbol}, executor={eid})")
             _drop_pending_fill(eid)
