@@ -18,6 +18,7 @@ _retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500,502,503,504], 
 _session.mount("https://", HTTPAdapter(max_retries=_retry))
 _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
+import risk_engine as risk_engine_mod
 from position_reservation import PositionReserver
 import coin_quality
 import leverage_policy
@@ -91,6 +92,9 @@ STALE_PENDING_GRACE_S = float(os.getenv("LIVE_STALE_PENDING_GRACE_S", "3600") or
 # canlı durum dosyalarına YAZAMAZ (kanıt: VPS'te pytest çalıştırmak
 # /root/.pending_fills.json içine test artığı E1/SOLUSDT yazıyordu).
 STATE_DIR = Path(os.getenv("FAZ9_STATE_DIR") or Path.home())
+# FAZ16: TEK risk DB yolu. RiskEngine, sync_risk_engine, PositionReserver,
+# CloseIntentStore ve SlPlacementStore aynı çözülmüş mutlak yolu kullanır.
+RISK_DB_FILE = STATE_DIR / "risk_ledger.db"
 PENDING_FILLS_JSON = Path(os.getenv("PENDING_FILLS_JSON")
                           or (STATE_DIR / ".pending_fills.json"))
 _PENDING_FILLS = {}
@@ -326,6 +330,43 @@ def add_blacklist(symbol, reason):
     log.info(f"  [BLACKLIST] {symbol} ({reason})")
 
 
+class AccountSnapshot:
+    """FAZ16: tek Futures account snapshot — equity ve available AYRI.
+
+    `totalMarginBalance` = Futures EQUITY (risk/sizing tabanı).
+    `availableBalance`  = yeni emir için kullanılabilir marjin (equity DEĞİL).
+    Geçersiz/eksik/NaN alan → `valid()` False; çağıran yeni girişi kapatır.
+    """
+
+    __slots__ = ("equity", "available_balance", "can_trade", "raw")
+
+    def __init__(self, equity=None, available_balance=None, can_trade=None, raw=None):
+        self.equity = equity
+        self.available_balance = available_balance
+        self.can_trade = can_trade
+        self.raw = raw
+
+    def valid(self):
+        for name, v in (("equity", self.equity), ("available", self.available_balance)):
+            if v is None:
+                return False, f"{name} missing"
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return False, f"{name} not numeric"
+            if not math.isfinite(f) or f < 0:
+                return False, f"{name} invalid ({v!r})"
+        if float(self.equity) <= 0:
+            return False, f"equity non-positive ({self.equity!r})"
+        if self.can_trade is False:
+            return False, "canTrade=False"
+        return True, "ok"
+
+    def __repr__(self):
+        return (f"AccountSnapshot(equity={self.equity}, "
+                f"available={self.available_balance}, can_trade={self.can_trade})")
+
+
 class BinanceAPI:
     def __init__(self, key, secret, base=None):
         self.key = key
@@ -364,6 +405,26 @@ class BinanceAPI:
     def account(self):
         """GET /fapi/v2/account — the startup check reads balance and canTrade from here."""
         return self._get("/fapi/v2/account", signed=True)
+
+    def account_snapshot(self):
+        """FAZ16: tek snapshot — equity (totalMarginBalance) ve availableBalance ayrı.
+
+        Hata/eksik alan durumunda `AccountSnapshot` geçersiz alanlarla döner;
+        `valid()` False ise çağıran yeni girişi kapatır (fail-closed).
+        """
+        try:
+            r = self.account()
+        except Exception as e:
+            log.warning(f"account snapshot alınamadı: {e}")
+            return AccountSnapshot(raw={"error": str(e)})
+        if not isinstance(r, dict) or "code" in r:
+            return AccountSnapshot(raw=r)
+        return AccountSnapshot(
+            equity=r.get("totalMarginBalance"),
+            available_balance=r.get("availableBalance"),
+            can_trade=r.get("canTrade"),
+            raw=r,
+        )
 
     def tickers(self):
         return self._get("/fapi/v1/ticker/24hr")
@@ -645,89 +706,167 @@ def is_flat_confirmed(positions, symbol):
     return False  # symbol absent -> not confirmed flat
 
 
-def sync_risk_engine(risk, hb, binance=None):
-    """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY).
+def _hb_executors_all(hb, page_limit=200, max_pages=50):
+    """POST /executors/search — tüm sayfalar. Dönüş: (list|None, error|None).
 
-    K2: a TERMINATED executor's PnL is recorded ONLY after a current, successful
-    Binance positionRisk query confirms that symbol is flat (positionAmt == 0).
-    If positionRisk errors/timeouts, is stale/missing, or the position is not
-    zero (partial close), the close is NOT recorded — it stays UNKNOWN/open and a
-    CRITICAL alarm is raised (fail-closed)."""
+    FAZ16: HTTP status, JSON parse ve `data` tipi doğrulanır; eksik `data` boş liste
+    sayılmaz. Sayfalama desteklenmiyorsa (aynı kayıtlar dönüyorsa) döngü durur.
+    """
+    out, seen = [], set()
+    for page in range(max_pages):
+        try:
+            resp = requests.post(f"{HB_API}/executors/search",
+                                 json={"limit": page_limit, "offset": page * page_limit},
+                                 auth=hb.auth, timeout=15)
+        except Exception as e:
+            return None, f"request: {type(e).__name__}: {e}"
+        if getattr(resp, "status_code", 200) != 200:
+            return None, f"http {getattr(resp, 'status_code', '?')}"
+        try:
+            body = resp.json()
+        except Exception as e:
+            return None, f"json: {e}"
+        if not isinstance(body, dict):
+            return None, "response not an object"
+        data = body.get("data")
+        if not isinstance(data, list):
+            return None, "data missing/not a list"
+        new = 0
+        for e in data:
+            eid = e.get("executor_id") if isinstance(e, dict) else None
+            if eid is None:
+                out.append(e)
+                new += 1
+            elif eid not in seen:
+                seen.add(eid)
+                out.append(e)
+                new += 1
+        if len(data) < page_limit or new == 0:
+            return out, None
+    return None, "pagination limit exceeded"
+
+
+def sync_risk_engine(risk, hb, binance=None):
+    """C3/FAZ16: kapanmış executor PnL'lerini SQLite ledger'a senkronize et.
+
+    Doğruluk kaynağı `trade_ledger.executor_id`'dir; watermark tek başına kayıt
+    atlama mekanizması DEĞİLDİR. Ledger'da olmayan her TERMINATED executor her
+    turda yeniden denenir. Flat teyidi (K2) korunur: positionRisk geçerli liste
+    değilse veya pozisyon sıfır değilse PnL YAZILMAZ.
+    """
     if HB_OFFLINE:
         log.info("🔌 HB_OFFLINE: sync_risk_engine atlandı (HB API'ye gidilmedi)")
         return
-    import sqlite3 as _sq
-    from datetime import timezone as _tz
-
-    db_path = STATE_DIR / "risk_ledger.db"
-
+    db_path = Path(getattr(risk, "db_file", None) or (STATE_DIR / "risk_ledger.db"))
     try:
-        with _sq.connect(str(db_path), timeout=10) as conn:
-            meta = conn.execute("SELECT last_close_ts FROM sync_meta WHERE id=1").fetchone()
-            last_ts = float(meta[0]) if meta else 0.0
-            reported_ids = {r[0] for r in conn.execute("SELECT executor_id FROM trade_ledger")}
+        conn = risk_engine_mod.connect_rw(db_path)
     except Exception as e:
+        _entry_health_set("sync", f"db: {e}")
+        log.critical(f"🚨 C3: sync DB açılamadı, fail-closed: {e}")
+        return
+    try:
+        risk_engine_mod.bootstrap_sync_meta(conn)
+        meta = conn.execute("SELECT last_close_ts FROM sync_meta WHERE id=1").fetchone()
+        last_ts = float(meta[0]) if meta else 0.0
+        reported_ids = {r[0] for r in conn.execute("SELECT executor_id FROM trade_ledger")}
+    except Exception as e:
+        conn.close()
+        _entry_health_set("sync", f"meta: {e}")
         log.critical(f"🚨 C3: sync_meta/ledger okunamadi, fail-closed: {e}")
         return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    all_execs, err = _hb_executors_all(hb)
+    if all_execs is None:
+        _entry_health_set("sync", f"executors: {err}")
+        log.critical(f"🚨 C3: executor geçmişi alınamadı ({err}) — yeni giriş kapalı")
+        return
+    terminated = [e for e in all_execs
+                  if isinstance(e, dict) and e.get("status") == "TERMINATED"]
+    terminated.sort(key=lambda e: float(e.get("close_timestamp") or 0))
+    log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, "
+             f"{len(reported_ids)} in ledger")
+
+    try:
+        _positions = binance.position_risk() if binance is not None else None
+    except Exception as _pe:
+        _positions = None
+        log.warning(f"  K2: positionRisk alınamadı (flat teyidi yok): {_pe}")
+    if not isinstance(_positions, list):
+        _entry_health_set("sync", "positionRisk alınamadı (flat teyidi yok)")
 
     reported = 0
     max_close_ts = last_ts
-    try:
-        r = requests.post(f"{HB_API}/executors/search", json={},
-                          auth=hb.auth, timeout=15).json()
-        all_execs = r.get("data", [])
-        terminated = [e for e in all_execs if e.get("status") == "TERMINATED"]
-        log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} in ledger")
-        # K2: single exchange snapshot used to confirm each close is really flat.
+    unresolved = []
+    for e in terminated:
+        eid = e.get("executor_id")
+        if not eid or eid in reported_ids:
+            continue
+        closed_at = float(e.get("close_timestamp") or 0)
+        if not math.isfinite(closed_at) or closed_at <= 0:
+            unresolved.append((eid, "invalid_close_timestamp"))
+            log.critical(f"🚨 K2: executor {str(eid)[:12]} geçersiz kapanış zamanı "
+                         f"({e.get('close_timestamp')!r}) — kaydedilmedi")
+            continue
+        pnl = float(e.get("net_pnl_quote") or 0)
+        pair = e.get("trading_pair")
+        _symbol = pair.replace("-", "") if pair else None
+        if not is_flat_confirmed(_positions, _symbol):
+            unresolved.append((eid, "not_flat"))
+            log.critical(f"🚨 K2: executor {str(eid)[:12]} TERMINATED ama borsa "
+                         f"flat DEĞİL/doğrulanamadı ({_symbol}) — PnL YAZILMADI "
+                         f"(fail-closed)")
+            continue
         try:
-            _positions = binance.position_risk() if binance is not None else None
-        except Exception as _pe:
-            _positions = None
-            log.warning(f"  K2: positionRisk alınamadı (flat teyidi yok): {_pe}")
-        for e in terminated:
-            eid = e.get("executor_id")
-            if not eid:
-                continue
-            if eid in reported_ids:
-                continue
-            closed_at = float(e.get("close_timestamp") or 0)
-            if closed_at <= last_ts:
-                # Pre-watermark: skip (already handled via migration or previous sync)
-                continue
-            pnl = float(e.get("net_pnl_quote") or 0)
-            pair = e.get("trading_pair")
-            # K2 gate: do NOT record a close (final PnL) unless the exchange
-            # confirms this symbol is flat. Fail-closed on error/stale/partial.
-            _symbol = pair.replace("-", "") if pair else None
-            if not is_flat_confirmed(_positions, _symbol):
-                log.critical(f"🚨 K2: executor {str(eid)[:12]} TERMINATED ama borsa "
-                             f"flat DEĞİL/doğrulanamadı ({_symbol}) — PnL YAZILMADI, "
-                             f"kapanmış sayılmadı (fail-closed)")
-                continue
-            closed_at_iso = datetime.fromtimestamp(closed_at).isoformat() if closed_at else None
-            inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso)
-            if inserted:
-                reported += 1
-                log.info(f"  RiskEngine PnL: {pair} -> {pnl:+.4f} ({msg})")
-            else:
-                log.debug(f"  skip {eid[:12]}: {msg}")
+            inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_epoch=closed_at)
+        except TypeError:
+            # Eski/uyumlu record_trade imzası (closed_at_iso konumsal).
+            inserted, msg = risk.record_trade(eid, pair, pnl, None)
+        if inserted:
+            reported += 1
+            reported_ids.add(eid)
+            log.info(f"  RiskEngine PnL: {pair} -> {pnl:+.4f} ({msg})")
             if closed_at > max_close_ts:
                 max_close_ts = closed_at
-        if reported:
-            log.info(f"  RiskEngine: {reported} yeni kapanis islendi")
-    except Exception as e:
-        log.warning(f"  RiskEngine sync HATA: {type(e).__name__}: {e}")
-        return
+        else:
+            unresolved.append((eid, msg))
+            log.critical(f"🚨 K2: executor {str(eid)[:12]} PnL kaydedilemedi ({msg}) — "
+                         f"sonraki turda yeniden denenecek")
+    if reported:
+        log.info(f"  RiskEngine: {reported} yeni kapanis islendi")
+
+    if unresolved:
+        _entry_health_set("sync", f"{len(unresolved)} çözümlenmemiş kapanış")
+        oldest = min((float(e.get("close_timestamp") or 0) for e in terminated
+                      if e.get("executor_id") in {u[0] for u in unresolved}), default=0.0)
+        if oldest > 0:
+            max_close_ts = min(max_close_ts, oldest)
+    else:
+        _entry_health_clear("sync")
 
     try:
-        now = datetime.now(_tz.utc).isoformat()
-        with _sq.connect(str(db_path), timeout=10) as conn:
-            conn.execute(
-                "UPDATE sync_meta SET last_close_ts=?, updated_at=? WHERE id=1",
-                (max_close_ts, now)
-            )
-            conn.commit()
+        conn = risk_engine_mod.connect_rw(db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE sync_meta SET last_close_ts=?, updated_at=? WHERE id=1",
+                    (max_close_ts, risk_engine_mod.iso_utc(risk_engine_mod.utc_now())))
+                if cur.rowcount != 1:
+                    raise risk_engine_mod.RiskStoreError(
+                        f"sync_meta rowcount={cur.rowcount}")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
     except Exception as e:
+        _entry_health_set("sync", f"watermark: {e}")
         log.critical(f"🚨 C3: sync_meta güncellenemedi: {e}")
 
 
@@ -990,7 +1129,7 @@ def protect_then_gate(binance, reserver, drift, stale):
 
 # K-3: shared ledger path for the cross-process SL-placement intent (same db as the
 # reservation / close-intent). Overridable in tests.
-SL_LEDGER_DB = str(STATE_DIR / "risk_ledger.db")
+SL_LEDGER_DB = str(RISK_DB_FILE)
 
 
 def _dedupe_algo_sl(binance, symbol):
@@ -1499,6 +1638,18 @@ def calculate_position_size(balance_usdt, coin):
     if margin_per_trade * _cap > balance_usdt * 0.9:
         safe_margin = (balance_usdt * 0.9) / _cap
         notional = safe_margin * LEVERAGE
+
+    # FAZ16: legacy yol da pozisyon başına equity yüzde tavanını uygular.
+    # Cap altında minimum notional sağlanamıyorsa emir YOK (yukarı yuvarlama yok).
+    _pct = float(RISK_CONFIG.get("max_position_pct") or 0)
+    if _pct > 0:
+        _pct_cap = float(balance_usdt) * _pct / 100.0
+        if _pct_cap > 0 and notional > _pct_cap:
+            notional = _pct_cap
+            if notional < MIN_NOTIONAL_USDT:
+                log.warning(f"calculate_position_size: yüzde tavanı minimum notional'ın "
+                            f"altında ({notional:.2f} < {MIN_NOTIONAL_USDT}) — emir yok")
+                return 0.0, vol_mult
 
     return notional, vol_mult
 
@@ -2089,6 +2240,23 @@ def select_candidates(picks, active, bl, top_n, total_n):
     return main, probes
 
 
+def _account_snapshot(binance):
+    """FAZ16: tek snapshot. `account_snapshot()` yoksa (eski istemci/test double)
+    bakiye uçlarından kurulur; yine de equity ve available AYRI alanlardan gelir."""
+    fn = getattr(binance, "account_snapshot", None)
+    if callable(fn):
+        return fn()
+    try:
+        if hasattr(binance, "get_balance"):
+            eq = binance.get_balance("USDT")
+        else:
+            eq = binance.get_available_balance("USDT")
+        av = binance.get_available_balance("USDT")
+    except Exception as e:
+        return AccountSnapshot(raw={"error": str(e)})
+    return AccountSnapshot(equity=eq, available_balance=av, can_trade=True)
+
+
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
     # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
     # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
@@ -2232,16 +2400,36 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         if not _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, WHALE_HUNTING):
             return False
 
-    # Bakiye
-    balance = binance.get_available_balance("USDT")
-    if balance < 10:
-        log.warning(f"  yetersiz bakiye: {balance:.2f} USDT")
+    # FAZ16: TEK account snapshot. equity = totalMarginBalance, available = availableBalance.
+    # availableBalance equity yerine KULLANILMAZ (eski kod sizing'e available'ı equity
+    # gibi veriyordu → yanlış risk bütçesi).
+    snap = _account_snapshot(binance)
+    _snap_ok, _snap_why = snap.valid()
+    if not _snap_ok:
+        log.warning(f"  atlandı: account snapshot geçersiz ({_snap_why})")
+        _entry_health_set("account", _snap_why)
         return False
+    _entry_health_clear("account")
+    equity = float(snap.equity)
+    available = float(snap.available_balance)
+    balance = equity
+    if available < 10:
+        log.warning(f"  yetersiz kullanılabilir marjin: {available:.2f} USDT "
+                    f"(equity={equity:.2f})")
+        return False
+    log.info(f"  💰 equity={equity:.2f} available={available:.2f} (ayrı alanlar)")
 
     # Boyutlandırma (FAZ 1.2: RiskEngine onayı)
     if RISK_CONFIG.get("risk_guards_enabled", False) and risk is not None:
-        target_notional, status = risk.approve_trade(balance, sl_pct + slippage_pct,
-                                                     take_profit_pct=tp_pct)
+        try:
+            target_notional, status = risk.approve_trade(
+                balance, sl_pct + slippage_pct, take_profit_pct=tp_pct,
+                equity=equity, max_position_pct=getattr(_live_cfg(), "max_position_pct", None)
+                if getattr(_live_cfg(), "is_live", False) else RISK_CONFIG.get("max_position_pct"))
+        except TypeError:
+            # Eski/uyumlu approve_trade imzası (equity/max_position_pct yok).
+            target_notional, status = risk.approve_trade(
+                balance, sl_pct + slippage_pct, take_profit_pct=tp_pct)
         if target_notional is None:
             log.warning(f"  RiskEngine reddetti: {status}")
             return False
@@ -2296,6 +2484,31 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             return False
 
     log.info(f"  amount={amount} (≈{amount * price:.2f} USDT)")
+
+    # FAZ16: yuvarlanmış NİHAİ notional yeniden doğrulanır. Cap'ler burada tekrar
+    # uygulanır; aşarsa emir reddedilir (yukarı yuvarlama yok).
+    final_notional = float(amount) * float(price)
+    _lc_fin = _live_cfg()
+    _is_live_fin = bool(getattr(_lc_fin, "is_live", False))
+    _pct_fin = getattr(_lc_fin, "max_position_pct", None) if _is_live_fin \
+        else RISK_CONFIG.get("max_position_pct")
+    _caps = [("risk_budget", float(target_notional))]
+    if _pct_fin:
+        _caps.append(("max_position_pct", equity * float(_pct_fin) / 100.0))
+    _stage_max = float(getattr(_lc_fin, "max_notional", 0) or 0) if _is_live_fin else 0.0
+    if _stage_max <= 0:
+        _stage_max = float(MAX_NOTIONAL_USDT)
+    if _stage_max > 0:
+        _caps.append(("stage_max_notional", _stage_max))
+    _limit = min(v for _, v in _caps if v and v > 0)
+    if final_notional > _limit + 1e-9:
+        log.warning(f"  atlandı: nihai notional {final_notional:.2f} > limit {_limit:.2f} "
+                    f"({', '.join(f'{k}={v:.2f}' for k, v in _caps)})")
+        return False
+    if final_notional < min_n:
+        log.warning(f"  atlandı: nihai notional {final_notional:.2f} < min {min_n:.2f}")
+        return False
+    log.info(f"  ✅ nihai notional {final_notional:.2f} ≤ limit {_limit:.2f}")
 
     if dry_run:
         log.info("  [DRY] emir yok")
@@ -2409,6 +2622,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"[LIVE] open {symbol} {'LONG' if side == 1 else 'SHORT'} qty={amount} "
                  f"notional={target_notional:.2f} entry={coin.get('lastPrice')} "
                  f"sl={sl_pct:.4f} tp={tp_pct:.4f} lev={dyn_lev}")
+    # FAZ16: MERKEZİ RİSK KAPISI — tüm gerçek yeni emir yolları buradan geçer.
+    # V2/legacy/scientific sizing ve protect_then_gate bunun yerine geçmez.
+    if risk is not None:
+        _gate_ok, _gate_why = _risk_entry_gate(risk, snapshot=snap, symbol=symbol,
+                                               notional=final_notional)
+        if not _gate_ok:
+            log.warning(f"  atlandı: merkezi risk kapısı ({_gate_why})")
+            if reserver is not None and _res_id is not None:
+                reserver.release(_res_id, reason="risk_gate")
+            return False
+    else:
+        log.warning("  ⚠️  risk engine yok — merkezi kapı atlandı (yalnız test/legacy)")
+
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
@@ -2533,6 +2759,73 @@ def _entry_gate_closed():
             if ctx.get("finalization_blocked"):
                 return f"PENDING_BLOCKED:{eid}"
     return None
+
+
+# ---------------------------------------------------------------- FAZ16 entry health
+# Kalıcı HALTED (risk.is_halted) ile GEÇİCİ çalışma sağlığı AYRI tutulur. Geçici
+# engeller yeni girişi kapatır; açık pozisyonların SL/koruma/kapanışını engellemez.
+# Geçici engel düzeldiğinde yalnız o engel kaldırılır — HALTED'a dokunulmaz.
+_ENTRY_HEALTH = {}
+_ENTRY_HEALTH_LOCK = threading.RLock()
+
+
+def _entry_health_set(key, reason):
+    with _ENTRY_HEALTH_LOCK:
+        if key not in _ENTRY_HEALTH:
+            log.critical(f"🚨 GİRİŞ SAĞLIĞI KAPALI [{key}]: {reason}")
+        _ENTRY_HEALTH[key] = reason
+
+
+def _entry_health_clear(key):
+    with _ENTRY_HEALTH_LOCK:
+        if _ENTRY_HEALTH.pop(key, None) is not None:
+            log.info(f"✅ GİRİŞ SAĞLIĞI AÇILDI [{key}]")
+
+
+def _entry_health_reasons():
+    with _ENTRY_HEALTH_LOCK:
+        return dict(_ENTRY_HEALTH)
+
+
+def _entry_health_blocked():
+    with _ENTRY_HEALTH_LOCK:
+        if not _ENTRY_HEALTH:
+            return None
+        key = sorted(_ENTRY_HEALTH)[0]
+        return f"ENTRY_HEALTH:{key}:{_ENTRY_HEALTH[key]}"
+
+
+def _risk_entry_gate(risk, snapshot=None, symbol=None, notional=None):
+    """Merkezi risk kapısı — TÜM gerçek yeni emir yolları buradan geçer.
+
+    Dönüş: (ok, reason). Yalnız YENİ pozisyon açmayı kapatır; SL, reconciliation
+    ve kapanış yolları bu kapıyı kullanmaz.
+    """
+    if risk is None:
+        return False, "no_risk_engine"
+    if getattr(risk, "health_ok", True) is False:
+        return False, f"risk_store:{getattr(risk, 'health_reason', 'unhealthy')}"
+    if getattr(risk, "migration_required", False):
+        return False, "migration_required (risk_migration.py --apply)"
+    if risk.is_halted:
+        return False, f"halted:{risk.halt_reason}"
+    hb = _entry_health_blocked()
+    if hb:
+        return False, hb
+    pg = _entry_gate_closed()
+    if pg:
+        return False, f"pending_store:{pg}"
+    if snapshot is not None:
+        ok, why = snapshot.valid()
+        if not ok:
+            return False, f"account_snapshot:{why}"
+        if notional is not None and notional > 0:
+            need = float(notional) / max(1.0, float(getattr(risk, "cfg", {}).get(
+                "max_leverage", 1) or 1))
+            if snapshot.available_balance < need:
+                return False, (f"insufficient_margin ({snapshot.available_balance:.2f} < "
+                               f"{need:.2f})")
+    return True, "ok"
 
 
 def _pending_hash(pending):
@@ -3529,8 +3822,11 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
             log.warning(f"  Likidasyon kontrol hatası: {e}")
 
     if risk is not None:
-        risk.register_open()
-        log.info("  📊 RiskEngine: günlük sayaç arttı")
+        # FAZ16: executor id ile idempotent — retry/tekrar işleme sayacı iki kez artırmaz.
+        if not risk.register_open(key=eid):
+            log.critical("  🚨 register_open yazılamadı — giriş sağlığı kapandı")
+        else:
+            log.info(f"  📊 RiskEngine: günlük sayaç {risk.daily_trades}")
 
     # Tracked list (orphan_killer cleanup only) - atomic write
     try:
@@ -3589,7 +3885,17 @@ def run_once(dry_run=False):
                  f"max_lev={_cfg.max_leverage} max_pos={_max_positions} base={_cfg.base_url}")
         log.info(f"[LIVE] daily_loss_limit={_cfg.daily_loss_pct:.2f}% of day-start equity "
                  f"(equity {_cfg.max_position_pct:.0f}% per position, no daily trade count limit)")
+    # FAZ16: TEK DB yolu — RiskEngine'e açıkça verilir; varsayılana bırakılmaz.
+    _risk_cfg["db_file"] = str(RISK_DB_FILE)
     risk = RiskEngine(_risk_cfg)
+    if not getattr(risk, "health_ok", True):
+        log.critical(f"🚨 risk store sağlıksız ({risk.health_reason}) — yeni giriş kapalı, "
+                     f"açık pozisyon yönetimi sürer")
+    log.info(f"[RISK] db={risk.db_file} halted={getattr(risk, 'is_halted', None)} "
+             f"streak={getattr(risk, 'consecutive_losses', None)} "
+             f"daily_pnl={getattr(risk, 'daily_pnl', None)} "
+             f"day_start={getattr(risk, 'day_start_equity', None)}"
+             f"@{getattr(risk, 'day_start_equity_date', None)}")
     reserver = PositionReserver(risk.db_file, _max_positions)
     try:
         reserver.init_schema()
@@ -3649,13 +3955,11 @@ def run_once(dry_run=False):
     except Exception as e:
         log.critical(f"🚨 CloseCoordinator kurulamadı, fallback doğrudan kapanış: {e}")
 
-    # FAZ 1.2: Günlük reset kontrolü
-    today = datetime.now().date().isoformat()
-    if risk.state.get("last_reset_date") != today:
+    # FAZ 1.2 / FAZ16: Günlük reset — UTC gün anahtarı, tek sefer, HALTED'ı kaldırmaz.
+    today = risk_engine_mod.utc_day()
+    if risk.last_reset_date != today:
         risk.reset_daily()
-        risk.state["last_reset_date"] = today
-        risk._save_state()
-        log.info(f"  Günlük sayaçlar sıfırlandı ({today})")
+        log.info(f"  Günlük sayaçlar sıfırlandı ({today}) halted={risk.is_halted}")
 
     # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir
     sync_risk_engine(risk, hb, binance=binance)
