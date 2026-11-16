@@ -6,6 +6,7 @@ rowcount, daily_pnl türetimi, UTC gün sınırı, baseline kalıcılığı, res
 watermark, migration, sizing cap ve nihai notional.
 """
 import json
+import multiprocessing
 import os
 import sqlite3
 import sys
@@ -79,6 +80,13 @@ def engine(db, **over):
     cfg = dict(CFG, db_file=db)
     cfg.update(over)
     return risk_engine.RiskEngine(cfg)
+
+
+def _register_worker(db, key, barrier, q):
+    """Ayrı süreçte register_open — process-safe idempotency kanıtı."""
+    r = risk_engine.RiskEngine(dict(CFG, db_file=db))
+    barrier.wait(30)
+    q.put((key, r.register_open(key=key)))
 
 
 class Base(unittest.TestCase):
@@ -281,6 +289,14 @@ class TestBaseline(Base):
 
 
 class TestRegisterOpen(Base):
+    def setUp(self):
+        super().setUp()
+        # FAZ9 post-audit: register_open bayat günlük reset tarihini fail-closed
+        # reddeder; testler güncel risk günüyle başlar.
+        r = engine(self.db)
+        r.last_reset_date = risk_engine.utc_day()
+        r._save_state()
+
     def test_register_open_is_idempotent_by_key(self):
         r = engine(self.db)
         self.assertTrue(r.register_open(key="E1"))
@@ -292,6 +308,46 @@ class TestRegisterOpen(Base):
         r.register_open()
         r.register_open()
         self.assertEqual(r.daily_trades, 2)
+
+    def test_register_open_rejects_stale_day(self):
+        r = engine(self.db)
+        r.last_reset_date = "2020-01-01"
+        r._save_state()
+        self.assertFalse(r.register_open(key="E1"))
+        self.assertFalse(r.health_ok)
+        self.assertIn("bayat", r.health_reason)
+        conn = sqlite3.connect(self.db)
+        n = conn.execute("SELECT daily_trades FROM risk_state WHERE id=1").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 0, "bayat günde sayaç artmamalı")
+
+    def _two_process(self, keys):
+        ctx = multiprocessing.get_context("fork")
+        barrier = ctx.Barrier(len(keys))
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_register_worker, args=(self.db, k, barrier, q))
+                 for k in keys]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(30)
+        results = [q.get(timeout=5) for _ in keys]
+        self.assertTrue(all(ok for _, ok in results), results)
+        conn = sqlite3.connect(self.db)
+        trades, raw = conn.execute(
+            "SELECT daily_trades, open_keys FROM risk_state WHERE id=1").fetchone()
+        conn.close()
+        return trades, set(json.loads(raw or "[]"))
+
+    def test_two_processes_same_key_count_once(self):
+        trades, keys = self._two_process(["E1", "E1"])
+        self.assertEqual(trades, 1, "aynı executor iki kez sayılmamalı")
+        self.assertEqual(keys, {"E1"})
+
+    def test_two_processes_different_keys_lose_nothing(self):
+        trades, keys = self._two_process(["E1", "E2"])
+        self.assertEqual(trades, 2)
+        self.assertEqual(keys, {"E1", "E2"})
 
 
 class TestMigration(Base):
@@ -391,6 +447,165 @@ class TestAccountSnapshot(unittest.TestCase):
         ok, why = auto_trader._risk_entry_gate(r, snapshot=s, notional=200.0)
         self.assertFalse(ok)
         self.assertIn("insufficient_margin", why)
+
+
+class TestStartupLedgerIntegrity(Base):
+    def test_unresolved_timestamp_blocks_at_startup(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO trade_ledger (executor_id, trading_pair, net_pnl_quote,"
+                     " closed_at, recorded_at, source) VALUES ('E9','SOL-USDT',-1.0,"
+                     " '2026-01-01T00:00:00','x','sync')")
+        conn.commit()
+        conn.close()
+        r = engine(self.db)
+        self.assertFalse(r.health_ok)
+        self.assertIn("ledger_unresolved_timestamps", r.health_reason)
+        ok, why = auto_trader._risk_entry_gate(r)
+        self.assertFalse(ok)
+        self.assertIn("risk_store", why)
+
+
+class TestSnapshotFallback(unittest.TestCase):
+    def test_wallet_balance_fallback_is_invalid(self):
+        class _Legacy:
+            def get_balance(self, asset="USDT"):
+                return 3478.0
+
+            def get_available_balance(self, asset="USDT"):
+                return 3478.0
+
+        s = auto_trader._account_snapshot(_Legacy())
+        ok, _ = s.valid()
+        self.assertFalse(ok, "cüzdan bakiyesi equity sayılamaz")
+        self.assertIsNone(s.equity)
+        self.assertIn("totalMarginBalance", s.raw.get("error", ""))
+
+    def test_missing_can_trade_blocks_entry(self):
+        s = auto_trader.AccountSnapshot(equity=1000.0, available_balance=500.0,
+                                        can_trade=None)
+        ok, why = s.valid()
+        self.assertFalse(ok)
+        self.assertIn("canTrade", why)
+        saved = auto_trader._entry_health_reasons()
+        with auto_trader._ENTRY_HEALTH_LOCK:
+            auto_trader._ENTRY_HEALTH.clear()
+        self.addCleanup(self._restore, saved)
+        r = engine(build(tempfile.mkdtemp()))
+        ok, why = auto_trader._risk_entry_gate(r, snapshot=s)
+        self.assertFalse(ok)
+        self.assertIn("account_snapshot", why)
+
+    @staticmethod
+    def _restore(saved):
+        with auto_trader._ENTRY_HEALTH_LOCK:
+            auto_trader._ENTRY_HEALTH.clear()
+            auto_trader._ENTRY_HEALTH.update(saved)
+
+
+class TestRiskNoneFailClosed(unittest.TestCase):
+    def test_gate_rejects_missing_risk_engine(self):
+        ok, why = auto_trader._risk_entry_gate(None)
+        self.assertFalse(ok)
+        self.assertEqual(why, "no_risk_engine")
+
+    def test_open_coin_without_risk_never_creates_executor(self):
+        class _Binance:
+            def __getattr__(self, name):
+                def _rec(*a, **k):
+                    raise AssertionError(f"risk=None yolunda API çağrısı olmamalı: {name}")
+                return _rec
+
+        class _HB:
+            def active_executors(self):
+                return []
+
+            def create_executor(self, *a, **k):
+                raise AssertionError("risk=None ile create_executor çağrılmamalı")
+
+        coin = {"symbol": "SOLUSDT", "lastPrice": "80", "quoteVolume": "9e8",
+                "_score": 0.9}
+        ok = auto_trader.open_coin(_Binance(), _HB(), coin, dry_run=False, risk=None)
+        self.assertFalse(ok)
+
+
+class TestExecutorPagination(unittest.TestCase):
+    def setUp(self):
+        self._orig = auto_trader.requests.post
+        self.addCleanup(setattr, auto_trader.requests, "post", self._orig)
+
+    @staticmethod
+    def _hb():
+        class _HB:
+            auth = ("u", "p")
+
+        return _HB()
+
+    @staticmethod
+    def _resp(data, status=200):
+        class _R:
+            status_code = status
+
+            def json(self):
+                return {"data": data}
+
+        return _R()
+
+    def test_repeated_page_is_incomplete(self):
+        page = [{"executor_id": "E1", "status": "TERMINATED"}]
+        auto_trader.requests.post = lambda *a, **k: self._resp(page)
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=2, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete:"), err)
+        self.assertEqual([e["executor_id"] for e in out], ["E1"])
+
+    def test_short_pages_advance_by_returned_size(self):
+        rows = [{"executor_id": f"E{i}", "status": "TERMINATED"} for i in range(4)]
+
+        def _post(url, json=None, **k):
+            off = int((json or {}).get("offset") or 0)
+            return self._resp(rows[off:off + 2])
+
+        auto_trader.requests.post = _post
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=10)
+        self.assertIsNone(err)
+        self.assertEqual(len(out), 4)
+
+    def test_missing_executor_id_is_incomplete(self):
+        auto_trader.requests.post = lambda *a, **k: self._resp(
+            [{"status": "TERMINATED"}])
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=2, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete:"), err)
+        self.assertEqual(len(out), 1, "çözümlenmemiş kayıt atılmamalı")
+
+
+class TestSyncIncompleteBlocksEntries(Base):
+    def setUp(self):
+        super().setUp()
+        self._orig = auto_trader.requests.post
+        self.addCleanup(setattr, auto_trader.requests, "post", self._orig)
+        saved = auto_trader._entry_health_reasons()
+        with auto_trader._ENTRY_HEALTH_LOCK:
+            auto_trader._ENTRY_HEALTH.clear()
+        self.addCleanup(self._restore, saved)
+
+    @staticmethod
+    def _restore(saved):
+        with auto_trader._ENTRY_HEALTH_LOCK:
+            auto_trader._ENTRY_HEALTH.clear()
+            auto_trader._ENTRY_HEALTH.update(saved)
+
+    def test_incomplete_history_blocks_new_entries(self):
+        page = [{"executor_id": "E1", "status": "TERMINATED"}]
+        auto_trader.requests.post = lambda *a, **k: TestExecutorPagination._resp(page)
+        r = engine(self.db)
+
+        class _HB:
+            auth = ("u", "p")
+
+        auto_trader.sync_risk_engine(r, _HB(), binance=None)
+        self.assertIn("sync", auto_trader._entry_health_reasons())
+        ok, why = auto_trader._risk_entry_gate(r)
+        self.assertFalse(ok)
+        self.assertIn("ENTRY_HEALTH:sync", why)
 
 
 if __name__ == "__main__":

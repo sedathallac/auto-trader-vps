@@ -358,8 +358,10 @@ class AccountSnapshot:
                 return False, f"{name} invalid ({v!r})"
         if float(self.equity) <= 0:
             return False, f"equity non-positive ({self.equity!r})"
-        if self.can_trade is False:
-            return False, "canTrade=False"
+        if self.can_trade is not True:
+            # FAZ9 post-audit: bilinmeyen/eksik canTrade de reddedilir. Eski kod
+            # yalnız `is False` durumunu reddediyordu; `None` sessizce geçiyordu.
+            return False, f"canTrade unknown/not allowed ({self.can_trade!r})"
         return True, "ok"
 
     def __repr__(self):
@@ -968,14 +970,23 @@ def _mark_sl_epoch_closed(symbol):
 def _hb_executors_all(hb, page_limit=200, max_pages=50):
     """POST /executors/search — tüm sayfalar. Dönüş: (list|None, error|None).
 
-    FAZ16: HTTP status, JSON parse ve `data` tipi doğrulanır; eksik `data` boş liste
-    sayılmaz. Sayfalama desteklenmiyorsa (aynı kayıtlar dönüyorsa) döngü durur.
+    FAZ9 post-audit: sayfalama SÖZLEŞMESİ doğrulanamıyor (authoritative total/cursor
+    yok). Bu yüzden tamamlanma yalnız GEÇERLİ BOŞ SAYFA ile kanıtlanır:
+      * HTTP status, JSON, gövde ve `data` listesi doğrulanır.
+      * Offset, istenen `limit` ile değil API'nin DÖNDÜRDÜĞÜ sayfa boyuyla ilerler
+        (API page size'ı kırpabilir).
+      * Kısa ama boş olmayan sayfa tamamlanma kanıtı SAYILMAZ; sonraki sayfa beklenir.
+      * Aynı sayfa tekrar dönerse / yeni executor ID gelmezse `incomplete` döner.
+      * Geçersiz/eksik executor_id "çözümlenmemiş veri"dir; sessizce atılmaz.
+      * Güvenlik sınırına ulaşılırken sonuç `incomplete` döner.
+    `error` "incomplete:" ile başlıyorsa liste KISMİdir; çağıran girişi kapatmalıdır.
     """
     out, seen = [], set()
-    for page in range(max_pages):
+    offset = 0
+    for _page in range(max_pages):
         try:
             resp = requests.post(f"{HB_API}/executors/search",
-                                 json={"limit": page_limit, "offset": page * page_limit},
+                                 json={"limit": page_limit, "offset": offset},
                                  auth=hb.auth, timeout=15)
         except Exception as e:
             return None, f"request: {type(e).__name__}: {e}"
@@ -990,19 +1001,25 @@ def _hb_executors_all(hb, page_limit=200, max_pages=50):
         data = body.get("data")
         if not isinstance(data, list):
             return None, "data missing/not a list"
+        if not data:
+            return out, None
         new = 0
         for e in data:
             eid = e.get("executor_id") if isinstance(e, dict) else None
-            if eid is None:
+            if not isinstance(eid, str) or not eid:
+                # Çözümlenmemiş kayıt: atılmaz, listeye eklenir ve sonuç KISMİ olur.
                 out.append(e)
-                new += 1
-            elif eid not in seen:
+                return out, (f"incomplete: geçersiz/eksik executor_id "
+                             f"(offset={offset})")
+            if eid not in seen:
                 seen.add(eid)
                 out.append(e)
                 new += 1
-        if len(data) < page_limit or new == 0:
-            return out, None
-    return None, "pagination limit exceeded"
+        if new == 0:
+            return out, (f"incomplete: offset ilerlemiyor / yeni kayıt yok "
+                         f"(offset={offset}, {len(data)} kayıt)")
+        offset += len(data)
+    return out, f"incomplete: sayfalama güvenlik sınırı ({max_pages} sayfa) aşıldı"
 
 
 def sync_risk_engine(risk, hb, binance=None):
@@ -1043,6 +1060,13 @@ def sync_risk_engine(risk, hb, binance=None):
     if all_execs is None:
         _entry_health_set("sync", f"executors: {err}")
         log.critical(f"🚨 C3: executor geçmişi alınamadı ({err}) — yeni giriş kapalı")
+        return
+    if err:
+        # FAZ9 post-audit: KISMİ geçmiş = tamamlanmış sayılmaz. Giriş kapatılır;
+        # pozisyon koruma/kapanış yolları bu kapıyı kullanmaz.
+        _entry_health_set("sync", f"executors: {err}")
+        log.critical(f"🚨 C3: executor geçmişi EKSİK ({err}) — yeni giriş kapalı, "
+                     f"sonuç PARTIAL")
         return
     terminated = [e for e in all_execs
                   if isinstance(e, dict) and e.get("status") == "TERMINATED"]
@@ -2615,20 +2639,21 @@ def select_candidates(picks, active, bl, top_n, total_n):
 
 
 def _account_snapshot(binance):
-    """FAZ16: tek snapshot. `account_snapshot()` yoksa (eski istemci/test double)
-    bakiye uçlarından kurulur; yine de equity ve available AYRI alanlardan gelir."""
+    """FAZ16: tek snapshot. `account_snapshot()` yoksa GÜVENLİ YEDEK YOKTUR.
+
+    FAZ9 post-audit: eski fallback `get_balance("USDT")` (GET /fapi/v2/balance →
+    `balance`, yani CÜZDAN bakiyesi) değerini equity sayıyor ve `can_trade=True`
+    uyduruyordu. Cüzdan bakiyesi `totalMarginBalance` (Futures equity) DEĞİLDİR;
+    bu yüzden fallback artık geçersiz snapshot döndürür ve yeni giriş kapanır.
+    Kapanış/SL/reduce-only/reconciliation yolları bu kapıyı kullanmaz.
+    """
     fn = getattr(binance, "account_snapshot", None)
     if callable(fn):
         return fn()
-    try:
-        if hasattr(binance, "get_balance"):
-            eq = binance.get_balance("USDT")
-        else:
-            eq = binance.get_available_balance("USDT")
-        av = binance.get_available_balance("USDT")
-    except Exception as e:
-        return AccountSnapshot(raw={"error": str(e)})
-    return AccountSnapshot(equity=eq, available_balance=av, can_trade=True)
+    return AccountSnapshot(
+        equity=None, available_balance=None, can_trade=None,
+        raw={"error": "account_snapshot() yok — Futures equity (totalMarginBalance) "
+                      "doğrulanamıyor; cüzdan bakiyesi equity yerine kullanılmaz"})
 
 
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
@@ -2637,6 +2662,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if HB_OFFLINE:
         dry_run = True
 
+    # FAZ9 post-audit: RiskEngine yoksa GERÇEK yeni giriş yok (fail-closed).
+    # dry-run/compare yolu korunur; dry_run zaten create_executor'a ulaşmaz.
+    if risk is None and not dry_run:
+        log.critical("  atlandı: risk engine yok — gerçek yeni giriş kapalı (fail-closed)")
+        return False
+    # ENTEGRE (79bed1d üst-C6 bloğu BİLİNÇLİ ALINDI): 79bed1d ağacındaki
+    # "fonksiyon başında hb.active_executors() ile limit kontrolü" burada
+    # yok; üretim (01229ce) ve bu ağaçtaki aşağıdaki `_occupied_slots` bloğu
+    # aynı amacın ÜST KÜMESİDİR (borsa slot gerçeği + executor kilidi +
+    # already-open sembol, None'da fail-closed) ve herhbAPI çağrısı yapmadan
+    # önce çalışır; üst blok her adayda fazladan active_executors() çağrısı
+    # demekti. Üst-C6'nın tek ek değeri (HB_OFFLINE'da hb'siz patlama)
+    # aşağıdaki bloğun `if HB_OFFLINE: set(), set()` dalıyla zaten karşılanır.
     symbol = coin["symbol"]
     # FAZ15b: global giriş kapısı — finalizasyon claim'i persist edilemediyse kapalı.
     if not HB_OFFLINE and _entry_gate_closed():
@@ -3013,7 +3051,11 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
                 reserver.release(_res_id, reason="risk_gate")
             return False
     else:
-        log.warning("  ⚠️  risk engine yok — merkezi kapı atlandı (yalnız test/legacy)")
+        # FAZ9 post-audit: risk=None gerçek emir yolunda ASLA kabul edilmez.
+        log.critical("  atlandı: merkezi risk kapısı yok (risk engine None) — emir yok")
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="no_risk_engine")
+        return False
 
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")

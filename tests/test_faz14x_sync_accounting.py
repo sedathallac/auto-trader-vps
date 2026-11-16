@@ -98,7 +98,14 @@ class SyncHarness(unittest.TestCase):
             at.SL_LEDGER_DB = self._orig_sl_db
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _post(self, *a, **k):
+    def _post(self, url, json=None, **k):
+        # 79bed1d sayfalama sözleşmesi: tamamlanma yalnız geçerli BOŞ sayfa ile
+        # kanıtlanır; aynı sayfanın tekrarı KISMİ demektir (fail-closed). Fixture
+        # tek-sayfa gerçeğini temsil eder: offset>0 -> boş sayfa. (Aynı uyarlama
+        # 79bed1d'nin kendi test_inc6_k2.py'sinde de yapıldı; assert değişmez.)
+        off = int((json or {}).get("offset") or 0)
+        if off:
+            return _Resp({"data": []}, self.search_status)
         return _Resp(self.search_payload, self.search_status)
 
     def run_sync(self):
