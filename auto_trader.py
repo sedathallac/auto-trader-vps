@@ -3314,7 +3314,13 @@ def _recover_pending_records(raw):
                          f"claim KORUNDU")
     stale, kept = [], []
     for k, v in list(raw.items()):
-        if float((v or {}).get("deadline") or 0) + STALE_PENDING_GRACE_S >= now:
+        # FAZ15b v5.1: dict olmayan kayıt .get() çağrısı yüzünden recovery'yi
+        # düşürmemeli ve SİLİNMEMELİ. Bozuk kayıt korunur; _entry_gate_closed onu
+        # PENDING_CORRUPT olarak görüp girişleri kapatır (otomatik repair YOK).
+        if not isinstance(v, dict):
+            kept.append(k)
+            continue
+        if float(v.get("deadline") or 0) + STALE_PENDING_GRACE_S >= now:
             continue
         if _is_dangerous_record(v):
             kept.append(k)
@@ -3495,6 +3501,46 @@ def _entry_order_terminal(binance, symbol, ctx):
     return True
 
 
+def _mut_confirm_failure(pending, now, eid, error):
+    """SAF: confirm hatasını atomik kaydet. Dış çağrı/IO/clock/logger YOK.
+
+    FAZ15b v5.1: eski kod `_register_pending_fill(eid, ctx)` ile ESKİ context'i
+    yeniden yazıyordu; çoklu prosesde taze attempt sayacını eziyor ve silinmiş bir
+    kaydı yeniden canlandırabiliyordu. Bu mutator yalnız MEVCUT kaydı günceller:
+      - kayıt yoksa no-op (yeniden oluşturmaz),
+      - sayaç diskten uzlaştırılmış güncel state üzerinden artar,
+      - backoff `now` parametresinden hesaplanır,
+      - maksimumda confirm_blocked=True.
+    """
+    new = copy.deepcopy(pending)
+    ctx = new.get(str(eid))
+    if not isinstance(ctx, dict):
+        return new, ("missing", None)
+    attempts = int(ctx.get("confirm_attempts") or 0) + 1
+    ctx["confirm_attempts"] = attempts
+    ctx["confirm_next_at"] = float(now) + CONFIRM_RETRY_BACKOFF_S
+    ctx["last_error"] = f"confirm: {error}"
+    if attempts >= CONFIRM_MAX_ATTEMPTS:
+        ctx["confirm_blocked"] = True
+    return new, ("recorded", ctx)
+
+
+def _mut_confirm_block(pending, now, eid, reason):
+    """SAF: mevcut kaydı confirm_blocked yap. Kayıt yoksa no-op."""
+    new = copy.deepcopy(pending)
+    ctx = new.get(str(eid))
+    if not isinstance(ctx, dict):
+        return new, ("missing", None)
+    ctx["confirm_blocked"] = True
+    ctx["last_error"] = ctx.get("last_error") or reason
+    return new, ("blocked", ctx)
+
+
+def _record_confirm_failure(eid, error):
+    """Confirm hatasını transaction içinde kalıcı yaz. Dönüş: (ok, result)."""
+    return _pending_transaction(_mut_confirm_failure, eid, error)
+
+
 def _pending_confirm(eid, ctx, reserver, out):
     """Rezervasyonu CONFIRMED yap; başarılıysa pending kaydı düşür.
 
@@ -3519,10 +3565,10 @@ def _pending_confirm(eid, ctx, reserver, out):
         return False
     attempts = int(ctx.get("confirm_attempts") or 0)
     if attempts >= CONFIRM_MAX_ATTEMPTS:
-        ctx = dict(ctx)
-        ctx["confirm_blocked"] = True
-        ctx["last_error"] = ctx.get("last_error") or "confirm_attempts_exhausted"
-        _register_pending_fill(eid, ctx)
+        ok, _ = _pending_transaction(_mut_confirm_block, eid, "confirm_attempts_exhausted")
+        if not ok:
+            log.critical(f"  🚨 confirm blok kaydı yazılamadı ({ctx.get('symbol')}) — "
+                         f"store unhealthy, giriş kapalı")
         log.critical(f"  🚫 confirm denemesi tükendi ({ctx.get('symbol')}, id={rid}) — "
                      f"kayıt KORUNDU, BLOKLU")
         out["waiting"] += 1
@@ -3534,18 +3580,26 @@ def _pending_confirm(eid, ctx, reserver, out):
     try:
         reserver.confirm(rid)
     except Exception as e:
-        # FAZ15b v5: commit edilmiş bellek sözlüğünü YERİNDE değiştirme; aksi halde
-        # memory ile disk hash'i ayrışır ve sonraki transaction MALFORMED_STATE verir.
-        ctx = dict(ctx)
-        ctx["confirm_attempts"] = attempts + 1
-        ctx["confirm_next_at"] = time.time() + CONFIRM_RETRY_BACKOFF_S
-        ctx["last_error"] = f"confirm: {e}"
-        if ctx["confirm_attempts"] >= CONFIRM_MAX_ATTEMPTS:
-            ctx["confirm_blocked"] = True
-        _register_pending_fill(eid, ctx)
+        # FAZ15b v5.1: failure kaydı ATOMİK transaction ile yazılır. Eski kod
+        # `_register_pending_fill(eid, ctx)` ile bayat context'i geri yazıyor,
+        # çoklu prosesde attempt sayacını kaybettiriyor ve silinmiş kaydı yeniden
+        # canlandırabiliyordu.
+        ok, res = _record_confirm_failure(eid, e)
+        if not ok:
+            log.critical(f"  🚨 confirm hatası kaydedilemedi ({ctx.get('symbol')}, "
+                         f"id={rid}) — store unhealthy, giriş kapalı")
+            out["waiting"] += 1
+            return False
+        state, cur = res if isinstance(res, tuple) else ("recorded", None)
+        if state == "missing":
+            log.warning(f"  🧹 confirm hatası: {eid} artık pending değil "
+                        f"(başka proses düşürdü) — yeniden oluşturulmadı")
+            out["waiting"] += 1
+            return False
         log.critical(f"  🚨 confirm hatası ({ctx.get('symbol')}, id={rid}): {e} — "
-                     f"pending KORUNDU (deneme {ctx['confirm_attempts']}/"
-                     f"{CONFIRM_MAX_ATTEMPTS}), yalnız confirm yeniden denenecek")
+                     f"pending KORUNDU (deneme "
+                     f"{(cur or {}).get('confirm_attempts')}/{CONFIRM_MAX_ATTEMPTS}), "
+                     f"yalnız confirm yeniden denenecek")
         out["waiting"] += 1
         return False
     _drop_pending_fill(eid)
