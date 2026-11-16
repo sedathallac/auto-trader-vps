@@ -207,4 +207,3 @@ def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
     assert ok is True
     assert len(posted) == 1, "kapı açıkken create_executor çağrılmadı"
     assert posted[0]["symbol"] == "SOLUSDT" and posted[0]["sl"] > 0 and posted[0]["tp"] > 0
-
