@@ -32,7 +32,8 @@ PAIR = "SOL-USDT"
 
 
 class _Resp:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
+        self.status_code = status
         self._payload = payload
 
     def json(self):
@@ -134,9 +135,12 @@ class FakeExchange:
     def handle_post(self, url, body):
         path = urlparse(url).path
         if path.endswith("/executors/search"):
-            if body == {"is_active": True}:
-                return {"data": [e for e in self.executors if e.get("status") == "RUNNING"]}
-            return {"data": list(self.executors)}
+            # FAZ15 Stage2b contract: body {"status","limit","cursor"}; cevap
+            # pagination bloğu içermek ZORUNDA (istemci yoksa HBContractError).
+            _st = (body or {}).get("status")
+            _d = [e for e in self.executors if e.get("status") == _st]
+            return {"data": _d, "pagination": {"limit": 100, "has_more": False,
+                                               "next_cursor": None, "total_count": len(_d)}}
         if "/executors/" in path and path.endswith("/stop"):
             self.stops.append(body)
             return {"status": "ok"}
@@ -495,7 +499,8 @@ def _xproc_close_worker(db, result_path, idx):
     from close_coordinator import CloseCoordinator as _C
 
     class _R:
-        def __init__(self, p):
+        def __init__(self, p, status=200):
+            self.status_code = status
             self._p = p
 
         def json(self):
@@ -522,7 +527,9 @@ def _xproc_close_worker(db, result_path, idx):
         def post(self, url, headers=None, json=None, auth=None, timeout=None):
             path = _up(url).path
             if path.endswith("/executors/search"):
-                return _R({"data": []})
+                # FAZ15 Stage2b contract: pagination bloğu zorunlu.
+                return _R({"data": [], "pagination": {"limit": 100, "has_more": False,
+                                                      "next_cursor": None, "total_count": 0}})
             if path == "/fapi/v1/order":
                 p = _pr(url)
                 qty = _D(p["quantity"])

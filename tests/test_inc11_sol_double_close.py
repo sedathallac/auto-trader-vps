@@ -133,10 +133,12 @@ class FakeExchange:
     def handle_post(self, url, body):
         path = urlparse(url).path
         if path.endswith("/executors/search"):
-            if body == {"is_active": True}:
-                return {"data": [e for e in self.executors
-                                 if e.get("status") == "RUNNING"]}
-            return {"data": list(self.executors)}
+            # FAZ15 Stage2b contract: body {"status","limit","cursor"}; cevap
+            # pagination bloğu içermek ZORUNDA (istemci yoksa HBContractError).
+            _st = (body or {}).get("status")
+            _d = [e for e in self.executors if e.get("status") == _st]
+            return {"data": _d, "pagination": {"limit": 100, "has_more": False,
+                                               "next_cursor": None, "total_count": len(_d)}}
         if "/executors/" in path and path.endswith("/stop"):
             self.stops.append((path, body))
             return {"status": "ok"}

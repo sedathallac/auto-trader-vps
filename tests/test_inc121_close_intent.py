@@ -29,7 +29,8 @@ SYM = "SOLUSDT"
 
 
 class _Resp:
-    def __init__(self, p):
+    def __init__(self, p, status=200):
+        self.status_code = status
         self._p = p
 
     def json(self):
@@ -74,7 +75,9 @@ class FakeExchange:
     def handle_post(self, url, body):
         path = urlparse(url).path
         if path.endswith("/executors/search"):
-            return {"data": []}
+            # FAZ15 Stage2b contract: pagination bloğu zorunlu.
+            return {"data": [], "pagination": {"limit": 100, "has_more": False,
+                                               "next_cursor": None, "total_count": 0}}
         if path == "/fapi/v1/order":
             bad = self._fail("post")
             if bad is not None:
@@ -324,7 +327,8 @@ def _xproc_worker(db_exch, db_intent, out_path, idx):
     from close_intent import CloseIntentStore as _S
 
     class _R:
-        def __init__(self, p):
+        def __init__(self, p, status=200):
+            self.status_code = status
             self._p = p
 
         def json(self):
@@ -353,7 +357,9 @@ def _xproc_worker(db_exch, db_intent, out_path, idx):
         def post(self, url, headers=None, json=None, auth=None, timeout=None):
             path = _up(url).path
             if path.endswith("/executors/search"):
-                return _R({"data": []})
+                # FAZ15 Stage2b contract: pagination bloğu zorunlu.
+                return _R({"data": [], "pagination": {"limit": 100, "has_more": False,
+                                                      "next_cursor": None, "total_count": 0}})
             if path == "/fapi/v1/order":
                 p = _pr(url)
                 qty = _D(p["quantity"])

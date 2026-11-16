@@ -76,6 +76,10 @@ class FakeBinance:
 
     def _simulate_fill(self):
         self._opened = True
+    def account_snapshot(self):
+        # FAZ16 (4331dd1): gerçek giriş yolu artık TEK snapshot ister — fixture katmanı.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
 
     def open_orders(self, symbol):
         return []
@@ -112,12 +116,28 @@ class FakeHB:
         return {"status": "ok"}
 
 
+class _RiskOK:
+    """FAZ16 (4331dd1) giriş kapısının beklediği minimal RiskEngine testi.
+    Üretim kapısına dokunmaz; sadece 'sağlıklı, halt'sız, onaylayan' motoru taklit eder."""
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, balance, slippage, take_profit_pct=None, equity=None,
+                      max_position_pct=None):
+        return 50.0, "approved"
+
+
 class F1Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "risk_ledger.db")
         self._orig_max = auto_trader.MAX_OPEN_POSITIONS
-        auto_trader.MAX_OPEN_POSITIONS = 2
+        auto_trader.MAX_OPEN_POSITIONS = 5
         self._orig = {}
         for name, val in [
             ("check_liquidity", lambda b, s: (True, "ok")),
@@ -135,6 +155,15 @@ class F1Base(unittest.TestCase):
         self._orig_pf = auto_trader.PENDING_FILLS_JSON
         auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
         auto_trader._PENDING_FILLS.clear()
+        # FAZ16 giriş kapısının modül globali: test kirliliğini kanonik biçimde yalıt.
+        _saved_health = auto_trader._entry_health_reasons()
+
+        def _restore(saved):
+            for k in list(auto_trader._entry_health_reasons()):
+                auto_trader._entry_health_clear(k)
+            for k, v in saved.items():
+                auto_trader._entry_health_set(k, v)
+        self.addCleanup(_restore, _saved_health)
 
     def tearDown(self):
         for name, val in self._orig.items():
@@ -166,7 +195,7 @@ class TestF1(F1Base):
         fb = FakeBinance(algo_raw=[_algo(side="BUY")])   # LONG needs SELL -> invalid
         hb = FakeHB()
         cc = self._cc(fb, hb)
-        res = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
+        res = auto_trader.open_coin(fb, hb, self._coin(), risk=_RiskOK(), reserver=None,
                                     coordinator=cc)
         self.assertTrue(res)          # emir kabul edildi, dolum bekliyor
         out = self._drive_fill(fb, hb, cc)
@@ -180,7 +209,7 @@ class TestF1(F1Base):
         fb = FakeBinance(algo_raw={"code": -1, "msg": "err"})
         hb = FakeHB()
         cc = self._cc(fb, hb)
-        res = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
+        res = auto_trader.open_coin(fb, hb, self._coin(), risk=_RiskOK(), reserver=None,
                                     coordinator=cc)
         self.assertTrue(res)
         out = self._drive_fill(fb, hb, cc)

@@ -167,7 +167,9 @@ def test_scan_thresholds_env_overridable(monkeypatch):
 def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
     """Kapı açıkken emir yolu uçtan uca çalışır: tek blokaj FAZ6 kapısıdır, emir hattı değil."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from test_faz12_layer_wiring import _FakeBinance, _FakeHB
+    # _RiskOK: FAZ16 (4331dd1) giriş kapısının beklediği sağlıklı RiskEngine stub'ı
+    # (tek kaynak: test_faz12_layer_wiring). Gerçek giriş beklenen test risk'siz çağrılmaz.
+    from test_faz12_layer_wiring import _FakeBinance, _FakeHB, _RiskOK
 
     posted = []
     hb = _FakeHB()
@@ -200,7 +202,7 @@ def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
     b = _FakeBinance()
     b.place_algo_sl = lambda symbol, trig, amount, side: {"algoId": 1}
     b.cancel_algo_order = lambda aid: {"ok": True}
-    ok = auto_trader.open_coin(b, hb, coin, dry_run=False, risk=None,
+    ok = auto_trader.open_coin(b, hb, coin, dry_run=False, risk=_RiskOK(),
                                reserver=None, coordinator=None)
     assert ok is True
     assert len(posted) == 1, "kapı açıkken create_executor çağrılmadı"

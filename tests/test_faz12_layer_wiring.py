@@ -110,6 +110,11 @@ class _FakeBinance:
     def position_risk(self):
         return []
 
+    def account_snapshot(self):
+        # FAZ16 (4331dd1): gerçek giriş yolu artık TEK snapshot ister — fixture katmanı.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
     def open_algo_orders_for(self, symbol):
         return []
 
@@ -127,11 +132,35 @@ class _FakeHB:
         return []
 
 
+class _RiskOK:
+    """FAZ16 (4331dd1) giriş kapısının beklediği minimal RiskEngine testi.
+    Üretim kapısına dokunmaz; sadece 'sağlıklı, halt'sız, onaylayan' motoru taklit eder."""
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, balance, slippage, take_profit_pct=None, equity=None,
+                      max_position_pct=None):
+        return 50.0, "approved"
+
+
 class PreflightWiringTest(unittest.TestCase):
     def setUp(self):
         self._orig = {n: getattr(auto_trader, n) for n in
                       ("HB_OFFLINE", "_live_family_gate", "_live_regime_gate",
                        "_live_edge_gate", "_live_cfg")}
+        # FAZ16 giriş kapısının modül globali: test kirliliğini kanonik biçimde yalıt.
+        _saved_health = auto_trader._entry_health_reasons()
+        def _restore(saved):
+            for k in list(auto_trader._entry_health_reasons()):
+                auto_trader._entry_health_clear(k)
+            for k, v in saved.items():
+                auto_trader._entry_health_set(k, v)
+        self.addCleanup(_restore, _saved_health)
         auto_trader.HB_OFFLINE = False
         auto_trader._live_family_gate = lambda *a, **k: (True, "ok")
         auto_trader._live_regime_gate = lambda *a, **k: (True, "ok")
@@ -164,8 +193,10 @@ class PreflightWiringTest(unittest.TestCase):
         auto_trader.preflight.pre_flight_check = fake_pf
         try:
             b = _FakeBinance()
+            # FAZ16 (4331dd1): gerçek giriş yolu RiskEngine ister — sağlıklı motor verilir;
+            # "risk yoksa giriş yok" kanıtı test_risk_engine_integrity.py'de duruyor.
             res = auto_trader.open_coin(b, _FakeHB(), self._coin(), dry_run=False,
-                                        risk=None, reserver=None, coordinator=None)
+                                        risk=_RiskOK(), reserver=None, coordinator=None)
         finally:
             auto_trader.preflight.pre_flight_check = orig
         self.assertFalse(res)

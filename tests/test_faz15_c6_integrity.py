@@ -577,6 +577,17 @@ class TestPendingFinalizeLifecycle(Base):
             self.assertTrue(auto_trader._PENDING_FILLS["E1"]["finalization_complete"])
             self.assertEqual(out1["waiting"], 1)
             self.assertEqual(self.order.count("finalize"), 1)
+
+            # protect_then_gate reconciliation runs after pending processing.
+            # An exchange position must NOT delete a reservation while its
+            # finalization is complete but confirm is still awaiting retry.
+            rep = r.reconcile(
+                {"NEARUSDT"}, finalizing_symbols={"NEARUSDT"})
+            self.assertEqual(rep.promoted, [],
+                             "pending confirm rezervasyonu reconcile tarafından silindi")
+            self.assertEqual(len(r.active_reservations()), 1,
+                             "confirm retry öncesi rezervasyon korunmalı")
+
             r.fail = False
             out2 = auto_trader._process_pending_fills(FakeBinance([]), hb, None, None, r)
             self.assertEqual(self.order.count("finalize"), 1,
