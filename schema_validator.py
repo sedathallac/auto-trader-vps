@@ -103,6 +103,39 @@ def assert_schema(
         )
 
 
+def validate_singletons(db_file) -> List[str]:
+    """FAZ16: gerekli singleton satırları ve anahtar bütünlüğünü doğrular.
+
+    `validate_schema` yalnız sütunlara bakar (geriye uyumlu). Bu fonksiyon
+    risk_state id=1, sync_meta id=1 ve trade_ledger executor_id tekilliğini
+    kontrol eder; eksikse yeni giriş fail-closed olmalıdır."""
+    problems: List[str] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+    except Exception as e:
+        return [f"DB açılamadı ({db_file}): {e}"]
+    try:
+        for table in ("risk_state", "sync_meta"):
+            if table_columns(conn, table) is None:
+                continue  # eksik tablo validate_schema'da raporlanır
+            if conn.execute(f"SELECT 1 FROM {table} WHERE id=1").fetchone() is None:
+                problems.append(f"{table} id=1 satırı YOK")
+        if table_columns(conn, "trade_ledger") is not None:
+            dup = conn.execute(
+                "SELECT executor_id FROM trade_ledger GROUP BY executor_id "
+                "HAVING COUNT(*)>1 LIMIT 1").fetchone()
+            if dup is not None:
+                problems.append(f"trade_ledger duplicate executor_id: {dup[0]}")
+    finally:
+        conn.close()
+    return problems
+
+
+def validate_integrity(db_file) -> List[str]:
+    """Şema + singleton bütünlüğü (operatör/startup için tam kontrol)."""
+    return validate_schema(db_file) + validate_singletons(db_file)
+
+
 def main() -> int:
     """CLI: `python3 schema_validator.py [db_path]` — OK ise 0, uyumsuzsa 1 döndürür."""
     import sys
