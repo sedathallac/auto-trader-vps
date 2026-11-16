@@ -45,6 +45,10 @@ class FakeBinance:
     def place_algo_sl(self, *a, **k):
         return {"algoId": 1}
 
+    def query_order(self, symbol, order_id=None, orig_client_order_id=None):
+        # FAZ15: terminal emir kanıtı (CANCELED + sıfır dolum) — release için gerekli.
+        return {"status": "CANCELED", "executedQty": "0", "orderId": order_id}
+
 
 class FakeHB:
     def __init__(self):
@@ -114,6 +118,10 @@ class TestExecutionRobustness(Faz2Base):
         r = auto_trader.open_coin(fb, hb, self._coin(), risk=None,
                                   reserver=self.reserver, coordinator=None)
         self.assertTrue(r)          # FAZ14p: open_coin beklemez, dolum tick'te izlenir
+        # FAZ15: release için TERMINAL emir kanıtı gerekir; HB orderId vermez, bu yüzden
+        # test kimliği enjekte eder (gerçek akışta kimlik yoksa rezervasyon KORUNUR).
+        for _c in auto_trader._PENDING_FILLS.values():
+            _c["entry_order_id"] = 4242
         out = auto_trader._process_pending_fills(fb, hb, None, None, self.reserver)
         self.assertEqual(out["cancelled"], 1)
         # robustness: the leaked reservation must be freed...
@@ -129,6 +137,8 @@ class TestExecutionRobustness(Faz2Base):
         hb = FakeHB()
         auto_trader.open_coin(fb, hb, self._coin(), risk=None,
                               reserver=self.reserver, coordinator=None)
+        for _c in auto_trader._PENDING_FILLS.values():
+            _c["entry_order_id"] = 4242
         auto_trader._process_pending_fills(fb, hb, None, None, self.reserver)
         self.assertEqual(self.reserver.used_slots([]), 0)   # full capacity restored
 

@@ -153,11 +153,14 @@ class TestUnknownAndReconcile(unittest.TestCase):
         self.assertIn("AAAUSDT", [x["symbol"] for x in rep.promoted])
 
     def test_reconcile_releases_stale_without_position(self):
+        # FAZ15: TTL artık serbest bırakma kanıtı DEĞİL. Yaşlanan PENDING kayıt
+        # alarm/stale olarak işaretlenir ve KORUNUR; release yalnız
+        # _process_pending_fills() içinde terminal emir kanıtıyla yapılır.
         self.r.reserve("AAAUSDT", exchange_open_symbols=[])
-        # TTL passed and the symbol never appeared on the exchange -> release.
         rep = self.r.reconcile(exchange_open_symbols=[], ttl_seconds=0)
-        self.assertEqual(self.r.used_slots(exchange_open_symbols=[]), 0)
-        self.assertIn("AAAUSDT", [x["symbol"] for x in rep.released])
+        self.assertEqual(self.r.used_slots(exchange_open_symbols=[]), 1)
+        self.assertEqual(rep.released, [])
+        self.assertIn("AAAUSDT", [x["symbol"] for x in rep.stale])
 
     def test_reconcile_keeps_fresh_pending(self):
         self.r.reserve("AAAUSDT", exchange_open_symbols=[])

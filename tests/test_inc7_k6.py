@@ -37,7 +37,8 @@ class _Reconcile:
 
 
 class _FakeReserver:
-    def reconcile(self, eos):
+    def reconcile(self, eos, ttl_seconds=120.0, keep_symbols=None,
+                  finalizing_symbols=None):
         return _Reconcile()
 
 

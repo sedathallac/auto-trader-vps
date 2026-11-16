@@ -459,10 +459,12 @@ class TestMaxOpenIntegration(unittest.TestCase):
         self.assertTrue(res.ok)
         # UNKNOWN create outcome -> caller does NOT release; slot stays held.
         self.assertEqual(len(self.r.active_reservations()), 1)
-        # restart reconcile against exchange truth: A never opened + stale -> released.
+        # FAZ15: restart reconcile TTL ile OTOMATİK release ETMEZ; kayıt korunur ve
+        # stale olarak işaretlenir (release yalnız terminal emir kanıtıyla).
         rep = self.r.reconcile([], ttl_seconds=0.0)
-        self.assertEqual(len(rep.released), 1)
-        self.assertEqual(self.r.active_reservations(), [])
+        self.assertEqual(len(rep.released), 0)
+        self.assertEqual(len(rep.stale), 1)
+        self.assertEqual(len(self.r.active_reservations()), 1)
 
     def test_restart_reconcile_promotes_real_position(self):
         self.r.reserve("A", [])

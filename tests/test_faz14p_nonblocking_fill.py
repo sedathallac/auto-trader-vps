@@ -45,9 +45,13 @@ class _Binance:
 class _Reserver:
     def __init__(self):
         self.released = []
+        self.confirmed = []
 
     def release(self, rid, reason=""):
         self.released.append((rid, reason))
+
+    def confirm(self, rid):
+        self.confirmed.append(rid)
 
 
 @pytest.fixture(autouse=True)
@@ -141,14 +145,17 @@ def test_process_adopts_when_position_exists(monkeypatch):
 
 
 def test_process_cancels_when_flat(monkeypatch):
+    # FAZ15: flat + executor durduruldu ama TERMINAL EMİR KANITI yok (entry_order_id
+    # yok) -> rezervasyon serbest BIRAKILMAZ, pending korunur.
     monkeypatch.setattr(auto_trader, "_finalize_open", lambda *a, **k: pytest.fail("flat iken finalize olmamalı"))
     hb = _HB({"filled_amount_quote": 0, "error_count": 0})
     rs = _Reserver()
     auto_trader._register_pending_fill("E1", _ctx(deadline_offset=-1))
     out = auto_trader._process_pending_fills(_Binance(amt=0.0), hb, None, None, rs)
-    assert out["cancelled"] == 1
+    assert out["cancelled"] == 0 and out["waiting"] == 1
     assert hb.stopped == [("E1", True)]
-    assert rs.released == [(7, "not_filled")]
+    assert rs.released == [], "terminal emir kanıtı olmadan release yok"
+    assert "E1" in auto_trader._PENDING_FILLS
 
 
 def test_process_fails_closed_when_position_unreadable(monkeypatch):
