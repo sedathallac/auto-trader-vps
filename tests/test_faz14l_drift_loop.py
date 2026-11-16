@@ -77,7 +77,7 @@ def test_adopts_executor_when_position_exists():
     FAZ14p: karar open_coin'den _process_pending_fills'e taşındı (bloklamayan tick işleyici).
     """
     src = inspect.getsource(auto_trader._process_pending_fills)
-    assert "executor BENİMSENDİ" in src
+    assert "BENİMSENDİ" in src
     assert "_pos_amt != 0" in src
     # durdurma yalnız flat dalında olmalı
     flat_branch = src.split("_pos_amt != 0")[1]

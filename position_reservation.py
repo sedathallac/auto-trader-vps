@@ -46,6 +46,21 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+# FAZ15: CONFIRMED bir rezervasyon bu süreden uzun süre borsada görünmezse CRITICAL
+# alarm üretilir (kayıt KORUNUR — otomatik silme yok).
+CONFIRMED_ALARM_S = 600.0
+
+
+def _age_seconds(ts, now: datetime):
+    """ISO zaman damgasından yaş (saniye); okunamazsa None."""
+    if not ts:
+        return None
+    try:
+        return (now - datetime.fromisoformat(ts)).total_seconds()
+    except Exception:
+        return None
+
+
 @dataclass
 class ReserveResult:
     ok: bool
@@ -57,8 +72,9 @@ class ReserveResult:
 @dataclass
 class ReconcileReport:
     promoted: List[dict] = field(default_factory=list)  # became real positions
-    released: List[dict] = field(default_factory=list)  # stale -> freed
+    released: List[dict] = field(default_factory=list)  # freed (explicit only)
     kept: List[dict] = field(default_factory=list)       # still in-flight
+    stale: List[dict] = field(default_factory=list)      # aged -> alarm, NOT freed
 
 
 class PositionReserver:
@@ -89,9 +105,16 @@ class PositionReserver:
                     symbol TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'PENDING',
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    confirmed_at TEXT
                 )
             """)
+            # Idempotent migration for DBs created before confirmed_at existed.
+            # Never drops or recreates the table; existing rows are preserved.
+            cols = {r["name"] for r in
+                    conn.execute("PRAGMA table_info(position_reservations)").fetchall()}
+            if "confirmed_at" not in cols:
+                conn.execute("ALTER TABLE position_reservations ADD COLUMN confirmed_at TEXT")
             # One active reservation per symbol (backstop against races + prevents
             # duplicate opens of the same symbol).
             conn.execute("""
@@ -187,52 +210,90 @@ class PositionReserver:
             conn.close()
 
     def confirm(self, reservation_id: int) -> None:
-        """Mark a reservation CONFIRMED (position known created). Optional — the
-        reservation is cleared by reconcile() once the exchange shows the
-        position; this just records intent."""
+        """Mark a reservation CONFIRMED (position known created).
+
+        FAZ15: state/confirmed_at/updated_at are written in ONE transaction and a
+        zero-row UPDATE now raises instead of silently succeeding. The old code
+        ignored the rowcount, so confirming a reservation that no longer existed
+        looked successful and the caller dropped the pending record — losing the
+        only evidence that a slot might still be held.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "UPDATE position_reservations SET state='CONFIRMED', updated_at=? WHERE id=?",
-                (_iso(_utcnow()), reservation_id),
+            now = _iso(_utcnow())
+            cur = conn.execute(
+                "UPDATE position_reservations "
+                "SET state='CONFIRMED', confirmed_at=?, updated_at=? WHERE id=?",
+                (now, now, reservation_id),
             )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                raise LookupError(
+                    f"confirm: rezervasyon bulunamadı (id={reservation_id})")
             conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
-    def reconcile(self, exchange_open_symbols, ttl_seconds: float = 120.0) -> ReconcileReport:
+    def reconcile(self, exchange_open_symbols, ttl_seconds: float = 120.0,
+                  keep_symbols=None, finalizing_symbols=None) -> ReconcileReport:
         """Resolve reservations against real exchange positions.
 
-        - symbol now on exchange -> delete (promoted to a real position).
-        - past TTL and not on exchange -> delete (release stale / UNKNOWN->none).
-        - fresh and not on exchange -> keep (still in-flight).
+        FAZ15 — TTL artık TEK BAŞINA serbest bırakma kanıtı değil:
+        - symbol now on exchange        -> delete (promoted to a real position).
+        - symbol in keep_symbols        -> keep (pending fill still in flight).
+        - symbol in finalizing_symbols  -> keep (finalization done, confirm pending).
+        - CONFIRMED                     -> never TTL-deleted; if confirmed_at is
+                                           older than CONFIRMED_ALARM_S and the
+                                           symbol is not on the exchange, a CRITICAL
+                                           alarm is recorded and the row is KEPT.
+        - PENDING past TTL              -> kept + recorded as stale (alarm/review);
+                                           release only happens in
+                                           _process_pending_fills() on real terminal
+                                           order proof + verified flat position.
         Idempotent; safe to call every loop and on startup (restart recovery).
         """
         exch = set(exchange_open_symbols)
+        keep = set(keep_symbols or ())
+        finalizing = set(finalizing_symbols or ())
         now = _utcnow()
         rep = ReconcileReport()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT id, symbol, created_at FROM position_reservations"
+                "SELECT id, symbol, state, created_at, confirmed_at "
+                "FROM position_reservations"
             ).fetchall()
             for r in rows:
-                rid, symbol, created_at = r["id"], r["symbol"], r["created_at"]
+                rid, symbol = r["id"], r["symbol"]
+                state = (r["state"] or "PENDING").upper()
                 if symbol in exch:
                     conn.execute("DELETE FROM position_reservations WHERE id=?", (rid,))
                     rep.promoted.append({"id": rid, "symbol": symbol})
                     continue
-                try:
-                    age = (now - datetime.fromisoformat(created_at)).total_seconds()
-                except Exception:
-                    age = ttl_seconds + 1  # unparsable -> treat as stale
-                if age >= ttl_seconds:
-                    conn.execute("DELETE FROM position_reservations WHERE id=?", (rid,))
-                    rep.released.append({"id": rid, "symbol": symbol, "age": age})
-                else:
-                    rep.kept.append({"id": rid, "symbol": symbol, "age": age})
+                if symbol in keep or symbol in finalizing:
+                    rep.kept.append({"id": rid, "symbol": symbol, "state": state})
+                    continue
+                if state == "CONFIRMED":
+                    age = _age_seconds(r["confirmed_at"], now)
+                    if age is not None and age >= CONFIRMED_ALARM_S:
+                        rep.stale.append({"id": rid, "symbol": symbol,
+                                          "state": state, "age": age})
+                    rep.kept.append({"id": rid, "symbol": symbol, "state": state})
+                    continue
+                age = _age_seconds(r["created_at"], now)
+                if age is None or age >= ttl_seconds:
+                    rep.stale.append({"id": rid, "symbol": symbol,
+                                      "state": state, "age": age})
+                rep.kept.append({"id": rid, "symbol": symbol,
+                                 "state": state, "age": age})
             conn.execute("COMMIT")
             return rep
         except Exception:

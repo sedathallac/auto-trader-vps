@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """auto_trader.py v4 — otonom kalite tarayıcı + native SL koruma"""
-import os, sys, time, hmac, hashlib, logging, argparse, json
+import os, sys, time, hmac, hashlib, logging, argparse, json, math
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -130,7 +130,17 @@ _HB_AUTH_BROKEN = False  # FAZ14f: Hummingbot kimlik hatasi sonrasi surecte yeni
 
 
 def _norm_symbol(s):
-    return str(s or "").upper().replace("-", "").replace("_", "")
+    """Sembol normalizasyonu — TEK kaynak.
+
+    FAZ15: eski hâli yalnız upper + ayraç silme yapıyordu; `"  ENA-USDT  "` gibi
+    boşluklu girdi `"  ENAUSDT  "` olarak dönüyor ve aynı sembol iki farklı
+    anahtar üretiyordu (slot sayımı, rezervasyon, pending eşleşmesi kayabilir).
+    Geçersiz girdi (None/boş/yalnız whitespace) "" döner; çağıran fail-closed uygular.
+    """
+    if s is None:
+        return ""
+    t = str(s).strip().upper().replace("-", "").replace("_", "")
+    return t if t else ""
 
 
 def _occupied_slots(binance, hb):
@@ -143,8 +153,12 @@ def _occupied_slots(binance, hb):
     Doğru semantik: slotu (a) borsadaki açık pozisyon ya da (b) dolumu bekleyen emir
     işgal eder. Hayalet executor slot işgal ETMEZ (yalnız uyarı loglanır).
     Dönüş: (slot_kümesi, hb_pair_kümesi) veya okunamazsa (None, None) -> çağıran fail-closed.
+
+    FAZ15: pozisyon okuma mantığı `_exchange_open_symbols`e devredildi (kopya yok) ve
+    bozuk pending context artık fail-closed: eskiden `(ctx or {}).get("symbol")` boş
+    sembolü sessizce atıyor, "0 slot kullanılıyor" gibi yanlış bir sonuç üretebiliyordu.
     """
-    slots, pairs = set(), set()
+    pairs = set()
     if not HB_OFFLINE:
         try:
             for e in hb.active_executors():
@@ -153,23 +167,19 @@ def _occupied_slots(binance, hb):
         except Exception as e:
             log.critical(f"🚨 slot sayımı: HB executor listesi alınamadı: {e}")
             return None, None
-    try:
-        pr = binance.position_risk()
-    except Exception as e:
-        log.critical(f"🚨 slot sayımı: positionRisk alınamadı: {e}")
+    slots = _exchange_open_symbols(binance)
+    if slots is None:
+        log.critical("🚨 slot sayımı: borsa pozisyonları doğrulanamadı (fail-closed)")
         return None, None
-    if not isinstance(pr, list):
-        log.critical("🚨 slot sayımı: positionRisk beklenmeyen tip")
-        return None, None
-    for p in pr:
-        try:
-            if float(p.get("positionAmt") or 0) != 0:
-                slots.add(_norm_symbol(p.get("symbol")))
-        except (TypeError, ValueError):
-            continue
-    for ctx in list(_PENDING_FILLS.values()):
-        slots.add(_norm_symbol((ctx or {}).get("symbol")))
-    slots.discard("")
+    for eid, ctx in list(_PENDING_FILLS.items()):
+        if not isinstance(ctx, dict):
+            log.critical(f"🚨 slot sayımı: bozuk pending context ({eid}) — fail-closed")
+            return None, None
+        sym = _norm_symbol(ctx.get("symbol"))
+        if not sym:
+            log.critical(f"🚨 slot sayımı: pending context sembolü geçersiz ({eid}) — fail-closed")
+            return None, None
+        slots.add(sym)
     ghosts = {_norm_symbol(p) for p in pairs} - slots
     ghosts.discard("")
     if ghosts:
@@ -895,21 +905,59 @@ def new_entry_allowed(drift, stale, mode_ok, unprotected):
     return (not drift) and (not stale) and bool(mode_ok) and (not unprotected)
 
 
+def _pending_symbol_sets():
+    """Pending dolum kayıtlarını (keep, finalizing) kümelerine ayır — TEK kaynak.
+
+    keep       : hâlâ uçuşta olan (finalizasyonu tamamlanmamış) semboller.
+    finalizing : finalizasyonu TAMAMLANMIŞ, yalnız confirm bekleyen semboller.
+    Bozuk context "" üretir; çağıran fail-closed uygular.
+    """
+    keep, finalizing = set(), set()
+    for ctx in list(_PENDING_FILLS.values()):
+        if not isinstance(ctx, dict):
+            return None, None
+        sym = _norm_symbol(ctx.get("symbol"))
+        if not sym:
+            return None, None
+        (finalizing if ctx.get("finalization_complete") else keep).add(sym)
+    return keep, finalizing
+
+
 def protect_then_gate(binance, reserver, drift, stale):
     """K6: run the protection check (SL coverage + CRITICAL alarms) and the
     reservation reconcile REGARDLESS of drift/stale, THEN decide whether new
     entries are allowed. A reconciliation drift blocks new entries but never
-    disables protection for open positions. Returns (allow_new_entry, reasons)."""
+    disables protection for open positions. Returns (allow_new_entry, reasons).
+
+    FAZ15: her hata yolu fail-closed. Eski kod reconcile exception'ını
+    `log.warning` ile yutup normal giriş akışına devam ediyordu; `_eos is None`
+    (pozisyon durumu bilinmiyor) durumunda reconcile tamamen atlanıyor ve kapı
+    yine de açılabiliyordu. Artık ikisi de `reconcile_ok=False` üretir ve yeni
+    giriş engellenir. Pending semboller keep/finalizing kümeleriyle reconcile'a
+    aktarılır ki TTL onları serbest bırakmasın.
+    """
     ensure_sl_coverage(binance)  # <- always runs; drift/stale never skip it
+    reconcile_ok = True
+    keep, finalizing = _pending_symbol_sets()
+    if keep is None:
+        log.critical("🚨 protect_then_gate: bozuk pending context — fail-closed")
+        reconcile_ok = False
+        keep, finalizing = set(), set()
     try:
         _eos = _exchange_open_symbols(binance)
-        if _eos is not None and reserver is not None:
-            _rc = reserver.reconcile(_eos)
+        if _eos is None:
+            log.critical("🚨 protect_then_gate: borsa pozisyonları doğrulanamadı — "
+                         "reconcile atlandı, yeni giriş fail-closed")
+            reconcile_ok = False
+        elif reserver is not None:
+            _rc = reserver.reconcile(_eos, keep_symbols=keep,
+                                     finalizing_symbols=finalizing)
             if _rc.promoted or _rc.released:
                 log.info(f"  🔁 rezervasyon reconcile: promoted={len(_rc.promoted)} "
                          f"released={len(_rc.released)} kept={len(_rc.kept)}")
     except Exception as e:
-        log.warning(f"rezervasyon reconcile hatası: {e}")
+        log.critical(f"🚨 rezervasyon reconcile hatası — yeni giriş fail-closed: {e}")
+        reconcile_ok = False
     if HB_OFFLINE:
         # HB_OFFLINE = emir YOK (veri toplama). ONEWAY doğrulaması YALNIZ yeni-giriş kapısında atlanır; geçersiz/IP-kısıtlı
         # anahtarla (-2015) mod UNKNOWN olup compare verisini engellemesin. _verify_oneway'in kendisi DEĞİŞMEDİ:
@@ -920,9 +968,10 @@ def protect_then_gate(binance, reserver, drift, stale):
         mode_ok, mode = _verify_oneway(binance)
     unprotected = should_block_new_entries()
     allow = new_entry_allowed(drift=drift, stale=stale, mode_ok=mode_ok,
-                              unprotected=unprotected)
+                              unprotected=unprotected) and reconcile_ok
     return allow, {"drift": drift, "stale": stale, "mode": mode,
-                   "mode_ok": mode_ok, "unprotected": unprotected}
+                   "mode_ok": mode_ok, "unprotected": unprotected,
+                   "reconcile_ok": reconcile_ok}
 
 
 # K-3: shared ledger path for the cross-process SL-placement intent (same db as the
@@ -1569,18 +1618,45 @@ def _exchange_position_amt(binance, symbol):
 
 
 def _exchange_open_symbols(binance):
-    """Set of symbols with a non-zero exchange position, or None on API failure.
-    None means the caller MUST fail-closed (do not admit a new position)."""
-    positions = binance.position_risk()
+    """Borsadaki açık pozisyon sembolleri (normalize) veya None.
+
+    FAZ15: `None` = pozisyon durumu BİLİNMİYOR; çağıran fail-closed uygulamak
+    zorunda. Eski kod yalnız liste tipini kontrol ediyor, `position_risk()`
+    exception'ını yukarı sızdırıyor ve bozuk satırları sessizce atlıyordu —
+    hatalı veri "boş pozisyon listesi" gibi yorumlanabiliyordu. Artık her bozuk
+    alan (dict olmayan eleman, eksik/sayısal olmayan/NaN positionAmt, geçersiz
+    sembol) None ile sonuçlanır.
+    """
+    try:
+        positions = binance.position_risk()
+    except Exception as e:
+        log.critical(f"🚨 _exchange_open_symbols: positionRisk hatası: {e}")
+        return None
     if not isinstance(positions, list):
+        log.critical("🚨 _exchange_open_symbols: positionRisk liste değil")
         return None
     out = set()
     for p in positions:
+        if not isinstance(p, dict):
+            log.critical("🚨 _exchange_open_symbols: listede dict olmayan eleman")
+            return None
+        if "positionAmt" not in p:
+            log.critical("🚨 _exchange_open_symbols: positionAmt alanı eksik")
+            return None
         try:
-            if float(p.get("positionAmt", 0)) != 0:
-                out.add(p["symbol"])
-        except (TypeError, ValueError, KeyError):
-            continue
+            amt = float(p.get("positionAmt"))
+        except (TypeError, ValueError):
+            log.critical("🚨 _exchange_open_symbols: positionAmt sayısal değil")
+            return None
+        if not math.isfinite(amt):
+            log.critical("🚨 _exchange_open_symbols: positionAmt NaN/Inf")
+            return None
+        if amt != 0:
+            sym = _norm_symbol(p.get("symbol"))
+            if not sym:
+                log.critical("🚨 _exchange_open_symbols: açık pozisyonun sembolü geçersiz")
+                return None
+            out.add(sym)
     return out
 
 
@@ -2400,7 +2476,14 @@ def _load_pending_fills():
 
 
 def _register_pending_fill(eid, ctx):
-    _PENDING_FILLS[str(eid)] = dict(ctx)
+    """Pending kaydı yaz + diske persist. FAZ15: lifecycle alanları HER kayıtta
+    varsayılanlarıyla bulunur (finalization_complete/attempts/last_error), böylece
+    restart sonrası yüklenen eski kayıtlar da aynı şemayla okunur."""
+    rec = dict(ctx)
+    rec.setdefault("finalization_complete", False)
+    rec.setdefault("finalization_attempts", 0)
+    rec.setdefault("last_error", None)
+    _PENDING_FILLS[str(eid)] = rec
     _persist_pending_fills()
 
 
@@ -2409,78 +2492,218 @@ def _drop_pending_fill(eid):
     _persist_pending_fills()
 
 
+_TERMINAL_ORDER_STATES = ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
+_ACTIVE_ORDER_STATES = ("NEW", "PARTIALLY_FILLED", "PENDING_NEW")
+
+
+def _entry_order_terminal(binance, symbol, ctx):
+    """Giriş emrinin GERÇEKTEN terminal + sıfır dolum olduğunu doğrula.
+
+    Dönüş: True  -> terminal (CANCELED/EXPIRED/REJECTED) + executedQty=0 + flat
+            False -> terminal değil / kısmi veya tam dolum / pozisyon açık
+            None  -> BELİRSİZ (emir kimliği yok, API hatası, bilinmeyen status)
+
+    FAZ15: `open_orders(symbol)==[]` terminal kanıtı DEĞİLDİR. Yalnız belirli giriş
+    emri sorgulanır. Hummingbot `create_executor()` yalnız `executor_id` döndürür;
+    exchange orderId/origClientOrderId vermez — bu yüzden kimlik yoksa sonuç None
+    olur ve çağıran rezervasyonu KORUR (otomatik release yok).
+    """
+    oid = ctx.get("entry_order_id")
+    ocid = ctx.get("entry_client_order_id")
+    if not oid and not ocid:
+        return None
+    try:
+        r = binance.query_order(symbol, order_id=oid, orig_client_order_id=ocid)
+    except Exception as e:
+        log.warning(f"  giriş emri sorgusu hatası ({symbol}): {e}")
+        return None
+    if not isinstance(r, dict) or "status" not in r:
+        log.warning(f"  giriş emri sorgusu belirsiz ({symbol}): {r}")
+        return None
+    status = str(r.get("status") or "").upper()
+    if status in _ACTIVE_ORDER_STATES or status == "FILLED":
+        return False
+    if status not in _TERMINAL_ORDER_STATES:
+        return None
+    try:
+        executed = float(r.get("executedQty") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(executed) or executed != 0:
+        return False
+    amt = _exchange_position_amt(binance, symbol)
+    if amt is None or amt != 0:
+        return False
+    return True
+
+
+def _pending_confirm(eid, ctx, reserver, out):
+    """Rezervasyonu CONFIRMED yap; başarılıysa pending kaydı düşür.
+
+    FAZ15: confirm başarısızsa pending KORUNUR ve diske yazılır; sonraki tick yalnız
+    confirm'i yeniden dener (finalizer ikinci kez çalışmaz).
+    """
+    rid = ctx.get("res_id")
+    if reserver is None or rid is None:
+        _drop_pending_fill(eid)
+        return True
+    try:
+        reserver.confirm(rid)
+    except Exception as e:
+        log.critical(f"  🚨 confirm hatası ({ctx.get('symbol')}, id={rid}): {e} — "
+                     f"pending KORUNDU, sonraki tick yalnız confirm deneyecek")
+        ctx["last_error"] = f"confirm: {e}"
+        _register_pending_fill(eid, ctx)
+        out["waiting"] += 1
+        return False
+    _drop_pending_fill(eid)
+    return True
+
+
+def _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
+                          reserver, out, key):
+    """_finalize_open çalıştır, sonucu KALICI yaz, sonra confirm et.
+
+    FAZ15 sıra garantisi: finalize -> persist(finalization_complete) -> confirm -> drop.
+    Eski kod `_drop_pending_fill()` çağrısını finalizasyondan ÖNCE yapıyordu; finalize
+    exception verirse pending kaydı çoktan silinmiş oluyor ve rezervasyon sahipsiz
+    kalıyordu.
+    """
+    ctx["finalization_attempts"] = int(ctx.get("finalization_attempts") or 0) + 1
+    _register_pending_fill(eid, ctx)          # deneme sayısı ÖNCE diske
+    try:
+        ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
+                            float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
+                            binance.filters(symbol), risk, coordinator, eid)
+    except Exception as e:
+        ok = False
+        ctx["last_error"] = f"finalize: {e}"
+        log.error(f"  finalize hatası ({symbol}): {e}")
+    if ok:
+        ctx["finalization_complete"] = True
+        ctx["last_error"] = None
+        _register_pending_fill(eid, ctx)      # confirm'den ÖNCE kalıcı
+        out[key] += 1
+        return _pending_confirm(eid, ctx, reserver, out)
+    ctx["last_error"] = ctx.get("last_error") or "finalize returned False"
+    _register_pending_fill(eid, ctx)
+    out["failed"] += 1
+    _amt = _exchange_position_amt(binance, symbol)
+    if _amt is None or _amt != 0:
+        log.critical(f"  🚨 {symbol}: finalize başarısız, pozisyon "
+                     f"{'okunamadı' if _amt is None else f'açık ({_amt})'} — "
+                     f"pending ve rezervasyon KORUNDU")
+    else:
+        log.warning(f"  ⚠️  {symbol}: finalize başarısız ve borsa flat — terminal emir "
+                    f"kanıtı olmadan rezervasyon serbest BIRAKILMADI")
+    out["waiting"] += 1
+    return False
+
+
 def _process_pending_fills(binance, hb, risk, coordinator, reserver):
     """Her tick'te bir kez: bekleyen dolumları sorgular, karar verir. BLOKLAMAZ.
 
-    Dönen sözlük: {'filled': n, 'adopted': n, 'cancelled': n, 'waiting': n, 'failed': n}
+    Dönen sözlük: {'filled','adopted','cancelled','waiting','failed','released'}
     """
-    out = {"filled": 0, "adopted": 0, "cancelled": 0, "waiting": 0, "failed": 0}
+    out = {"filled": 0, "adopted": 0, "cancelled": 0, "waiting": 0,
+           "failed": 0, "released": 0}
     if not _PENDING_FILLS:
         return out
     for eid in list(_PENDING_FILLS.keys()):
-        ctx = _PENDING_FILLS.get(eid) or {}
-        symbol = ctx.get("symbol")
+        ctx = _PENDING_FILLS.get(eid)
+        if not isinstance(ctx, dict):
+            log.critical(f"  🚨 bozuk pending context ({eid}) — KORUNDU, inceleme gerekli")
+            out["waiting"] += 1
+            continue
+        symbol = _norm_symbol(ctx.get("symbol"))
+        if not symbol:
+            log.critical(f"  🚨 pending context sembolü geçersiz ({eid}) — KORUNDU")
+            out["waiting"] += 1
+            continue
+        # B — finalizasyon tamamlanmış: finalizer TEKRAR ÇALIŞMAZ, yalnız confirm retry.
+        if ctx.get("finalization_complete"):
+            _pending_confirm(eid, ctx, reserver, out)
+            continue
         try:
             ex = hb.get_executor(eid)
         except Exception as e:
             log.warning(f"  bekleyen dolum sorgu hatası ({symbol}): {e}")
             out["waiting"] += 1
             continue
+        # A — executor HB'de yok: ÖNCE borsa sorgulanır, pending hemen silinmez.
+        if ex is None:
+            _amt = _exchange_position_amt(binance, symbol)
+            if _amt is None:
+                log.critical(f"  🚨 {symbol}: executor yok, pozisyon durumu okunamadı — "
+                             f"pending ve rezervasyon KORUNDU")
+                out["waiting"] += 1
+                continue
+            if _amt != 0:
+                log.warning(f"  ♻️  {symbol}: executor yok ama borsada pozisyon var "
+                            f"({_amt}) — BENİMSENDİ")
+                _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk,
+                                      coordinator, reserver, out, "adopted")
+                continue
+            if _entry_order_terminal(binance, symbol, ctx) is True:
+                log.info(f"  🔓 {symbol}: giriş emri terminal + sıfır dolum + flat — "
+                         f"rezervasyon serbest")
+                if reserver is not None and ctx.get("res_id") is not None:
+                    reserver.release(ctx["res_id"], reason="terminal_no_fill")
+                    out["released"] += 1
+                _drop_pending_fill(eid)
+                out["cancelled"] += 1
+                continue
+            log.warning(f"  ⏳ {symbol}: executor yok, flat, terminal emir kanıtı YOK — "
+                        f"pending ve rezervasyon KORUNDU")
+            out["waiting"] += 1
+            continue
         filled = float(ex.get("filled_amount_quote", 0) or 0) if ex else 0.0
         err = int(ex.get("error_count", 0) or 0) if ex else 999
         deadline = float(ctx.get("deadline") or 0)
-        # FAZ14s: executor HB'de ARTIK YOK (silinmiş/expire olmuş). Dolum bekleyemez;
-        # kayıt düşürülür. Eski kod err=999 ile "dolmadı" dalına girip sembolü
-        # karalisteye yazıyordu — ölü bir executor yüzünden sağlam sembol kapanıyordu.
-        if ex is None:
-            log.warning(f"  🧹 bekleyen dolum düşürüldü: {symbol} executor={eid} HB'de yok "
-                        f"(dolamaz; karalisteye YAZILMADI)")
-            _drop_pending_fill(eid)
-            out["cancelled"] += 1
-            continue
+        # C — dolum tespit edildi: pending KORUNARAK finalize -> persist -> confirm -> drop
         if filled >= 1:
             log.info(f"  ✅ doldu: {filled:.2f} USDT ({symbol}, executor={eid})")
-            _drop_pending_fill(eid)
-            try:
-                _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
-                                         float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
-                                         binance.filters(symbol), risk, coordinator, eid)
-                out["filled" if _fin_ok else "failed"] += 1
-            except Exception as e:
-                log.error(f"  finalize hatası ({symbol}): {e}")
-                out["failed"] += 1
+            _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
+                                  reserver, out, "filled")
             continue
+        # D — deadline/error: ÖNCE borsa, sonra executor durdurma, sonra terminal kanıt
         if err > 0 or time.time() >= deadline:
             _pos_amt = _exchange_position_amt(binance, symbol)
             if _pos_amt is None:
-                log.critical(f"  🚨 {symbol}: pozisyon durumu okunamadı — executor DURDURULMADI, "
-                             f"rezervasyon KORUNDU (fail-closed)")
+                log.critical(f"  🚨 {symbol}: pozisyon durumu okunamadı — executor "
+                             f"DURDURULMADI, rezervasyon KORUNDU (fail-closed)")
                 out["waiting"] += 1
                 continue
-            _drop_pending_fill(eid)
             if _pos_amt != 0:
-                log.warning(f"  ♻️  {symbol}: borsada pozisyon var ({_pos_amt}) — executor BENİMSENDİ "
-                            f"(durdurulmadı), SL yerleştirmeye geçiliyor")
-                try:
-                    _fin_ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
-                                             float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
-                                             binance.filters(symbol), risk, coordinator, eid)
-                    out["adopted" if _fin_ok else "failed"] += 1
-                except Exception as e:
-                    log.error(f"  benimseme finalize hatası ({symbol}): {e}")
-                    out["failed"] += 1
-            else:
-                log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err} "
-                            f"(bekleme={FILL_WAIT_S:.0f}s) — borsa flat, executor durduruldu")
-                try:
-                    hb.stop_executor(eid, keep_position=True)
-                except Exception as e:
-                    log.warning(f"  executor durdurma hatası (dolmadı): {e}")
+                log.warning(f"  ♻️  {symbol}: borsada pozisyon var ({_pos_amt}) — executor "
+                            f"BENİMSENDİ (durdurulmadı), SL yerleştirmeye geçiliyor")
+                _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
+                                      reserver, out, "adopted")
+                continue
+            log.warning(f"  ⚠️  dolmadı: filled={filled:.2f} err={err} "
+                        f"(bekleme={FILL_WAIT_S:.0f}s) — borsa flat, executor durduruluyor")
+            try:
+                hb.stop_executor(eid, keep_position=True)
+            except Exception as e:
+                log.critical(f"  🚨 executor durdurma hatası ({symbol}): {e} — "
+                             f"pending ve rezervasyon KORUNDU")
+                out["waiting"] += 1
+                continue
+            # stop başarılı olsa bile terminal emir kanıtı olmadan release YOK.
+            if _entry_order_terminal(binance, symbol, ctx) is True:
+                log.info(f"  🔓 {symbol}: giriş emri terminal + sıfır dolum + flat — "
+                         f"rezervasyon serbest")
                 if reserver is not None and ctx.get("res_id") is not None:
                     reserver.release(ctx["res_id"], reason="not_filled")
-                    log.info(f"  🔓 rezervasyon serbest (id={ctx['res_id']}): dolmadı")
+                    out["released"] += 1
+                _drop_pending_fill(eid)
                 add_blacklist(symbol, "dolmadı")
                 out["cancelled"] += 1
+            else:
+                log.warning(f"  ⏳ {symbol}: dolmadı ama terminal emir kanıtı YOK "
+                            f"(entry_order_id={ctx.get('entry_order_id') or '-'}) — "
+                            f"pending ve rezervasyon KORUNDU")
+                out["waiting"] += 1
             continue
         out["waiting"] += 1
     return out
@@ -2881,18 +3104,22 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
         return 0, 0, 0
     ok = 0
     for c in candidates:
-        # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et
+        # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et.
+        # FAZ15: kapı artık `_occupied_slots` (borsa gerçeği ∪ pending) kullanıyor.
+        # Eski kod yalnız HB RUNNING executor sayıyordu: hayalet executor slot işgal
+        # ediyor, HB'ye ulaşılamazsa sayı 0 görünüp limit aşılabiliyordu.
         if HB_OFFLINE:
             _cur_active = set()  # HB_OFFLINE: kalibrasyon modu, limit kontrolü HB'siz
         else:
-            try:
-                _cur_active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-            except Exception as e:
-                log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
+            _slots, _cur_active = _occupied_slots(binance, hb)
+            if _slots is None:
+                log.critical("🚨 C6: dolu slot sayısı doğrulanamadı, fail-closed "
+                             "(döngüden çıkılıyor)")
                 break
-        if not HB_OFFLINE and len(_cur_active) >= _effective_max_positions():
-            log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{_effective_max_positions()}), döngüden çıkılıyor")
-            break
+            if len(_slots) >= _effective_max_positions():
+                log.info(f"🚫 C6: limit doldu ({len(_slots)}/{_effective_max_positions()}) "
+                         f"slot={sorted(_slots)}, döngüden çıkılıyor")
+                break
         try:
             # HB_OFFLINE: open_coin dry-run'a zorlanır — compare log üretilir ama GERÇEK
             # EMİR GÖNDERİLMEZ (HB'siz güvenli kalibrasyon/log toplama).

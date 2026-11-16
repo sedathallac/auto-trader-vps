@@ -83,6 +83,8 @@ class TestLoadOnce(PendingFillsBase):
 
 class TestDeadExecutorDropped(PendingFillsBase):
     def test_missing_executor_dropped_without_blacklist(self):
+        # FAZ15: executor yok + flat + terminal emir kanıtı yok -> pending KORUNUR
+        # (eskiden sessizce siliniyordu). Karalisteye yine YAZILMAZ.
         auto_trader._PENDING_FILLS = {"E1": {"symbol": "SOLUSDT", "side": 2,
                                              "amount": 1.0, "sl_pct": 0.01, "tp_pct": 0.02,
                                              "price": 80.0, "deadline": time.time() + 300}}
@@ -93,9 +95,9 @@ class TestDeadExecutorDropped(PendingFillsBase):
             out = auto_trader._process_pending_fills(_Binance(), _HB(None), None, None, None)
         finally:
             auto_trader.add_blacklist = orig
-        self.assertEqual(out["cancelled"], 1)
+        self.assertEqual(out["waiting"], 1)
         self.assertEqual(calls, [], "ölü executor sembolü karalisteye yazmamalı")
-        self.assertNotIn("E1", auto_trader._PENDING_FILLS)
+        self.assertIn("E1", auto_trader._PENDING_FILLS)
 
 
 if __name__ == "__main__":
