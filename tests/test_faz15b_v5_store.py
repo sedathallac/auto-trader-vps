@@ -19,7 +19,7 @@ import auto_trader
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CHILD_TX = r"""
-import json, sys
+import json, os, sys, time
 sys.path.insert(0, {root!r})
 import auto_trader as at
 at.PENDING_FILLS_JSON = at.Path({path!r})
@@ -30,6 +30,16 @@ at._PENDING_REVISION[0] = 0
 at._PENDING_STORE_HEALTHY[0] = True
 at._GLOBAL_ENTRY_BLOCKED[0] = False
 at._PENDING_WRITE_IN_PROGRESS[0] = False
+# Deterministik bariyer: hazır olduğumu bildir, parent GO yazana kadar bekle.
+ready = at.Path({ready!r})
+open(str(ready), "w").write("ready")
+go = at.Path({go!r})
+deadline = time.time() + 60
+while not go.exists():
+    if time.time() > deadline:
+        print("BARRIER_TIMEOUT")
+        sys.exit(2)
+    time.sleep(0.005)
 for i in range({n}):
     ok = at._register_pending_fill({tag!r} + "-" + str(i),
                                    {{"symbol": "SOLUSDT", "deadline": 0}})
@@ -40,7 +50,7 @@ print("OK")
 """
 
 _CHILD_LOAD = r"""
-import sys
+import sys, time
 sys.path.insert(0, {root!r})
 import auto_trader as at
 at.PENDING_FILLS_JSON = at.Path({path!r})
@@ -50,6 +60,15 @@ at._PENDING_FILLS = {{}}
 at._PENDING_REVISION[0] = 0
 at._PENDING_STORE_HEALTHY[0] = False
 at._GLOBAL_ENTRY_BLOCKED[0] = False
+ready = at.Path({ready!r})
+open(str(ready), "w").write("ready")
+go = at.Path({go!r})
+deadline = time.time() + 60
+while not go.exists():
+    if time.time() > deadline:
+        print("BARRIER_TIMEOUT")
+        sys.exit(2)
+    time.sleep(0.005)
 got = at._load_pending_fills()
 print("OK" if at._PENDING_STORE_HEALTHY[0] else "UNHEALTHY")
 print("REV", at._PENDING_REVISION[0])
@@ -112,12 +131,21 @@ class TestTwoProcessLostUpdate(StoreBase):
     def test_two_processes_preserve_all_writes_and_revision(self):
         self._write({}, revision=0)
         n = 12
-        procs = []
+        procs, readies, go = [], [], os.path.join(self.tmp, "GO")
         for tag in ("A", "B"):
-            script = _CHILD_TX.format(root=ROOT, path=self.path, n=n, tag=tag)
+            ready = os.path.join(self.tmp, f"ready-{tag}")
+            readies.append(ready)
+            script = _CHILD_TX.format(root=ROOT, path=self.path, n=n, tag=tag,
+                                      ready=ready, go=go)
             procs.append(subprocess.Popen([sys.executable, "-c", script],
                                           stdout=subprocess.PIPE,
                                           stderr=subprocess.PIPE, text=True))
+        # Bariyer: iki child da hazır olmadan GO verilmez.
+        deadline = time.time() + 60
+        while not all(os.path.exists(r) for r in readies):
+            self.assertLess(time.time(), deadline, "child bariyerde hazır olmadı")
+            time.sleep(0.005)
+        open(go, "w").write("go")
         outs = [p.communicate(timeout=120) for p in procs]
         for p, (out, err) in zip(procs, outs):
             self.assertEqual(p.returncode, 0, f"child failed: {out} {err}")
@@ -138,12 +166,20 @@ class TestTwoProcessStartupRace(StoreBase):
                "finalization_phase": "pre_side_effect",
                "finalization_complete": False, "finalization_blocked": False}
         self._write({"E1": rec}, revision=4)
-        procs = []
-        for _ in range(2):
-            script = _CHILD_LOAD.format(root=ROOT, path=self.path)
+        procs, readies, go = [], [], os.path.join(self.tmp, "GO")
+        for i in range(2):
+            ready = os.path.join(self.tmp, f"ready-{i}")
+            readies.append(ready)
+            script = _CHILD_LOAD.format(root=ROOT, path=self.path,
+                                        ready=ready, go=go)
             procs.append(subprocess.Popen([sys.executable, "-c", script],
                                           stdout=subprocess.PIPE,
                                           stderr=subprocess.PIPE, text=True))
+        deadline = time.time() + 60
+        while not all(os.path.exists(r) for r in readies):
+            self.assertLess(time.time(), deadline, "child bariyerde hazır olmadı")
+            time.sleep(0.005)
+        open(go, "w").write("go")
         outs = [p.communicate(timeout=120) for p in procs]
         for p, (out, err) in zip(procs, outs):
             self.assertEqual(p.returncode, 0, f"child failed: {out} {err}")
@@ -356,6 +392,103 @@ class TestConfirmRetryPolicy(StoreBase):
         self.assertTrue(ok)
         self.assertNotIn("E1", self._disk()["pending"])
         self.assertEqual(out["waiting"], 0)
+
+
+class TestNonDictPendingRecord(StoreBase):
+    def test_non_dict_pending_record_is_preserved_and_blocks_entry(self):
+        self._write({"E1": "not-a-dict"}, revision=2)
+        auto_trader._PENDING_LOADED[0] = False
+        auto_trader._PENDING_FILLS = {}
+        got = auto_trader._load_pending_fills()
+        self.assertIn("E1", got, "bozuk kayıt silinmemeli")
+        self.assertEqual(got["E1"], "not-a-dict", "otomatik repair yapılmamalı")
+        self.assertEqual(self._disk()["pending"]["E1"], "not-a-dict")
+        reason = auto_trader._entry_gate_closed()
+        self.assertEqual(reason, "PENDING_CORRUPT:E1",
+                         "bozuk kayıt girişleri kapatmalı")
+
+    def test_non_dict_record_does_not_crash_recovery(self):
+        self._write({"E1": ["x"], "E2": None, "E3": 7}, revision=1)
+        auto_trader._PENDING_LOADED[0] = False
+        auto_trader._PENDING_FILLS = {}
+        got = auto_trader._load_pending_fills()
+        self.assertEqual(set(got), {"E1", "E2", "E3"})
+        self.assertTrue(auto_trader._PENDING_STORE_HEALTHY[0])
+
+
+class TestConfirmFailureAtomic(StoreBase):
+    def _ctx(self):
+        return {"symbol": "NEARUSDT", "side": 2, "amount": 62.0, "sl_pct": 0.01,
+                "tp_pct": 0.02, "price": 3.19, "res_id": 7,
+                "deadline": time.time() + 300,
+                "finalization_complete": True, "finalization_attempts": 1,
+                "finalization_in_progress": False,
+                "finalization_phase": "side_effect_started",
+                "finalization_blocked": False}
+
+    def test_mutator_is_pure_and_uses_now(self):
+        pending = {"E1": self._ctx()}
+        frozen = json.dumps(pending, sort_keys=True)
+        new, res = auto_trader._mut_confirm_failure(pending, 1000.0, "E1", "boom")
+        self.assertEqual(json.dumps(pending, sort_keys=True), frozen,
+                         "mutator girdiyi değiştirmemeli")
+        self.assertEqual(res[0], "recorded")
+        self.assertEqual(new["E1"]["confirm_attempts"], 1)
+        self.assertEqual(new["E1"]["confirm_next_at"],
+                         1000.0 + auto_trader.CONFIRM_RETRY_BACKOFF_S)
+
+    def test_mutator_does_not_resurrect_missing_record(self):
+        new, res = auto_trader._mut_confirm_failure({}, 1000.0, "E1", "boom")
+        self.assertEqual(res[0], "missing")
+        self.assertEqual(new, {}, "silinmiş kayıt yeniden oluşturulmamalı")
+
+    def test_failure_counter_increments_from_disk_state(self):
+        auto_trader._PENDING_FILLS = {"E1": self._ctx()}
+        auto_trader._persist_envelope(auto_trader._PENDING_FILLS, 1)
+        auto_trader._PENDING_REVISION[0] = 1
+        # Disk revision ileride: transaction uzlaştırıp sayaç 5'ten artırmalı.
+        disk = self._disk()
+        disk["pending"]["E1"]["confirm_attempts"] = 5
+        disk["revision"] = 4
+        with open(self.path, "w") as f:
+            json.dump(disk, f)
+        ok, res = auto_trader._record_confirm_failure("E1", "db locked")
+        self.assertTrue(ok)
+        self.assertEqual(res[1]["confirm_attempts"], 6,
+                         "sayaç diskten uzlaştırılmış state'ten artmalı")
+
+    def test_failure_on_missing_record_does_not_recreate(self):
+        auto_trader._PENDING_FILLS = {}
+        auto_trader._persist_envelope({}, 1)
+        auto_trader._PENDING_REVISION[0] = 1
+        ok, res = auto_trader._record_confirm_failure("E1", "db locked")
+        self.assertTrue(ok)
+        self.assertEqual(res[0], "missing")
+        self.assertNotIn("E1", self._disk()["pending"])
+
+    def test_max_attempts_sets_blocked_atomically(self):
+        ctx = self._ctx()
+        ctx["confirm_attempts"] = auto_trader.CONFIRM_MAX_ATTEMPTS - 1
+        auto_trader._PENDING_FILLS = {"E1": ctx}
+        auto_trader._persist_envelope(auto_trader._PENDING_FILLS, 1)
+        auto_trader._PENDING_REVISION[0] = 1
+        ok, res = auto_trader._record_confirm_failure("E1", "db locked")
+        self.assertTrue(ok)
+        self.assertTrue(res[1]["confirm_blocked"])
+        self.assertTrue(self._disk()["pending"]["E1"]["confirm_blocked"])
+
+    def test_pending_confirm_uses_atomic_path(self):
+        auto_trader._PENDING_FILLS = {"E1": self._ctx()}
+        auto_trader._persist_envelope(auto_trader._PENDING_FILLS, 1)
+        auto_trader._PENDING_REVISION[0] = 1
+        out = {"waiting": 0}
+        ok = auto_trader._pending_confirm("E1", dict(self._ctx()),
+                                          _FlakyReserver(), out)
+        self.assertFalse(ok)
+        disk = self._disk()["pending"]["E1"]
+        self.assertEqual(disk["confirm_attempts"], 1)
+        self.assertGreater(disk["confirm_next_at"], time.time())
+        self.assertEqual(out["waiting"], 1)
 
 
 if __name__ == "__main__":
