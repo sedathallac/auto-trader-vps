@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """auto_trader.py v4 — otonom kalite tarayıcı + native SL koruma"""
-import os, sys, time, hmac, hashlib, logging, argparse, json, math
+import os, sys, time, hmac, hashlib, logging, argparse, json, math, threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -2094,6 +2094,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  C6: limit dolu ({len(_cur)}/{_effective_max_positions()}), atlanıyor")
         return False
     symbol = coin["symbol"]
+    # FAZ15b: global giriş kapısı — finalizasyon claim'i persist edilemediyse kapalı.
+    if not HB_OFFLINE and _entry_gate_closed():
+        log.critical(f"  atlandı: global giriş kapısı KAPALI ({_entry_gate_closed()})")
+        return False
     # FAZ14t: canlı sembol kapısı — yasaklı sembole emir açılmaz (compare/dry-run etkilenmez).
     if not HB_OFFLINE and symbol.upper() in LIVE_BLOCKED_SYMBOLS:
         log.warning(f"  atlandı: canlı sembol kapısı ({symbol} yasaklı listede)")
@@ -2428,13 +2432,120 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
 
 
 def _persist_pending_fills():
-    """Bekleyen dolumları diske yaz (atomik). Hata akışı durdurmaz."""
+    """Bekleyen dolumları diske yaz (atomik). Dönüş: True -> yazıldı.
+
+    FAZ15b: dönüş değeri eklendi. Atomik finalizasyon claim'i persist başarısızsa
+    finalizer'ı ÇAĞIRMAZ ve global giriş kapısını kapatır; bunun için yazmanın
+    gerçekten başarılı olup olmadığını bilmek gerekir.
+    """
     try:
         tmp = PENDING_FILLS_JSON.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(_PENDING_FILLS, indent=2, default=str))
         tmp.replace(PENDING_FILLS_JSON)
+        return True
     except Exception as e:
         log.warning(f"pending_fills persist: {e}")
+        return False
+
+
+# === FAZ15b: ATOMIC FINALIZATION CLAIM =====================================
+# Aynı eid için iki thread (veya tick içi iki yol) aynı anda _finalize_open()
+# çağırabiliyordu: SL iki kez yerleştirilebiliyor, attempts sayısı iki kez
+# artıyor ve "3 deneme" sınırı anlamsızlaşıyordu. Claim, kontrol + artırma +
+# in_progress + persist'i TEK kritik bölgede yapar. _PENDING_LOCK ağ/API
+# çağrıları boyunca TUTULMAZ; thread'ler arası koruma in_progress alanıyla.
+_PENDING_LOCK = threading.RLock()
+FINALIZATION_MAX_ATTEMPTS = 3
+FINALIZATION_RETRY_BACKOFF_S = float(os.getenv("LIVE_FINALIZE_RETRY_S", "30") or 30)
+_ENTRY_GATE_CLOSED = [None]   # None -> açık; str -> kapatma nedeni
+
+
+def _entry_gate_closed():
+    return _ENTRY_GATE_CLOSED[0]
+
+
+def _close_entry_gate(reason):
+    if _ENTRY_GATE_CLOSED[0] is None:
+        log.critical(f"🚨 GİRİŞ KAPISI KAPATILDI: {reason}")
+    _ENTRY_GATE_CLOSED[0] = reason
+
+
+def _claim_finalization_attempt(eid):
+    """Finalizasyon denemesini ATOMİK olarak rezerve et.
+
+    Dönüş: (karar, ctx) — karar: "claimed" | "waiting" | "blocked" | "error"
+    "claimed" dönen thread claim sahibidir ve _finalize_open() çağırabilir.
+    """
+    with _PENDING_LOCK:
+        ctx = _PENDING_FILLS.get(str(eid))
+        if not isinstance(ctx, dict):
+            return "blocked", None
+        if not _norm_symbol(ctx.get("symbol")):
+            return "blocked", ctx
+        if ctx.get("finalization_blocked"):
+            return "blocked", ctx
+        if ctx.get("finalization_in_progress"):
+            return "waiting", ctx
+        attempts = int(ctx.get("finalization_attempts") or 0)
+        if attempts >= FINALIZATION_MAX_ATTEMPTS:
+            ctx["finalization_blocked"] = True
+            ctx["last_error"] = (ctx.get("last_error")
+                                 or "attempts_exhausted")
+            _persist_pending_fills()
+            return "blocked", ctx
+        nxt = float(ctx.get("next_attempt_at") or 0)
+        if nxt and time.time() < nxt:
+            return "waiting", ctx
+        ctx["finalization_attempts"] = attempts + 1
+        ctx["finalization_in_progress"] = True
+        ctx["finalization_claimed_at"] = time.time()
+        ctx.setdefault("finalization_phase", "pre_side_effect")
+        if not _persist_pending_fills():
+            ctx["finalization_in_progress"] = False
+            ctx["finalization_attempts"] = attempts
+            _close_entry_gate(f"finalization claim persist edilemedi ({eid})")
+            return "error", ctx
+        return "claimed", ctx
+
+
+def _mark_side_effect_started(eid):
+    """İlk cancel/place mutasyonundan ÖNCE `side_effect_started` fazını KALICI yaz.
+
+    FAZ15b: bu işaret K-4'ün (SlPlacementStore) etkin olup olmamasına BAĞLI DEĞİL.
+    `_oc_store is None` veya token alınamadığı için K-4 yolu kullanılamasa bile
+    yazılır; aksi halde bu yolda çöken bir süreç restart sonrası "güvenli
+    pre_side_effect" sanılıp ikinci kez SL yerleştirebilirdi.
+    """
+    with _PENDING_LOCK:
+        cur = _PENDING_FILLS.get(str(eid))
+        if not isinstance(cur, dict):
+            return False
+        if cur.get("finalization_phase") == "side_effect_started":
+            return True
+        cur["finalization_phase"] = "side_effect_started"
+        return _persist_pending_fills()
+
+
+def _release_finalization_claim(eid, ctx, complete=False, blocked=False, error=None):
+    """Claim'i atomik temizle ve durumu kalıcı yaz."""
+    with _PENDING_LOCK:
+        cur = _PENDING_FILLS.get(str(eid))
+        if not isinstance(cur, dict):
+            return False
+        cur["finalization_in_progress"] = False
+        cur.pop("finalization_claimed_at", None)
+        cur.setdefault("finalization_complete", False)
+        if complete:
+            cur["finalization_complete"] = True
+            cur["finalization_blocked"] = False
+            cur["last_error"] = None
+        if blocked:
+            cur["finalization_blocked"] = True
+        if error:
+            cur["last_error"] = error
+        if not complete and not blocked:
+            cur["next_attempt_at"] = time.time() + FINALIZATION_RETRY_BACKOFF_S
+        return _persist_pending_fills()
 
 
 def _load_pending_fills():
@@ -2462,6 +2573,26 @@ def _load_pending_fills():
                           + STALE_PENDING_GRACE_S < _now]
                 for k in _stale:
                     raw.pop(k, None)
+                # FAZ15b: restart kurtarma. in_progress claim'i yalnız KANITLI güvenli
+                # aşamada temizlenir; belirsiz durumda DOKUNULMAZ (fail-closed).
+                for k, v in list(raw.items()):
+                    if not isinstance(v, dict) or not v.get("finalization_in_progress"):
+                        continue
+                    ph = v.get("finalization_phase")
+                    if ph == "pre_side_effect":
+                        v["finalization_in_progress"] = False
+                        v.pop("finalization_claimed_at", None)
+                        log.warning(f"  ♻️  {k}: pre_side_effect claim temizlendi "
+                                    f"(attempts={int(v.get('finalization_attempts') or 0)} korundu)")
+                    elif ph == "side_effect_started":
+                        v["finalization_in_progress"] = False
+                        v["finalization_blocked"] = True
+                        v["last_error"] = "crash_after_side_effect"
+                        log.critical(f"  🚨 {k}: side_effect_started sonrası çökme — "
+                                     f"BLOKLU (elle inceleme gerekli)")
+                    else:
+                        log.critical(f"  🚨 {k}: belirsiz finalizasyon aşaması "
+                                     f"({ph!r}) — claim KORUNDU")
                 _PENDING_FILLS = raw
                 if _stale:
                     log.warning(f"  🧹 {len(_stale)} bayat bekleyen dolum düşürüldü "
@@ -2478,18 +2609,26 @@ def _load_pending_fills():
 def _register_pending_fill(eid, ctx):
     """Pending kaydı yaz + diske persist. FAZ15: lifecycle alanları HER kayıtta
     varsayılanlarıyla bulunur (finalization_complete/attempts/last_error), böylece
-    restart sonrası yüklenen eski kayıtlar da aynı şemayla okunur."""
+    restart sonrası yüklenen eski kayıtlar da aynı şemayla okunur.
+
+    FAZ15b: yazma _PENDING_LOCK altında; claim alanları da varsayılanlanır.
+    """
     rec = dict(ctx)
     rec.setdefault("finalization_complete", False)
     rec.setdefault("finalization_attempts", 0)
+    rec.setdefault("finalization_in_progress", False)
+    rec.setdefault("finalization_blocked", False)
+    rec.setdefault("finalization_phase", "pre_side_effect")
     rec.setdefault("last_error", None)
-    _PENDING_FILLS[str(eid)] = rec
-    _persist_pending_fills()
+    with _PENDING_LOCK:
+        _PENDING_FILLS[str(eid)] = rec
+        return _persist_pending_fills()
 
 
 def _drop_pending_fill(eid):
-    _PENDING_FILLS.pop(str(eid), None)
-    _persist_pending_fills()
+    with _PENDING_LOCK:
+        _PENDING_FILLS.pop(str(eid), None)
+        return _persist_pending_fills()
 
 
 _TERMINAL_ORDER_STATES = ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
@@ -2568,9 +2707,20 @@ def _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
     Eski kod `_drop_pending_fill()` çağrısını finalizasyondan ÖNCE yapıyordu; finalize
     exception verirse pending kaydı çoktan silinmiş oluyor ve rezervasyon sahipsiz
     kalıyordu.
+
+    FAZ15b: deneme sayacı ve in_progress claim'i ATOMİK rezerve edilir. Claim
+    alınamazsa finalizer ÇAĞRILMAZ (ikinci thread waiting döner, attempts artmaz).
     """
-    ctx["finalization_attempts"] = int(ctx.get("finalization_attempts") or 0) + 1
-    _register_pending_fill(eid, ctx)          # deneme sayısı ÖNCE diske
+    decision, ctx = _claim_finalization_attempt(eid)
+    if decision != "claimed":
+        if decision == "blocked":
+            log.critical(f"  🚫 {symbol}: finalizasyon BLOKLU "
+                         f"(attempts={int(ctx.get('finalization_attempts') or 0) if ctx else '?'}) "
+                         f"— finalizer çağrılmadı")
+        elif decision == "error":
+            log.critical(f"  🚨 {symbol}: claim persist edilemedi — finalizer çağrılmadı")
+        out["waiting"] += 1
+        return False
     try:
         ok = _finalize_open(binance, hb, symbol, int(ctx["side"]), ctx["amount"],
                             float(ctx["sl_pct"]), float(ctx["tp_pct"]), ctx["price"],
@@ -2580,13 +2730,11 @@ def _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
         ctx["last_error"] = f"finalize: {e}"
         log.error(f"  finalize hatası ({symbol}): {e}")
     if ok:
-        ctx["finalization_complete"] = True
-        ctx["last_error"] = None
-        _register_pending_fill(eid, ctx)      # confirm'den ÖNCE kalıcı
+        _release_finalization_claim(eid, ctx, complete=True)
         out[key] += 1
         return _pending_confirm(eid, ctx, reserver, out)
-    ctx["last_error"] = ctx.get("last_error") or "finalize returned False"
-    _register_pending_fill(eid, ctx)
+    _release_finalization_claim(eid, ctx,
+                                error=ctx.get("last_error") or "finalize returned False")
     out["failed"] += 1
     _amt = _exchange_position_amt(binance, symbol)
     if _amt is None or _amt != 0:
@@ -2623,6 +2771,16 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
         # B — finalizasyon tamamlanmış: finalizer TEKRAR ÇALIŞMAZ, yalnız confirm retry.
         if ctx.get("finalization_complete"):
             _pending_confirm(eid, ctx, reserver, out)
+            continue
+        # FAZ15b: bloklu kayıt ya da başka thread'in aktif claim'i -> finalizer YOK.
+        if ctx.get("finalization_blocked"):
+            log.critical(f"  🚫 {symbol}: finalizasyon BLOKLU "
+                         f"(attempts={int(ctx.get('finalization_attempts') or 0)}) — "
+                         f"pending ve rezervasyon KORUNDU, inceleme gerekli")
+            out["waiting"] += 1
+            continue
+        if ctx.get("finalization_in_progress"):
+            out["waiting"] += 1
             continue
         try:
             ex = hb.get_executor(eid)
@@ -2721,6 +2879,12 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
         trig = round(round((price * (1 - sl_pct)) / tick) * tick, 8)
     else:
         trig = round(round((price * (1 + sl_pct)) / tick) * tick, 8)
+    # FAZ15b: ilk mutasyondan (K-4 acquire / cancel / place) ÖNCE kalıcı faz işareti.
+    # K-4 etkin olmasa da yazılır; yazılamazsa mutasyon YAPILMAZ (fail-closed).
+    if not _mark_side_effect_started(eid):
+        log.critical(f"  🚨 {symbol}: side_effect_started yazılamadı — SL mutasyonu "
+                     f"YAPILMADI (fail-closed)")
+        return False
     # === K-4: open_coin SL-placement intent (full prevention of the open_coin <->
     # ensure_sl_coverage double-SL race) ===
     # Acquire the SAME cross-process SlPlacementStore intent (K-3) that
