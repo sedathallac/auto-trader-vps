@@ -75,18 +75,48 @@ def load_whale_rows(path, modes=("compare", "on")):
         c.close()
 
 
-def load_signal_rows(path):
+def load_signal_rows(path, real_only=False):
+    """Live sinyal satırları. `real_only=False` (varsayılan): `real` filtresi UYGULANMAZ.
+
+    `real = fwd_ret > cost AND mae > -sl_pct` olduğu için `real=1` filtresi tanım gereği kazananları seçer; onunla
+    hesaplanan win oranı tautolojiktir ve performans kanıtı sayılamaz. Kazanç ölçütü `fwd_ret > cost` olarak ayrıca
+    hesaplanır (`win` alanı). `real_only=True` yalnız eski raporlarla kıyas için vardır.
+    """
     if not Path(path).exists():
         return []
     c = _ro(path)
     try:
-        return [{"ts": int(ts), "symbol": s, "signal": sg, "regime": rg, "side": int(d), "real": int(real),
-                 "fwd": float(fwd), "horizon": int(hz)}
-                for s, sg, rg, d, ts, hz, real, fwd in c.execute(
-                    "SELECT symbol,signal,regime,direction,entry_ts,horizon,real,fwd_ret FROM signal_outcomes "
-                    "WHERE source='live' AND resolved=1 AND real IS NOT NULL AND fwd_ret IS NOT NULL")]
+        where = "source='live' AND resolved=1 AND fwd_ret IS NOT NULL"
+        if real_only:
+            where += " AND real IS NOT NULL"
+        return [{"ts": int(ts), "symbol": s, "signal": sg, "regime": rg, "side": int(d),
+                 "real": None if real is None else int(real),
+                 "fwd": float(fwd), "horizon": int(hz),
+                 "persist_bars": None if pb is None else int(pb)}
+                for s, sg, rg, d, ts, hz, real, fwd, pb in c.execute(
+                    "SELECT symbol,signal,regime,direction,entry_ts,horizon,real,fwd_ret,persist_bars "
+                    f"FROM signal_outcomes WHERE {where}")]
     finally:
         c.close()
+
+
+def win_of(row, cost=DEFAULT_COST):
+    """Kazanç ölçütü: net getiri pozitif mi. `real` KULLANILMAZ (tautolojik)."""
+    return 1 if (row["fwd"] - cost) > 0 else 0
+
+
+def persist_bars_analysis(rows, *, cost=DEFAULT_COST, min_bars=3):
+    """persist_bars>=min_bars ile tüm satırların EV'sini karşılaştırır: sinyal hızlı ölüyor mu?"""
+    def _blk(rs):
+        if not rs:
+            return {"n": 0, "win_pct": None, "ev_pct": None}
+        return {"n": len(rs),
+                "win_pct": round(100.0 * sum(win_of(r, cost) for r in rs) / len(rs), 2),
+                "ev_pct": round(100.0 * _mean([r["fwd"] - cost for r in rs]), 4)}
+
+    kept = [r for r in rows if r.get("persist_bars") is not None and r["persist_bars"] >= min_bars]
+    return {"min_bars": min_bars, "all": _blk(rows), "persistent": _blk(kept),
+            "note": "persist_bars NULL olan satırlar 'persistent' tarafına girmez"}
 
 
 # ===================================================================== whale: sonuç çözümü + istatistik
@@ -217,7 +247,8 @@ def _approved_cells(train, min_events, fdr, n_perm, seed):
 def strategy_analysis(rows, *, cost=DEFAULT_COST, min_events=100, fdr=0.10, min_p_real=0.65, folds=4,
                       min_acc=30, n_perm=1000, seed=0, horizon=8):
     rows = decluster(rows, lambda r: (r["symbol"], r["signal"], r["side"]), "ts", horizon * M15)
-    out = {"n_declustered": len(rows), "posteriors": p_real_table(rows, min_events=min_events)}
+    out = {"n_declustered": len(rows), "posteriors": p_real_table(rows, min_events=min_events),
+           "win_definition": "fwd_ret > cost (real filtresi KULLANILMADI)"}
     if len(rows) < folds * 2:
         out.update(verdict=INSUFFICIENT, reason=f"satır {len(rows)} < {folds * 2}")
         return out
@@ -238,16 +269,17 @@ def strategy_analysis(rows, *, cost=DEFAULT_COST, min_events=100, fdr=0.10, min_
             all_.append(r)
             p_real = ok.get((r["signal"], r["regime"]))
             (acc if (p_real is not None and p_real >= min_p_real) else rej).append(r)
-    base = _rate([r["real"] for r in all_])
+    base = _rate([win_of(r, cost) for r in all_])
     out.update(n_test=len(all_), n_accepted=len(acc), n_rejected=len(rej), base_real_rate=base,
                approved_cells_by_fold=approved_any, min_p_real=min_p_real)
     if acc:
-        lo, hi = se.wilson_interval(sum(r["real"] for r in acc), len(acc))
-        out.update(accepted_real_rate=_rate([r["real"] for r in acc]), accepted_wilson=[lo, hi],
+        lo, hi = se.wilson_interval(sum(win_of(r, cost) for r in acc), len(acc))
+        out.update(accepted_real_rate=_rate([win_of(r, cost) for r in acc]), accepted_wilson=[lo, hi],
                    accepted_net_expectancy=_mean([r["fwd"] - cost for r in acc]),
                    base_net_expectancy=_mean([r["fwd"] - cost for r in all_]))
         if rej:
-            out["p_value"] = se.permutation_pvalue([r["real"] for r in acc], [r["real"] for r in rej], n_perm, seed)
+            out["p_value"] = se.permutation_pvalue([win_of(r, cost) for r in acc],
+                                                   [win_of(r, cost) for r in rej], n_perm, seed)
     if len(acc) < min_acc:
         out.update(verdict=INSUFFICIENT, reason=f"OOS kabul n={len(acc)} < {min_acc}")
         return out
@@ -286,9 +318,14 @@ def run(whale_db, signal_db, getter, *, cache_dir=None, now_ms=None, sleeper=tim
                        n_perm=kw.get("n_perm", 2000), horizon=kw.get("horizon", 8))
     w["n_rows_loaded"], w["n_unresolved_skipped"] = len(wrows), skipped
     pw, pw_final = whale_pwin_posterior(resolved, horizon=kw.get("horizon", 8))
-    s = strategy_analysis(load_signal_rows(signal_db), cost=kw.get("cost", DEFAULT_COST),
+    srows = load_signal_rows(signal_db, real_only=kw.get("real_only", False))
+    s = strategy_analysis(srows, cost=kw.get("cost", DEFAULT_COST),
                           min_p_real=kw.get("min_p_real", 0.65), n_perm=kw.get("n_perm", 2000),
                           horizon=kw.get("horizon", 8))
+    s["persist_bars"] = persist_bars_analysis(srows, cost=kw.get("cost", DEFAULT_COST))
+    s["real_filter"] = ("real_only=True: tautolojik filtre ACIK, sonuc performans kaniti degil"
+                        if kw.get("real_only", False) else
+                        "real filtresi KULLANILMADI; kazanc olcutu fwd_ret > cost")
     verdict, text = overall(w, s)
     return {"verdict": verdict, "decision": text, "whale": w, "whale_pwin_posterior": pw,
             "strategy": s}, pw
@@ -331,13 +368,17 @@ def main(argv=None):
     ap.add_argument("--n-perm", type=int, default=2000)
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--out", default=None, help="rapor JSON yolu")
+    ap.add_argument("--real-only", action="store_true",
+                    help="UYARI: real=1 filtresi tautolojiktir (fwd_ret>cost AND mae>-sl). Yalniz eski raporlarla "
+                         "kiyas icin; performans kaniti olarak KULLANMA.")
     ap.add_argument("--write-whale-calibration", default=None,
                     help="AÇIK ONAY: canlı-fit p_win kalibrasyonunu yazar (OOS skill>0). Toplama BİTMEDEN kullanma: "
                          "bot compare'da bu dosyayı okur ve deneyi bozar.")
     a = ap.parse_args(argv)
     try:
         rep, _ = run(a.whale_db, a.signal_db, cb.default_getter, cache_dir=a.cache_dir, min_rows=a.min_rows,
-                     min_days=a.min_days, min_p_real=a.min_p_real, sl_pct=a.sl_pct, n_perm=a.n_perm)
+                     min_days=a.min_days, min_p_real=a.min_p_real, sl_pct=a.sl_pct, n_perm=a.n_perm,
+                     real_only=a.real_only)
     except cb.RateLimited as e:
         print(f"[analyze_live_data] RATE-LIMIT, durduruldu (tekrar denemeyin): {e}", file=sys.stderr)
         return 2

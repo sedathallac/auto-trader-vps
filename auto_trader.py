@@ -173,11 +173,14 @@ def add_blacklist(symbol, reason):
 
 
 class BinanceAPI:
-    def __init__(self, key, secret):
+    def __init__(self, key, secret, base=None):
         self.key = key
         self.secret = secret
         self._info = None
         self._info_ts = 0
+        # FAZ9 live: the base URL is per instance, so the testnet and mainnet instances can never share a client.
+        # BINANCE_FUTURES_BASE_URL wins, then the module default (mainnet) — the compare instance is unchanged.
+        self.base = (base or os.getenv("BINANCE_FUTURES_BASE_URL") or BINANCE_FAPI).rstrip("/")
 
     def _sign(self, params):
         qs = urlencode(params)
@@ -191,18 +194,22 @@ class BinanceAPI:
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 60000
-            return _session.get(f"{BINANCE_FAPI}{path}?{self._sign(params)}",
+            return _session.get(f"{self.base}{path}?{self._sign(params)}",
                                 headers=self._hdr(), timeout=15).json()
-        return _session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15).json()
+        return _session.get(f"{self.base}{path}", params=params, timeout=15).json()
 
     def _post(self, path, params, method="POST"):
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 60000
-        url = f"{BINANCE_FAPI}{path}?{self._sign(params)}"
+        url = f"{self.base}{path}?{self._sign(params)}"
         if method == "DELETE":
             return _session.delete(url, headers=self._hdr(), timeout=15).json()
         return _session.post(url, headers=self._hdr(), timeout=15).json()
+
+    def account(self):
+        """GET /fapi/v2/account — the startup check reads balance and canTrade from here."""
+        return self._get("/fapi/v2/account", signed=True)
 
     def tickers(self):
         return self._get("/fapi/v1/ticker/24hr")
@@ -1286,6 +1293,60 @@ def coordinate_close(coordinator, binance, symbol, reason, side=None, amount=Non
                        critical=True)
 
 
+_LAST_CONFIRM = {}          # son Faz6 teyidinin aileleri (live family gate için)
+
+
+_LIVE_CFG = None            # live_guard.LiveConfig (tembel; HB_OFFLINE=1 iken hiç yüklenmez)
+_startup_checked = [False]  # live açılış doğrulaması süreç başına bir kez
+
+
+def _live_cfg():
+    """Live config, or None in compare mode. A bad live config raises: the service must not start."""
+    global _LIVE_CFG
+    if _LIVE_CFG is None:
+        import live_guard
+        _LIVE_CFG = live_guard.LiveConfig.from_env().validate()
+    return _LIVE_CFG
+
+
+def _live_family_gate(symbol, side):
+    """(allowed, reason). In compare/dry-run the gate is open; in live only the winning family may place an order."""
+    try:
+        import live_guard
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    families = list((_LAST_CONFIRM.get("families") or {}).keys())
+    if not families:
+        return False, "no confirming family for this side"
+    for fam in families:
+        ok, reason = live_guard.family_gate(fam, cfg)
+        if ok:
+            log.info(f"  🎯 live family eşleşti: {fam} ({symbol} side={side})")
+            return True, reason
+    return False, f"confirming families {families} do not include live family {cfg.strategy_family!r}"
+
+
+def _live_regime_gate():
+    """(allowed, reason). Canlıda yalnız kazanan rejimler emir verebilir; compare'da kapı açık."""
+    try:
+        import live_guard
+        cfg = _live_cfg()
+    except Exception as e:
+        log.critical(f"🚨 live config geçersiz, fail-closed: {e}")
+        return False, f"live config error: {e}"
+    if not cfg.is_live:
+        return True, "not live: gate open"
+    regime = _LAST_CONFIRM.get("regime")
+    ok, reason = live_guard.regime_gate(regime, cfg)
+    if not ok:
+        log.info(f"[LIVE] skipped regime={regime} (not in winning set)")
+    return ok, reason
+
+
 def _faz6_confirm(binance, symbol, side, sl_pct, mode):
     """Faz 6 teyit. compare: logla + signal_outcomes'a yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
     Döner: True = devam, False = reddet (yalnız mode=='on')."""
@@ -1300,14 +1361,21 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
+        # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
+        # _faz6_confirm keeps its bool signature and every existing caller is untouched.
+        _LAST_CONFIRM.clear()
+        _LAST_CONFIRM.update({"families": dict(_v6.families or {}), "regime": _v6.regime,
+                              "p_real": _v6.p_real, "allow": bool(_v6.allow)})
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
                  f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
                  f"{'GEÇER' if _v6.allow else 'RED'}: {_v6.reason}")
         if _main6 is not None:
             for _r6 in _v6.readings:
                 if _r6.direction == _sd6 and _r6.strength >= RISK_CONFIG["confirm_min_strength"]:
-                    _store6.record_event(symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
-                                         RISK_CONFIG["confirm_horizon"])
+                    _store6.record_event(
+                        symbol, _r6, _v6.regime, _main6.t[-1], _main6.c[-1],
+                        RISK_CONFIG["confirm_horizon"], sl_pct=sl_pct
+                    )
         if mode == "on" and not _v6.allow:
             log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
             return False
@@ -1317,6 +1385,79 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
             return False
         log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
     return True
+
+
+
+def _resolve_pending_signal_outcomes(binance):
+    """Aday listesine bağlı olmadan DB'deki tüm bekleyen Faz6 sembollerini sonuçlandır."""
+    summary = {
+        "symbols": 0,
+        "resolved": 0,
+        "scored": 0,
+        "unscored": 0,
+        "waiting": 0,
+        "unavailable": 0,
+        "errors": 0,
+    }
+
+    try:
+        import strategy_engine as _se
+        store = _se.SignalStore(_se.SIGNAL_DB)
+        pending = store.pending_symbol_ranges()
+    except Exception as exc:
+        log.warning(f"Faz6 bekleyen sonuç kuyruğu okunamadı: {exc}")
+        summary["errors"] += 1
+        return summary
+
+    if not pending:
+        return summary
+
+    summary["symbols"] = len(pending)
+    tf = RISK_CONFIG.get(
+        "confirm_tf_main",
+        _se.CONFIRM_DEFAULTS["confirm_tf_main"],
+    )
+    cost = float(RISK_CONFIG.get("fee_pct_round_trip", 0.0008))
+
+    for symbol, oldest_entry_ts in pending:
+        try:
+            candles = _se.fetch_candles_from(
+                binance, symbol, tf, oldest_entry_ts
+            )
+            if candles is None:
+                summary["unavailable"] += 1
+                log.warning(
+                    f"Faz6 sonuç kuyruğu: {symbol} mum verisi alınamadı; "
+                    "kayıtlar beklemede bırakıldı."
+                )
+                continue
+
+            result = store.resolve_pending_detailed(symbol, candles, cost)
+            summary["resolved"] += result["resolved"]
+            summary["scored"] += result["scored"]
+            summary["unscored"] += result["unscored"]
+            summary["waiting"] += result["waiting"]
+
+            if result["error"]:
+                summary["errors"] += 1
+                log.error(
+                    f"Faz6 sonuç kuyruğu DB hatası ({symbol}): {result['error']}"
+                )
+        except Exception as exc:
+            summary["errors"] += 1
+            log.exception(f"Faz6 bekleyen sonuç işlenemedi ({symbol}): {exc}")
+
+    log.info(
+        "Faz6 bekleyen sonuç kuyruğu: "
+        f"sembol={summary['symbols']} "
+        f"çözülen={summary['resolved']} "
+        f"skorlanabilir={summary['scored']} "
+        f"eski_stop_bilgisi_yok={summary['unscored']} "
+        f"bekleyen={summary['waiting']} "
+        f"veri_yok={summary['unavailable']} "
+        f"hata={summary['errors']}"
+    )
+    return summary
 
 
 def _faz5_whale(binance, symbol, side, sl_pct, tp_pct, atr_pct, risk, mode):
@@ -1453,6 +1594,19 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if STRATEGY_CONFIRMATION in ("compare", "on"):
         if not _faz6_confirm(binance, symbol, side, sl_pct, STRATEGY_CONFIRMATION):
             return False
+
+    # FAZ9 live: yalnız kazanan aile emir verebilir. Compare/dry-run'da kapı açık; canlıda kapalı = sinyal
+    # signal_outcomes'a yazıldı, emir yok.
+    _fam_ok, _fam_reason = _live_family_gate(symbol, side)
+    if not _fam_ok:
+        log.info(f"  atlandı: live family gate ({_fam_reason})")
+        return False
+
+    # FAZ9 live: rejim kapısı. trend rejimi veri toplamaya devam eder, emir vermez.
+    _reg_ok, _reg_reason = _live_regime_gate()
+    if not _reg_ok:
+        log.info(f"  atlandı: live regime gate ({_reg_reason})")
+        return False
 
     # Slipaj (sadece flag açıksa)
     if RISK_CONFIG.get("risk_guards_enabled", False):
@@ -1779,8 +1933,18 @@ def run_once(dry_run=False):
     log.info("=" * 60)
     log.info(f"Tarama: {datetime.now().isoformat()}")
     heartbeat_tick()
-    risk = RiskEngine(RISK_CONFIG)
-    reserver = PositionReserver(risk.db_file, MAX_OPEN_POSITIONS)
+    # FAZ9 live: kademe limitleri RiskEngine'e enjekte edilir. Compare'da cfg.is_live False → RISK_CONFIG aynen kalır.
+    _cfg = _live_cfg()
+    _risk_cfg = dict(RISK_CONFIG)
+    _max_positions = MAX_OPEN_POSITIONS
+    if _cfg.is_live:
+        _risk_cfg.update(_cfg.risk_overrides())
+        _max_positions = _cfg.max_open_positions
+        log.info(f"🔴 LIVE stage={_cfg.stage} testnet={_cfg.testnet} family={_cfg.strategy_family} "
+                 f"max_notional={_cfg.max_notional} daily_loss={_cfg.daily_loss_limit} "
+                 f"lev={_cfg.leverage} max_pos={_max_positions} base={_cfg.base_url}")
+    risk = RiskEngine(_risk_cfg)
+    reserver = PositionReserver(risk.db_file, _max_positions)
     try:
         reserver.init_schema()
     except Exception as e:
@@ -1793,8 +1957,22 @@ def run_once(dry_run=False):
         log.error("BINANCE_KEY/SECRET yok")
         return
 
-    binance = BinanceAPI(bk, bs)
+    binance = BinanceAPI(bk, bs, base=_cfg.base_url)
     hb = HBAPI(HB_API, hu, hp)
+    # FAZ9 live: tek seferlik açılış doğrulaması (bakiye + exchangeInfo). Başarısızsa süreç başlamaz.
+    if _cfg.is_live and not _startup_checked[0]:
+        try:
+            import live_guard
+            _sc = live_guard.startup_check(binance, _cfg)
+            _startup_checked[0] = True
+            log.info(f"✅ live startup check: balance={_sc['balance_usdt']:.2f} USDT "
+                     f"symbols={_sc['symbols']} canTrade={_sc['can_trade']} testnet={_sc['testnet']}")
+        except Exception as e:
+            log.critical(f"🚨 live startup check BAŞARISIZ, fail-closed (emir yok): {e}")
+            risk.is_halted = True
+            risk.halt_reason = f"live startup check failed: {e}"
+            risk._save_state()
+            return
     if HB_OFFLINE:
         log.warning("🔌 HB_OFFLINE aktif — Hummingbot API atlanıyor; open_coin dry-run'a "
                     "zorlanacak (gerçek emir YOK). Kalibrasyon/log toplama modu.")
@@ -1834,6 +2012,12 @@ def run_once(dry_run=False):
     stale = not check_stale_data(binance, max_age_sec=30)
 
     allow_new, _reasons = protect_then_gate(binance, reserver, drift, stale)
+
+    # Risk/pozisyon koruma kontrolleri tamamlandı.
+    # Bekleyen araştırma sinyallerini aday listesinden bağımsız çöz.
+    # Bu işlem yalnızca public kline verisi okur.
+    _resolve_pending_signal_outcomes(binance)
+
     if not allow_new:
         if drift:
             log.critical("🚨 Reconciliation drift — yeni giriş engellendi (koruma denetimi yine de çalıştı)")

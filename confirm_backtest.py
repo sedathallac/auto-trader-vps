@@ -355,8 +355,11 @@ def write_outcomes_db(events, table, path, horizon):
         for name, r in act.items():
             row = table.get((name, e["regime"]))
             if row and row["approved"]:
-                n += store.record_resolved(e["symbol"], r, e["regime"], e["ts"], e["entry"],
-                                           horizon, e["real"], e["fwd"], e["persist"], "offline")
+                n += store.record_resolved(
+                    e["symbol"], r, e["regime"], e["ts"], e["entry"],
+                    horizon, e["real"], e["fwd"], e["persist"], "offline",
+                    sl_pct=e["sl"],
+                )
     return n
 
 

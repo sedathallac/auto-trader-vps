@@ -422,3 +422,30 @@ def test_scope_isolation_no_live_trading_no_keys():
     # canlı bot varsayılanları değişmedi
     assert auto_trader.STRATEGY_CONFIRMATION == "off" and auto_trader.WHALE_HUNTING == "off"
     assert auto_trader.SCIENTIFIC_SIZING == "off" and auto_trader.HIERARCHICAL_SCAN == "off"
+
+def test_write_outcomes_db_persists_stop_pct(tmp_path):
+    reading = SignalReading("exhaustion", "rsi_extreme", 1, 0.8, "15m")
+    event = {
+        "readings": [reading],
+        "side": 1,
+        "regime": "range",
+        "symbol": "TESTUSDT",
+        "ts": 900_000,
+        "entry": 100.0,
+        "real": 1,
+        "fwd": 0.012,
+        "persist": 8,
+        "sl": 0.037,
+    }
+    db = tmp_path / "backtest_outcomes.db"
+    table = {("rsi_extreme", "range"): {"approved": True}}
+
+    assert cb.write_outcomes_db([event], table, str(db), 8) == 1
+
+    con = sqlite3.connect(db)
+    row = con.execute(
+        "SELECT source,resolved,real,sl_pct FROM signal_outcomes"
+    ).fetchone()
+    con.close()
+
+    assert row == ("offline", 1, 1, pytest.approx(0.037))

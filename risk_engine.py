@@ -189,6 +189,14 @@ class RiskEngine:
             return None, f"daily_limit ({self.daily_trades})"
         if self.consecutive_losses >= self.cfg["max_consecutive_losses"]:
             return None, f"loss_limit ({self.consecutive_losses})"
+        # FAZ9 live: günlük zarar tavanı USDT cinsinden (kademe limiti). Anahtarsız çağrıda davranış değişmez.
+        _dl = self.cfg.get("max_daily_loss_usdt")
+        if _dl is not None and self.daily_pnl <= -abs(float(_dl)):
+            self.is_halted = True
+            self.halt_reason = f"daily_loss {self.daily_pnl:.2f} <= -{abs(float(_dl)):.2f} USDT"
+            self._save_state()
+            log.critical(f"🚨 Günlük zarar limiti: {self.halt_reason}")
+            return None, f"daily_loss_limit ({self.daily_pnl:.2f})"
         if stop_distance_pct <= 0:
             return None, "invalid_stop"
         fee_pct = self.cfg.get("fee_pct_round_trip", 0.0008)
