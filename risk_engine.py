@@ -220,6 +220,15 @@ class RiskEngine:
                     "is_halted, halt_reason, last_reset_date, " + _sel +
                     " FROM risk_state WHERE id=1"
                 ).fetchone()
+                # FAZ9 post-audit: çözümlenemeyen kapanış zamanları startup'ta
+                # tespit edilir; bir sonraki record_trade'e kadar gizli kalmaz.
+                _ledger_cols = _columns(conn, "trade_ledger") or set()
+                unresolved_closures = 0
+                if {"closed_at_epoch", "closed_at"} <= _ledger_cols:
+                    for _ep, _iso in conn.execute(
+                            "SELECT closed_at_epoch, closed_at FROM trade_ledger"):
+                        if parse_close_epoch(_ep, _iso) is None:
+                            unresolved_closures += 1
         except Exception as e:
             self._block(f"DB load error: {e}")
             return
@@ -256,6 +265,11 @@ class RiskEngine:
             "day_start_equity_date": self.day_start_equity_date,
             "day_start_equity_at": self.day_start_equity_at,
         }
+        if unresolved_closures:
+            # Giriş kapalı; pozisyon yönetimi/kapanış etkilenmez. Zaman UYDURULMAZ,
+            # geçmiş satırlar sessizce yeniden yazılmaz/silinmez.
+            self._block(f"ledger_unresolved_timestamps: {unresolved_closures} "
+                        f"kapanış zamanı çözümlenemedi (reconciliation gerekli)")
 
     def _save_state(self):
         """UPSERT risk_state. Dönüş: True yalnız gerçekten yazıldıysa.
@@ -593,37 +607,70 @@ class RiskEngine:
 
     # --------------------------------------------------------------- counters
     def register_open(self, key=None):
-        """Günlük açılış sayacını ATOMİK artır; `key` ile idempotent."""
-        if key is not None and key in self._open_keys:
-            log.info(f"  register_open: {key} zaten sayıldı (idempotent)")
-            return True
-        now = iso_utc(utc_now())
-        keys = set(self._open_keys)
-        if key is not None:
-            keys.add(key)
+        """Günlük açılış sayacını ATOMİK artır; `key` ile idempotent.
+
+        FAZ9 post-audit: okuma ARTIK transaction İÇİNDE ve DB'den yapılır. Eski kod
+        `self._open_keys` (RAM) değerini `BEGIN IMMEDIATE`'ten ÖNCE okuyup yazıyordu;
+        iki bağımsız süreç aynı executor ID'yi kaydedince `daily_trades` iki kez
+        artıyor, farklı ID'ler birbirini eziyordu (lost update). JSON depolama
+        biçimi korunur; şema değişikliği yok.
+        """
+        day = utc_day()
         try:
             with self._db() as conn:
+                cols = _columns(conn, "risk_state") or set()
+                if "open_keys" not in cols:
+                    self.migration_required = True
+                    raise RiskStoreError("open_keys sütunu YOK — migration gerekli")
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    row = conn.execute(
+                        "SELECT daily_trades, last_reset_date, open_keys "
+                        "FROM risk_state WHERE id=1").fetchone()
+                    if row is None:
+                        raise RiskStoreError("risk_state id=1 satırı YOK")
+                    db_trades = int(row[0] or 0)
+                    db_day = row[1]
                     try:
-                        cur = conn.execute(
-                            "UPDATE risk_state SET daily_trades=daily_trades+1, updated_at=?, "
-                            "open_keys=? WHERE id=1", (now, json.dumps(sorted(keys))))
-                    except sqlite3.OperationalError as oe:
-                        if "no such column" not in str(oe):
-                            raise
-                        self.migration_required = True
-                        cur = conn.execute(
-                            "UPDATE risk_state SET daily_trades=daily_trades+1, updated_at=? "
-                            "WHERE id=1", (now,))
+                        parsed = json.loads(row[2] or "[]")
+                    except (TypeError, ValueError) as je:
+                        # Bozuk JSON sessizce boş küme SAYILMAZ.
+                        raise RiskStoreError(f"open_keys JSON bozuk: {je}")
+                    if not isinstance(parsed, list) or any(
+                            not isinstance(k, str) for k in parsed):
+                        raise RiskStoreError("open_keys JSON dizi değil")
+                    db_keys = set(parsed)
+                    if key is not None and key in db_keys:
+                        conn.execute("COMMIT")
+                        self.daily_trades = db_trades
+                        self._open_keys = db_keys
+                        self.state["daily_trades"] = db_trades
+                        log.info(f"  register_open: {key} zaten sayıldı "
+                                 f"(idempotent, DB)")
+                        return True
+                    if db_day != day:
+                        # Günlük reset burada YAPILMAZ; tarih güncel değilse
+                        # sayaç artırılmaz (fail-closed).
+                        raise RiskStoreError(
+                            f"günlük reset tarihi bayat ({db_day!r} != {day!r}) — "
+                            f"sayaç artırılmadı")
+                    keys = set(db_keys)
+                    if key is not None:
+                        keys.add(key)
+                    conn.execute(
+                        "UPDATE risk_state SET daily_trades=daily_trades+1, "
+                        "updated_at=?, open_keys=? WHERE id=1",
+                        (iso_utc(utc_now()), json.dumps(sorted(keys))))
                     if conn.execute("SELECT changes()").fetchone()[0] != 1:
                         raise RiskStoreError("register_open yazılmadı (changes!=1)")
-                    row = conn.execute("SELECT daily_trades FROM risk_state WHERE id=1").fetchone()
+                    new_trades = int(conn.execute(
+                        "SELECT daily_trades FROM risk_state WHERE id=1").fetchone()[0])
                     conn.execute("COMMIT")
                 except Exception:
                     conn.execute("ROLLBACK")
                     raise
-            self.daily_trades = int(row[0])
+            # Commit BAŞARILI olduktan sonra bellek DB ile eşitlenir.
+            self.daily_trades = new_trades
             self._open_keys = keys
             self.state["daily_trades"] = self.daily_trades
             return True

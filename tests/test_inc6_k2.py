@@ -82,7 +82,13 @@ class TestSyncRiskEngineK2Gate(unittest.TestCase):
         term = {"data": [{"executor_id": "E1", "status": "TERMINATED",
                           "close_timestamp": 9999999999, "net_pnl_quote": -0.27,
                           "trading_pair": "SOL-USDT"}]}
-        at.requests.post = lambda *a, **k: _FakeResp(term)
+
+        def _post(url, json=None, **kw):
+            # FAZ9 post-audit: sayfalama offset'e uyar; offset>0 → boş sayfa.
+            off = int((json or {}).get("offset") or 0)
+            return _FakeResp({"data": [] if off else term["data"]})
+
+        at.requests.post = _post
 
     def tearDown(self):
         at.STATE_DIR = self._orig_home
