@@ -615,6 +615,37 @@ def build_executor_config(symbol, amount, lev, side):
     }
 
 
+# FAZ15 Stage2b — C6 pagination contract, verified against the INSTALLED image
+# (hummingbot-api 26.7.1-1, source extracted from the image layers; evidence:
+# ~/faz9-c6-evidence/rootfs/hummingbot-api):
+#   POST /executors/search body = ExecutorFilterRequest(PaginationParams):
+#     {limit: default 100 (ge1, le1000), cursor: Optional[str], account_names,
+#      connector_names, trading_pairs, executor_types, status: Optional[str],
+#      controller_ids}  — models/executors.py:317-343.
+#   There is NO `is_active` and NO `offset` filter field (a body sending them
+#   is silently ignored -> old bug: "is_active": True filtered nothing and the
+#   default 100-row first page was treated as the full list).
+#   Response = {"data": [...], "pagination": {limit, has_more, next_cursor,
+#   total_count}}; cursor = "{created_at}:{executor_id}", rows sorted desc by
+#   (created_at, executor_id); a cursor the server cannot find RESTARTS the
+#   scan at the first page (executor_service.py _paginated: start_idx falls
+#   back to 0) — so a client must track cursors itself and stop on repeat.
+_ACTIVE_EXECUTOR_STATUSES = ("NOT_STARTED", "RUNNING", "SHUTTING_DOWN")
+_HB_SEARCH_LIMIT = 100
+_HB_SEARCH_MAX_PAGES = 50
+
+
+class HBContractError(RuntimeError):
+    """C6 API sözleşmesi ihlali/sonucu belirsiz — fail-closed.
+
+    The result of such a query is NOT trustworthy: a partial executor list is
+    never returned to callers. Callers already fail closed on any exception
+    from HBAPI (_occupied_slots -> (None, None), open_coin -> False,
+    create_executor -> UNKNOWN resolution), so raising is the safe contract.
+    A get_executor 404 -> None is deliberately NOT this error: "record not
+    found" is not evidence of a terminal state."""
+
+
 class HBAPI:
     def __init__(self, base, user, pw):
         self.base = base
@@ -660,10 +691,95 @@ class HBAPI:
         return {"error": f"UNKNOWN create outcome ({cause}); new executors={sorted(new)}",
                 "outcome": "UNKNOWN" if new else "NOT_CREATED"}
 
+    def _search_all_status(self, status):
+        """Full cursor chain of POST /executors/search for ONE `status`.
+
+        Returns every page. Raises HBContractError — the whole chain result
+        is then invalid, never a partial list — on any of:
+          * request error, non-200 status, JSON error, non-object body;
+          * missing/corrupt `data`/`pagination`; row without valid
+            executor_id or status;
+          * has_more=True without a usable next_cursor; has_more missing or
+            not boolean; has_more=False yet next_cursor present;
+          * cursor that repeats or does not advance (the server would
+            silently restart the scan at page 1 for an unknown cursor);
+          * more than _HB_SEARCH_MAX_PAGES pages (runaway guard).
+        """
+        out = []
+        cursor = None
+        seen_cursors = set()
+        for _page_no in range(_HB_SEARCH_MAX_PAGES):
+            try:
+                r = _session.post(f"{self.base}/executors/search",
+                                  json={"status": status,
+                                        "limit": _HB_SEARCH_LIMIT,
+                                        "cursor": cursor},
+                                  auth=self.auth, timeout=15)
+            except Exception as e:
+                raise HBContractError(
+                    f"search({status}) request failed: {type(e).__name__}: {e}") from e
+            code = getattr(r, "status_code", None)
+            if code != 200:
+                raise HBContractError(f"search({status}) http {code}")
+            try:
+                body = r.json()
+            except Exception as e:
+                raise HBContractError(f"search({status}) json parse failed: {e}") from e
+            if not isinstance(body, dict):
+                raise HBContractError(f"search({status}) body is not an object")
+            data = body.get("data")
+            pag = body.get("pagination")
+            if not isinstance(data, list) or not isinstance(pag, dict):
+                raise HBContractError(f"search({status}) data/pagination missing or corrupt")
+            for row in data:
+                if not isinstance(row, dict):
+                    raise HBContractError(f"search({status}) row is not an object")
+                if not isinstance(row.get("executor_id"), str) or not row["executor_id"]:
+                    raise HBContractError(f"search({status}) row has missing/invalid executor_id")
+                if not isinstance(row.get("status"), str) or not row["status"]:
+                    raise HBContractError(f"search({status}) row has missing/invalid status")
+            out.extend(data)
+            has_more = pag.get("has_more")
+            next_cursor = pag.get("next_cursor")
+            if has_more is False:
+                if next_cursor is not None:
+                    raise HBContractError(
+                        f"search({status}) has_more=False but next_cursor={next_cursor!r} — corrupt pagination")
+                return out
+            if has_more is not True:
+                raise HBContractError(f"search({status}) has_more missing/not boolean: {has_more!r}")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise HBContractError(f"search({status}) has_more=True but no next_cursor")
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise HBContractError(
+                    f"search({status}) cursor not advancing/repeating: {next_cursor!r}")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise HBContractError(f"search({status}) exceeded {_HB_SEARCH_MAX_PAGES}-page guard")
+
     def active_executors(self):
-        r = _session.post(f"{self.base}/executors/search",
-                          json={"is_active": True}, auth=self.auth, timeout=15)
-        return r.json().get("data", [])
+        """Executors that may occupy a slot: NOT_STARTED ∪ RUNNING ∪ SHUTTING_DOWN.
+
+        FAZ15 Stage2b: previously a single POST with body {"is_active": True}
+        — a filter field ExecutorFilterRequest does not have (silently
+        ignored), so the call actually returned TERMINATED history too and,
+        with the default 100-row limit, only the FIRST PAGE was ever seen
+        while being treated as the complete list. Now: one independent
+        cursor chain per active status (TERMINATED history is never pulled),
+        results deduplicated by executor_id. A failure in ANY status chain
+        raises HBContractError and the whole result is invalidated — callers
+        fail closed, they never see a partial list. `is_active`/`offset` are
+        never sent (verified absent from the request model)."""
+        out = []
+        seen = set()
+        for status in _ACTIVE_EXECUTOR_STATUSES:
+            for row in self._search_all_status(status):
+                eid = row["executor_id"]
+                if eid in seen:
+                    continue
+                seen.add(eid)
+                out.append(row)
+        return out
 
     def get_executor(self, eid):
         r = requests.post(f"{self.base}/executors/search",
