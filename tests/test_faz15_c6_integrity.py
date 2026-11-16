@@ -490,16 +490,22 @@ class TestPendingFinalizeLifecycle(Base):
         rid = r.reserve("NEARUSDT", set()).reservation_id
         auto_trader._PENDING_FILLS = {"E1": self._ctx(res_id=rid)}
         hb = FakeHB(executor={"filled_amount_quote": 200.0, "error_count": 0})
-        out1 = auto_trader._process_pending_fills(FakeBinance([]), hb, None, None, r)
-        self.assertIn("E1", auto_trader._PENDING_FILLS)
-        self.assertTrue(auto_trader._PENDING_FILLS["E1"]["finalization_complete"])
-        self.assertEqual(out1["waiting"], 1)
-        self.assertEqual(self.order.count("finalize"), 1)
-        r.fail = False
-        out2 = auto_trader._process_pending_fills(FakeBinance([]), hb, None, None, r)
-        self.assertEqual(self.order.count("finalize"), 1, "finalizer tekrar çalışmamalı")
-        self.assertNotIn("E1", auto_trader._PENDING_FILLS)
-        self.assertEqual(out2["waiting"], 0)
+        _orig_backoff = auto_trader.CONFIRM_RETRY_BACKOFF_S
+        auto_trader.CONFIRM_RETRY_BACKOFF_S = 0.0
+        try:
+            out1 = auto_trader._process_pending_fills(FakeBinance([]), hb, None, None, r)
+            self.assertIn("E1", auto_trader._PENDING_FILLS)
+            self.assertTrue(auto_trader._PENDING_FILLS["E1"]["finalization_complete"])
+            self.assertEqual(out1["waiting"], 1)
+            self.assertEqual(self.order.count("finalize"), 1)
+            r.fail = False
+            out2 = auto_trader._process_pending_fills(FakeBinance([]), hb, None, None, r)
+            self.assertEqual(self.order.count("finalize"), 1,
+                             "finalizer tekrar çalışmamalı")
+            self.assertNotIn("E1", auto_trader._PENDING_FILLS)
+            self.assertEqual(out2["waiting"], 0)
+        finally:
+            auto_trader.CONFIRM_RETRY_BACKOFF_S = _orig_backoff
 
     def test_executor_missing_queries_exchange_first(self):
         r = self._reserver_recording()

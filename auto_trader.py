@@ -2469,6 +2469,10 @@ PENDING_FLOCK_PATH = PENDING_FILLS_JSON.with_suffix(".lock")
 
 FINALIZATION_MAX_ATTEMPTS = 3
 FINALIZATION_RETRY_BACKOFF_S = float(os.getenv("LIVE_FINALIZE_RETRY_S", "30") or 30)
+# FAZ15b v5: confirm-only retry politikası. Sayaç/backoff kalıcıdır (restart korur);
+# maksimumda kayıt SİLİNMEZ, confirm_blocked=True ile fail-closed kalır.
+CONFIRM_MAX_ATTEMPTS = 3
+CONFIRM_RETRY_BACKOFF_S = float(os.getenv("LIVE_CONFIRM_RETRY_S", "30") or 30)
 
 
 class PendingTxError(RuntimeError):
@@ -2567,7 +2571,13 @@ def _parse_envelope(data):
 
 
 def _persist_envelope(pending, revision):
-    """Envelope'ı atomik + dayanıklı yaz: tmp -> fsync -> replace -> dir fsync."""
+    """Envelope'ı atomik + dayanıklı yaz: tmp -> fsync -> replace -> dir fsync.
+
+    FAZ15b v5: dizin fsync hatası ARTIK sessizce geçilmez. Dosya fsync, replace,
+    dizin fsync veya close hatalarının herhangi biri persist'i başarısız sayar;
+    çağıran store'u unhealthy yapar ve global gate kapanır. Aksi halde "yazıldı"
+    sanılan kayıt çökme sonrası kaybolabiliyordu.
+    """
     env = {"schema_version": PENDING_SCHEMA_VERSION, "revision": int(revision),
            "pending": pending}
     try:
@@ -2583,18 +2593,26 @@ def _persist_envelope(pending, revision):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, PENDING_FILLS_JSON)
-        try:
-            dfd = os.open(str(PENDING_FILLS_JSON.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
-        return True
     except Exception as e:
         log.critical(f"🚨 pending envelope persist hatası: {e}")
         return False
+    try:
+        dfd = os.open(str(PENDING_FILLS_JSON.parent), os.O_RDONLY)
+    except OSError as e:
+        log.critical(f"🚨 pending envelope dizin fsync açılamadı: {e}")
+        return False
+    try:
+        os.fsync(dfd)
+    except OSError as e:
+        log.critical(f"🚨 pending envelope dizin fsync hatası: {e}")
+        return False
+    finally:
+        try:
+            os.close(dfd)
+        except OSError as e:
+            log.critical(f"🚨 pending envelope dizin close hatası: {e}")
+            return False
+    return True
 
 
 def _acquire_flock(timeout=FLOCK_TIMEOUT_S):
@@ -2632,6 +2650,69 @@ def _release_flock(fd):
         pass
 
 
+def _read_disk_state():
+    """Diskteki envelope'ı oku + doğrula. Dönüş: (pending, rev, err).
+
+    err: None -> geçerli; "MISSING" -> dosya yok (bootstrap); diğer -> hata kodu.
+    """
+    try:
+        exists = PENDING_FILLS_JSON.exists()
+    except OSError as e:
+        return None, None, f"DISK_READ_FAILED: {e}"
+    if not exists:
+        return None, None, "MISSING"
+    try:
+        text = PENDING_FILLS_JSON.read_text(encoding="utf-8")
+    except OSError as e:
+        return None, None, f"DISK_READ_FAILED: {e}"
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        return None, None, f"MALFORMED_JSON: {e}"
+    parsed = _parse_envelope(data)
+    if parsed is None:
+        return None, None, "MALFORMED_ENVELOPE"
+    return parsed[0], parsed[1], None
+
+
+def _reconcile_with_disk():
+    """flock ALTINDA disk ile belleği uzlaştır. Dönüş: (ok, rev).
+
+    FAZ15b v5: iki süreç aynı revision'dan başlayıp eşzamanlı yazdığında ikincisi
+    birincinin commit'ini ezebiliyordu (lost update). Artık her transaction
+    mutator'dan ÖNCE diski okur:
+      disk > local  -> disk state belleğe alınır (revision ilerletilir)
+      disk == local -> canonical hash eşleşmeli, değilse MALFORMED_STATE
+      disk < local  -> REVISION_ROLLBACK
+      okunamaz/bozuksa -> mutator çalışmaz, önceki state korunur, gate kapanır
+    """
+    global _PENDING_FILLS
+    disk_pending, disk_rev, err = _read_disk_state()
+    if err == "MISSING":
+        with _PENDING_LOCK:
+            return True, _PENDING_REVISION[0]
+    if err:
+        _mark_store_unhealthy(err)
+        return False, None
+    with _PENDING_LOCK:
+        local_rev = _PENDING_REVISION[0]
+        local_pending = copy.deepcopy(_PENDING_FILLS)
+    if disk_rev > local_rev:
+        with _PENDING_LOCK:
+            _PENDING_FILLS = disk_pending
+            _PENDING_REVISION[0] = disk_rev
+        log.warning(f"  ♻️  pending store diskten uzlaştırıldı "
+                    f"(revision {local_rev}->{disk_rev})")
+        return True, disk_rev
+    if disk_rev == local_rev:
+        if _pending_hash(disk_pending) != _pending_hash(local_pending):
+            _mark_store_unhealthy("MALFORMED_STATE")
+            return False, None
+        return True, local_rev
+    _mark_store_unhealthy(f"REVISION_ROLLBACK: disk={disk_rev} memory={local_rev}")
+    return False, None
+
+
 def _persist_pending_fills():
     """Mevcut belleği mevcut revision ile yaz (recovery yolu). Dönüş: True/False."""
     with _PENDING_LOCK:
@@ -2644,7 +2725,8 @@ def _pending_transaction(mutator, *args, **kwargs):
     """Saf state dönüşümünü atomik uygula. Dönüş: (ok, result).
 
     Kilit grafiği: _PENDING_TX_LOCAL (nested) -> _PERSIST_LOCK -> flock ->
-    _PENDING_LOCK (yalnız snapshot/commit). _PENDING_LOCK ağ/API boyunca TUTULMAZ.
+    disk uzlaştırma -> _PENDING_LOCK (snapshot/commit). _PENDING_LOCK ağ/API
+    boyunca TUTULMAZ.
     """
     global _PENDING_FILLS
     if getattr(_PENDING_TX_LOCAL, "active", False):
@@ -2660,9 +2742,11 @@ def _pending_transaction(mutator, *args, **kwargs):
         if fd is None:
             _mark_store_unhealthy("FLOCK_TIMEOUT")
             return False, None
+        ok, rev = _reconcile_with_disk()
+        if not ok:
+            return False, None
         with _PENDING_LOCK:
             snapshot = copy.deepcopy(_PENDING_FILLS)
-            rev = _PENDING_REVISION[0]
         now = time.time()
         out = mutator(snapshot, now, *args, **kwargs)
         if isinstance(out, tuple) and len(out) == 2:
@@ -2784,18 +2868,33 @@ def _ensure_store_loaded():
         _load_pending_fills()
 
 
+def _is_dangerous_record(v):
+    """Recovery'de deadline/TTL nedeniyle SİLİNMEMESİ gereken kayıt.
+
+    FAZ15b v5: eski kod bayat deadline'ı koşulsuz siliyordu; `side_effect_started`
+    veya confirm bekleyen bir kayıt TTL yüzünden düşerse rezervasyon sahipsiz kalır
+    ve SL ikinci kez yerleştirilebilir. Tehlikeli kayıt her zaman korunur.
+    """
+    if not isinstance(v, dict):
+        return True
+    if v.get("finalization_in_progress") or v.get("finalization_blocked"):
+        return True
+    if v.get("finalization_complete"):
+        return True
+    if v.get("finalization_phase") == "side_effect_started":
+        return True
+    if v.get("confirm_blocked"):
+        return True
+    return False
+
+
 def _recover_pending_records(raw):
-    """Startup recovery: bayat kayıt + in_progress claim. Dönüş: (pending, changed)."""
+    """Startup recovery: bayat kayıt + in_progress claim. Dönüş: (pending, changed).
+
+    Sıra: önce faz değerlendirmesi, sonra deadline temizliği (yalnız tehlikesiz).
+    """
     changed = False
     now = time.time()
-    stale = [k for k, v in raw.items()
-             if float((v or {}).get("deadline") or 0) + STALE_PENDING_GRACE_S < now]
-    for k in stale:
-        raw.pop(k, None)
-        changed = True
-    if stale:
-        log.warning(f"  🧹 {len(stale)} bayat bekleyen dolum düşürüldü "
-                    f"(deadline > {STALE_PENDING_GRACE_S:.0f}s geçmiş)")
     for k, v in list(raw.items()):
         if not isinstance(v, dict) or not v.get("finalization_in_progress"):
             continue
@@ -2816,82 +2915,89 @@ def _recover_pending_records(raw):
         else:
             log.critical(f"  🚨 {k}: belirsiz finalizasyon aşaması ({ph!r}) — "
                          f"claim KORUNDU")
+    stale, kept = [], []
+    for k, v in list(raw.items()):
+        if float((v or {}).get("deadline") or 0) + STALE_PENDING_GRACE_S >= now:
+            continue
+        if _is_dangerous_record(v):
+            kept.append(k)
+            continue
+        raw.pop(k, None)
+        changed = True
+        stale.append(k)
+    if stale:
+        log.warning(f"  🧹 {len(stale)} bayat bekleyen dolum düşürüldü "
+                    f"(deadline > {STALE_PENDING_GRACE_S:.0f}s geçmiş)")
+    if kept:
+        log.warning(f"  🛡️  {len(kept)} bayat kayıt KORUNDU (finalizasyon/confirm "
+                    f"durumu belirsiz): {sorted(kept)}")
     return raw, changed
 
 
 def _load_pending_fills():
     """Startup: dosyayı oku, şemayı/revision'ı doğrula, recovery uygula.
 
-    FAZ14s: süreç başına BİR kez yüklenir; bayat kayıtlar düşürülür.
-    FAZ15b v4: envelope zorunlu; extra/eksik reserved anahtar fail-closed. İlk
-    kurulumda dosyanın yokluğu AÇIK bootstrap kuralıyla boş state üretir; mevcut
-    dosyanın okunamaması sessizce boş state'e çevrilmez.
+    FAZ14s: süreç başına BİR kez yüklenir.
+    FAZ15b v4: envelope zorunlu; extra/eksik reserved anahtar fail-closed.
+    FAZ15b v5: okuma+parse+recovery+persist aynı süreçler-arası kilit protokolünde.
+    Paylaşılan `.json.tmp` yazımı yarışa kapalı; recovery sırasında state başka
+    süreç tarafından ezilemez; bootstrap eşzamanlı başlangıca dayanıklı.
     """
     global _PENDING_FILLS
     if _PENDING_LOADED[0]:
         return _PENDING_FILLS
     _PENDING_LOADED[0] = True
     _PENDING_STORE_HEALTHY[0] = False
-    try:
-        exists = PENDING_FILLS_JSON.exists()
-    except OSError as e:
-        _mark_store_unhealthy(f"DISK_READ_FAILED: {e}")
+    if not _PERSIST_LOCK.acquire(timeout=PERSIST_LOCK_TIMEOUT_S):
+        _mark_store_unhealthy("PERSIST_LOCK_TIMEOUT")
         return _PENDING_FILLS
-    if not exists:
-        # Açık bootstrap kuralı: ilk kurulumda boş state.
-        _PENDING_FILLS = {}
-        _PENDING_REVISION[0] = 0
-        if not _persist_envelope({}, 0):
-            _mark_store_unhealthy("BOOTSTRAP_PERSIST_FAILED")
+    fd = None
+    try:
+        fd = _acquire_flock()
+        if fd is None:
+            _mark_store_unhealthy("FLOCK_TIMEOUT")
             return _PENDING_FILLS
+        disk_pending, disk_rev, err = _read_disk_state()
+        if err == "MISSING":
+            # Açık bootstrap kuralı: ilk kurulumda boş state (kilit altında).
+            _PENDING_FILLS = {}
+            _PENDING_REVISION[0] = 0
+            if not _persist_envelope({}, 0):
+                _mark_store_unhealthy("BOOTSTRAP_PERSIST_FAILED")
+                return _PENDING_FILLS
+            _mark_store_healthy()
+            return _PENDING_FILLS
+        if err:
+            _mark_store_unhealthy(err)
+            return _PENDING_FILLS
+        pending, changed = _recover_pending_records(disk_pending)
+        _PENDING_FILLS = pending
+        _PENDING_REVISION[0] = disk_rev
+        if changed:
+            if not _persist_envelope(pending, disk_rev + 1):
+                _mark_store_unhealthy("RECOVERY_PERSIST_FAILED")
+                return _PENDING_FILLS
+            _PENDING_REVISION[0] = disk_rev + 1
         _mark_store_healthy()
+        if pending:
+            log.info(f"  ♻️  {len(pending)} bekleyen dolum diskten geri yüklendi "
+                     f"(revision={_PENDING_REVISION[0]})")
         return _PENDING_FILLS
-    try:
-        text = PENDING_FILLS_JSON.read_text(encoding="utf-8")
-    except OSError as e:
-        _mark_store_unhealthy(f"DISK_READ_FAILED: {e}")
-        return _PENDING_FILLS
-    try:
-        data = json.loads(text)
-    except Exception as e:
-        _mark_store_unhealthy(f"MALFORMED_JSON: {e}")
-        return _PENDING_FILLS
-    parsed = _parse_envelope(data)
-    if parsed is None:
-        _mark_store_unhealthy("MALFORMED_ENVELOPE")
-        return _PENDING_FILLS
-    pending, disk_rev = parsed
-    pending, changed = _recover_pending_records(pending)
-    _PENDING_FILLS = pending
-    _PENDING_REVISION[0] = disk_rev
-    if changed and not _persist_envelope(pending, disk_rev):
-        _mark_store_unhealthy("RECOVERY_PERSIST_FAILED")
-        return _PENDING_FILLS
-    _mark_store_healthy()
-    if pending:
-        log.info(f"  ♻️  {len(pending)} bekleyen dolum diskten geri yüklendi "
-                 f"(revision={disk_rev})")
-    return _PENDING_FILLS
+    finally:
+        _release_flock(fd)
+        _PERSIST_LOCK.release()
 
 
 def _check_pending_revision():
     """Runtime revision/hash denetimi. Dönüş: True -> tutarlı."""
     global _PENDING_FILLS
-    try:
-        text = PENDING_FILLS_JSON.read_text(encoding="utf-8")
-    except OSError as e:
-        _mark_store_unhealthy(f"DISK_READ_FAILED: {e}")
+    disk_pending, disk_rev, err = _read_disk_state()
+    if err == "MISSING":
+        _mark_store_unhealthy("DISK_READ_FAILED: pending dosyası kayboldu")
         return False
-    try:
-        data = json.loads(text)
-    except Exception as e:
-        _mark_store_unhealthy(f"MALFORMED_JSON: {e}")
+    if err:
+        _mark_store_unhealthy(err)
         return False
-    parsed = _parse_envelope(data)
-    if parsed is None:
-        _mark_store_unhealthy("MALFORMED_ENVELOPE")
-        return False
-    disk_pending, disk_rev = parsed
     with _PENDING_LOCK:
         local_rev = _PENDING_REVISION[0]
         local_pending = copy.deepcopy(_PENDING_FILLS)
@@ -2995,26 +3101,54 @@ def _entry_order_terminal(binance, symbol, ctx):
 def _pending_confirm(eid, ctx, reserver, out):
     """Rezervasyonu CONFIRMED yap; başarılıysa pending kaydı düşür.
 
-    FAZ15: confirm başarısızsa pending KORUNUR ve diske yazılır; sonraki tick yalnız
-    confirm'i yeniden dener (finalizer ikinci kez çalışmaz).
+    FAZ15: confirm başarısızsa pending KORUNUR; sonraki tick yalnız confirm'i
+    yeniden dener (finalizer ikinci kez çalışmaz).
+    FAZ15b v5: kalıcı confirm sayacı + backoff + maksimum deneme. Maksimumda kayıt
+    silinmez; confirm_blocked=True ile fail-closed kalır (elle inceleme).
     """
     rid = ctx.get("res_id")
     if reserver is None or rid is None:
         _drop_pending_fill(eid)
         return True
-    # FAZ15b v4: commit edilmiş kaydı kullan (mutator'ın kopyası değil), aksi halde
-    # confirm hatasında finalization_complete=False geri yazılırdı.
+    # FAZ15b v4: commit edilmiş kaydı kullan (mutator'ın kopyası değil).
     with _PENDING_LOCK:
         _cur = _PENDING_FILLS.get(str(eid))
         if isinstance(_cur, dict):
             ctx = _cur
+    if ctx.get("confirm_blocked"):
+        log.critical(f"  🚫 confirm BLOKLU ({ctx.get('symbol')}, id={rid}) — "
+                     f"elle inceleme gerekli")
+        out["waiting"] += 1
+        return False
+    attempts = int(ctx.get("confirm_attempts") or 0)
+    if attempts >= CONFIRM_MAX_ATTEMPTS:
+        ctx = dict(ctx)
+        ctx["confirm_blocked"] = True
+        ctx["last_error"] = ctx.get("last_error") or "confirm_attempts_exhausted"
+        _register_pending_fill(eid, ctx)
+        log.critical(f"  🚫 confirm denemesi tükendi ({ctx.get('symbol')}, id={rid}) — "
+                     f"kayıt KORUNDU, BLOKLU")
+        out["waiting"] += 1
+        return False
+    nxt = float(ctx.get("confirm_next_at") or 0)
+    if nxt and time.time() < nxt:
+        out["waiting"] += 1
+        return False
     try:
         reserver.confirm(rid)
     except Exception as e:
-        log.critical(f"  🚨 confirm hatası ({ctx.get('symbol')}, id={rid}): {e} — "
-                     f"pending KORUNDU, sonraki tick yalnız confirm deneyecek")
+        # FAZ15b v5: commit edilmiş bellek sözlüğünü YERİNDE değiştirme; aksi halde
+        # memory ile disk hash'i ayrışır ve sonraki transaction MALFORMED_STATE verir.
+        ctx = dict(ctx)
+        ctx["confirm_attempts"] = attempts + 1
+        ctx["confirm_next_at"] = time.time() + CONFIRM_RETRY_BACKOFF_S
         ctx["last_error"] = f"confirm: {e}"
+        if ctx["confirm_attempts"] >= CONFIRM_MAX_ATTEMPTS:
+            ctx["confirm_blocked"] = True
         _register_pending_fill(eid, ctx)
+        log.critical(f"  🚨 confirm hatası ({ctx.get('symbol')}, id={rid}): {e} — "
+                     f"pending KORUNDU (deneme {ctx['confirm_attempts']}/"
+                     f"{CONFIRM_MAX_ATTEMPTS}), yalnız confirm yeniden denenecek")
         out["waiting"] += 1
         return False
     _drop_pending_fill(eid)
@@ -3049,6 +3183,8 @@ def _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
                             binance.filters(symbol), risk, coordinator, eid)
     except Exception as e:
         ok = False
+        # FAZ15b v5: bellek sözlüğünü yerinde değiştirme (hash/disk ayrışması).
+        ctx = dict(ctx)
         ctx["last_error"] = f"finalize: {e}"
         log.error(f"  finalize hatası ({symbol}): {e}")
     if ok:
