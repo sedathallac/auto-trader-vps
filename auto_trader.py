@@ -782,12 +782,42 @@ class HBAPI:
         return out
 
     def get_executor(self, eid):
-        r = requests.post(f"{self.base}/executors/search",
-                          json={}, auth=self.auth, timeout=15)
-        for e in r.json().get("data", []):
-            if e.get("executor_id") == eid:
-                return e
-        return None
+        """GET /executors/{executor_id} — tekil kayıt sorgusu (kurulu imajda
+        routers/executors.py:301-327 doğrulandı: önce memory, sonra DB; yanıt
+        ExecutorDetailResponse: executor_id/status/filled_amount_quote/
+        error_count/custom_info düz alanlar).
+
+        FAZ15 Stage2b: eski uygulama boş gövdeyle /executors/search atıp
+        DÖNEN İLK 100 SATIRI (varsayılan sayfa) tarıyordu; sayfa sınırını
+        aşan executor bulunamaz ve "yok" sanılabilirdi. Şimdi:
+          404            -> None (kayıt bulunamadı; TERMINAL kanıtı DEĞİLDİR
+                            — çağıran bunu tek başına release için kullanamaz)
+          5xx/timeouts/
+          JSON/şekil/ID
+          uyuşmazlığı     -> HBContractError (UNKNOWN; pending KORUNUR)."""
+        if not isinstance(eid, str) or not eid:
+            raise HBContractError("get_executor: geçersiz executor_id")
+        try:
+            r = _session.get(f"{self.base}/executors/{eid}", auth=self.auth,
+                             timeout=15)
+        except Exception as e:
+            raise HBContractError(
+                f"get_executor({eid}) request failed: {type(e).__name__}: {e}") from e
+        code = getattr(r, "status_code", None)
+        if code == 404:
+            return None
+        if code != 200:
+            raise HBContractError(f"get_executor({eid}) http {code}")
+        try:
+            body = r.json()
+        except Exception as e:
+            raise HBContractError(f"get_executor({eid}) json parse failed: {e}") from e
+        if not isinstance(body, dict):
+            raise HBContractError(f"get_executor({eid}) body is not an object")
+        if body.get("executor_id") != eid:
+            raise HBContractError(
+                f"get_executor({eid}) id mismatch: {body.get('executor_id')!r}")
+        return body
 
     def stop_executor(self, eid, keep_position=True):
         """Stop an executor WITHOUT letting it place its own close
@@ -2810,12 +2840,26 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # FILL_WAIT_S (300s) boyunca time.sleep ile kilitliyordu: tarama, SL denetimi ve
     # reconciliation 5 dakika boyunca duruyordu (strace: clock_nanosleep 300s). Artık
     # open_coin beklemez; executor kaydedilir ve her tick'te bir kez sorgulanır.
+    # FAZ15 Stage2b: ilk kimlik anlık görüntüsü. create_executor YALNIZ
+    # executor_id döndürür (CreateExecutorResponse) — emir kimliği ORADA DEĞİLDİR.
+    # Executor'un ilk tick'i henüz emir koymamış olabilir → boş liste normaldir;
+    # _process_pending_fills her tick'te yeniden hasat eder ve history'yi
+    # büyütür. Sorgu hatası ölümcül değil: pending kimliksiz kaydedilir,
+    # kimliksiz kayıt hiçbir zaman otomatik release edilemez (fail-closed).
+    entry_ids = []
+    try:
+        entry_ids = _harvest_entry_client_ids(hb.get_executor(eid))
+    except Exception as e:
+        log.info(f"  entry kimliği ilk sorgusu alınamadı ({eid}): {e} — "
+                 f"kimlikler sonraki tick'lerde toplanacak")
     _register_pending_fill(eid, {
         "symbol": symbol, "side": side, "amount": amount, "sl_pct": sl_pct,
         "tp_pct": tp_pct, "price": price, "dyn_lev": dyn_lev,
         "target_notional": target_notional, "res_id": _res_id,
         "deadline": time.time() + max(0.0, FILL_WAIT_S),
         "opened_at": time.time(),
+        "entry_client_order_ids": list(entry_ids),
+        "entry_client_order_id": entry_ids[-1] if entry_ids else None,
     })
     log.info(f"  ⏳ dolum bekleniyor (tick'ler arası, {FILL_WAIT_S:.0f}s): executor={eid}")
     return True
@@ -3505,46 +3549,169 @@ def _drop_pending_fill(eid):
 _TERMINAL_ORDER_STATES = ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
 _ACTIVE_ORDER_STATES = ("NEW", "PARTIALLY_FILLED", "PENDING_NEW")
 
+# Entry kimliği yalnız executor GERÇEKTEN giriş aşamasındayken hasat edilir.
+# K1=B kurulumunda (build_executor_config: üç bariyer de None, stop her zaman
+# keep_position=True) NOT_STARTED/RUNNING sırasında close/TP emri VAR OLAMAZ;
+# dolayısıyla custom_info.order_ids bu iki durumda yalnız GİRİŞ denemeleri ve
+# iptal-yeniden-deneme (retry) kimlikleridir. SHUTTING_DOWN/TERMINATED'ta
+# order_ids close/TP kimliği taşıyabileceğinden hasat DURUR (§4B kanıtı).
+_ENTRY_HARVEST_STATUSES = ("NOT_STARTED", "RUNNING")
+
+
+def _harvest_entry_client_ids(ex):
+    """Executor kaydından entry CLIENT emir kimliklerini çıkarır.
+
+    Kanıt (kurulu imaj, position_executor.py:719-730 ve exchange_py_base.py:
+    269-299): get_custom_info()["order_ids"] = mevcut
+    [_open_order, _close_order, _take_profit_limit_order] TrackedOrder
+    kimlikleridir ve buy()/sell() CONNECTOR-ÜRETIMI CLIENT kimlik döndürür —
+    exchange orderId DEĞİL. Bu kimlikler yalnız origClientOrderId alanına
+    yazılır/sorgulanır; entry_order_id (exchange orderId) alanına ASLA.
+    order_ids[0] koşulsuz entry SAYILMAZ (close/TP ilk sıraya geçebilir,
+    iptal edilen eski giriş listeden düşer, retry yeni kimlik üretir) — bu
+    yüzden TAMAMI history'ye eklenir. Yalnız NOT_STARTED/RUNNING'da hasat.
+    """
+    if not isinstance(ex, dict):
+        return []
+    if ex.get("status") not in _ENTRY_HARVEST_STATUSES:
+        return []
+    ci = ex.get("custom_info")
+    if not isinstance(ci, dict):
+        return []
+    ids = ci.get("order_ids")
+    if not isinstance(ids, list):
+        return []
+    return [i for i in ids if isinstance(i, str) and i]
+
+
+def _mut_add_entry_ids(pending, now, eid, ids):
+    """SAF: görülmemiş entry client kimliklerini HISTORY'ye ekle; eskileri
+    ASLA ezme. entry_order_id (exchange orderId alanına) DOKUNULMAZ — o alan
+    yalnız Binance sorgu yanıtından gelen gerçek orderId taşıyabilir.
+    Kayıt yoksa no-op (yeniden oluşturmaz)."""
+    new = copy.deepcopy(pending)
+    ctx = new.get(str(eid))
+    if not isinstance(ctx, dict):
+        return new, False
+    hist = ctx.get("entry_client_order_ids")
+    if not isinstance(hist, list):
+        hist = [c for c in (ctx.get("entry_client_order_id"),)
+                if isinstance(c, str) and c]
+    changed = False
+    for cid in ids:
+        if isinstance(cid, str) and cid and cid not in hist:
+            hist.append(cid)
+            changed = True
+    if changed:
+        ctx["entry_client_order_ids"] = hist
+        ctx["entry_client_order_id"] = hist[-1]
+    return new, changed
+
+
+def _persist_entry_client_ids(eid, new_ids):
+    """Entry client kimliklerini atomik pending transaction ile kalıcılaştır.
+    Başarısız persist KRİTİK değil: bellek diskten sonraki tick'te
+    uzlaştırılır ve hasat tekrar denenir; pending daima korunur. Güncel ctx
+    döner (kayıt bu anda düştüyse None)."""
+    ok, changed = _pending_transaction(_mut_add_entry_ids, eid, list(new_ids))
+    if not ok:
+        log.warning(f"  ⚠️ entry client kimliği persist edilemedi ({eid}) — "
+                    f"sonraki tick'te yeniden denenecek, pending KORUNDU")
+    with _PENDING_LOCK:
+        return copy.deepcopy(_PENDING_FILLS.get(eid))
+
 
 def _entry_order_terminal(binance, symbol, ctx):
-    """Giriş emrinin GERÇEKTEN terminal + sıfır dolum olduğunu doğrula.
+    """BİLİNEN TÜM giriş emirlerinin GERÇEKTEN terminal + sıfır dolum
+    olduğunu doğrula.
 
-    Dönüş: True  -> terminal (CANCELED/EXPIRED/REJECTED) + executedQty=0 + flat
-            False -> terminal değil / kısmi veya tam dolum / pozisyon açık
-            None  -> BELİRSİZ (emir kimliği yok, API hatası, bilinmeyen status)
+    Dönüş: True  -> her kimlik terminal (CANCELED/EXPIRED/REJECTED),
+                   executedQty=0, sembolde AÇIK emir yok, pozisyon flat
+            False -> aktif/dolu emir var (executedQty>0 terminal-no-fill
+                   DEĞİLDİR; dolum uzlaştırma yolu yönetir) / açık emir var
+                   / pozisyon açık
+            None  -> BELİRSİZ (hiç kimlik yok, sorgu hatası/UNKNOWN,
+                   eksik alan, güvenilmez openOrders) — çağıran pending ve
+                   rezervasyonu KORUR.
 
-    FAZ15: `open_orders(symbol)==[]` terminal kanıtı DEĞİLDİR. Yalnız belirli giriş
-    emri sorgulanır. Hummingbot `create_executor()` yalnız `executor_id` döndürür;
-    exchange orderId/origClientOrderId vermez — bu yüzden kimlik yoksa sonuç None
-    olur ve çağıran rezervasyonu KORUR (otomatik release yok).
+    FAZ15 Stage2b:
+      * Kimlikler entry_client_order_ids history + geçerlisinden gelir; bunlar
+        CLIENT kimliklerdir ve origClientOrderId parametresiyle sorgulanır.
+        ctx["entry_order_id"] varsa yalnız Binance yanıtından gelmiştir ve
+        ayrı istekte orderId parametresiyle sorgulanır — iki alan ASLA
+        birbirinin yerine kullanılmaz (Binance query_order iki parametreyi
+        ayrı ayrı gönderir).
+      * Herhangi bir kimliğin sorgusu UNKNOWN -> tüm sonuç None (kısmi
+        doğrulama ile release YOK).
+      * openOrders sorgusu liste dönmek ZORUNDA (hata/gövde bozuksa None);
+        liste doluysa retry/ilişkili emir ihtimali release'i engeller.
+      * allOrders zaman-simge eşleştirmesi KULLANILMAZ: executor↔emir
+        bağıntısı kurulamaz; kimlik hiç gözlenmediyse otomatik release yok.
     """
-    oid = ctx.get("entry_order_id")
-    ocid = ctx.get("entry_client_order_id")
-    if not oid and not ocid:
-        return None
     try:
-        r = binance.query_order(symbol, order_id=oid, orig_client_order_id=ocid)
+        client_ids = []
+        hist = ctx.get("entry_client_order_ids")
+        if isinstance(hist, list):
+            for c in hist:
+                if isinstance(c, str) and c and c not in client_ids:
+                    client_ids.append(c)
+        cur = ctx.get("entry_client_order_id")
+        if isinstance(cur, str) and cur and cur not in client_ids:
+            client_ids.append(cur)
+        exchange_oid = ctx.get("entry_order_id")
+        if isinstance(exchange_oid, str) and not exchange_oid.strip():
+            exchange_oid = None
+        if not client_ids and exchange_oid is None:
+            return None
+        try:
+            oo = binance.open_orders(symbol)
+        except Exception as e:
+            log.warning(f"  açık emir sorgusu entry doğrulamasında başarısız "
+                        f"({symbol}): {e} — BELİRSİZ")
+            return None
+        if not isinstance(oo, list):
+            log.warning(f"  açık emir sorgusu güvenilmez ({symbol}): {oo!r} — BELİRSİZ")
+            return None
+        if oo:
+            log.warning(f"  {symbol}: {len(oo)} açık emir var — terminal giriş "
+                        f"kanıtı eksik (retry/ilişkili emri dışlanamaz)")
+            return False
+        queries = [(None, c) for c in client_ids]
+        if exchange_oid is not None:
+            queries.append((exchange_oid, None))
+        for oid, ocid in queries:
+            tag = f"origClientOrderId={ocid}" if ocid else f"orderId={oid}"
+            try:
+                r = binance.query_order(symbol, order_id=oid,
+                                        orig_client_order_id=ocid)
+            except Exception as e:
+                log.warning(f"  giriş emri sorgusu hatası ({symbol}, {tag}): {e}")
+                return None
+            if not isinstance(r, dict) or "status" not in r:
+                log.warning(f"  giriş emri sorgusu belirsiz ({symbol}, {tag}): {r!r}")
+                return None
+            status = str(r.get("status") or "").upper()
+            if status in _ACTIVE_ORDER_STATES or status == "FILLED":
+                return False
+            if status not in _TERMINAL_ORDER_STATES:
+                return None
+            if "executedQty" not in r:
+                return None
+            try:
+                executed = float(r["executedQty"])
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(executed) or executed != 0:
+                return False
+        amt = _exchange_position_amt(binance, symbol)
+        if amt is None or amt != 0:
+            return False
+        return True
     except Exception as e:
-        log.warning(f"  giriş emri sorgusu hatası ({symbol}): {e}")
+        # Beklenmedik hiçbir durum kısmi/otomatik release'e yol açamaz.
+        log.warning(f"  giriş terminal doğrulaması beklenmedik hata ({symbol}): "
+                    f"{type(e).__name__}: {e} — BELİRSİZ")
         return None
-    if not isinstance(r, dict) or "status" not in r:
-        log.warning(f"  giriş emri sorgusu belirsiz ({symbol}): {r}")
-        return None
-    status = str(r.get("status") or "").upper()
-    if status in _ACTIVE_ORDER_STATES or status == "FILLED":
-        return False
-    if status not in _TERMINAL_ORDER_STATES:
-        return None
-    try:
-        executed = float(r.get("executedQty") or 0)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(executed) or executed != 0:
-        return False
-    amt = _exchange_position_amt(binance, symbol)
-    if amt is None or amt != 0:
-        return False
-    return True
 
 
 def _mut_confirm_failure(pending, now, eid, error):
@@ -3777,6 +3944,18 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
                         f"pending ve rezervasyon KORUNDU")
             out["waiting"] += 1
             continue
+        # FAZ15 Stage2b: giriş kimlik hasadı HER tick'te (retry kimlikleri dahil;
+        # history asla ezilmez; close/TP hasat dışı — _harvest_entry_client_ids).
+        # Persist başarılıysa ctx tazelenir; kayıt bu anda düştüyse beklenir.
+        seen_ids = {c for c in (ctx.get("entry_client_order_ids") or [])
+                    if isinstance(c, str)}
+        new_ids = [i for i in _harvest_entry_client_ids(ex) if i not in seen_ids]
+        if new_ids:
+            refreshed = _persist_entry_client_ids(eid, new_ids)
+            if not isinstance(refreshed, dict):
+                out["waiting"] += 1
+                continue
+            ctx = refreshed
         filled = float(ex.get("filled_amount_quote", 0) or 0) if ex else 0.0
         err = int(ex.get("error_count", 0) or 0) if ex else 999
         deadline = float(ctx.get("deadline") or 0)
@@ -3809,7 +3988,24 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
                              f"pending ve rezervasyon KORUNDU")
                 out["waiting"] += 1
                 continue
-            # stop başarılı olsa bile terminal emir kanıtı olmadan release YOK.
+            # FAZ15 Stage2b: stop yanıtı tek başına kanıt değil — executor'un
+            # GERÇEKTEN TERMINATED olduğu yeniden doğrulanır (404/UNKNOWN/
+            # hâlâ aktif -> bekle; sonraki tick A veya D kolundan devam eder).
+            try:
+                ex2 = hb.get_executor(eid)
+            except Exception as e:
+                log.warning(f"  ⏳ {symbol}: stop sonrası executor durumu "
+                            f"doğrulanamadı ({e}) — pending ve rezervasyon KORUNDU")
+                out["waiting"] += 1
+                continue
+            if ex2 is None or str(ex2.get("status") or "") != "TERMINATED":
+                log.warning(f"  ⏳ {symbol}: executor henüz TERMINATED değil "
+                            f"(status={(ex2 or {}).get('status') or 'yok'}) — "
+                            f"pending ve rezervasyon KORUNDU")
+                out["waiting"] += 1
+                continue
+            # stop + TERMINATED doğrulaması olsa bile terminal emir kanıtı
+            # olmadan release YOK.
             if _entry_order_terminal(binance, symbol, ctx) is True:
                 log.info(f"  🔓 {symbol}: giriş emri terminal + sıfır dolum + flat — "
                          f"rezervasyon serbest")
@@ -3821,7 +4017,7 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
                 out["cancelled"] += 1
             else:
                 log.warning(f"  ⏳ {symbol}: dolmadı ama terminal emir kanıtı YOK "
-                            f"(entry_order_id={ctx.get('entry_order_id') or '-'}) — "
+                            f"(entry kimlikleri={ctx.get('entry_client_order_ids') or '-'}) — "
                             f"pending ve rezervasyon KORUNDU")
                 out["waiting"] += 1
             continue
