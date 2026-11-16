@@ -79,8 +79,9 @@ def test_open_coin_does_not_block_on_fill_wait():
 def test_pending_fill_registered_and_persisted():
     auto_trader._register_pending_fill("E1", _ctx())
     assert "E1" in auto_trader._PENDING_FILLS
-    on_disk = json.loads(auto_trader.PENDING_FILLS_JSON.read_text())
-    assert on_disk["E1"]["symbol"] == "NEARUSDT"
+    envelope = json.loads(auto_trader.PENDING_FILLS_JSON.read_text())
+    assert set(envelope) == {"schema_version", "revision", "pending"}
+    assert envelope["pending"]["E1"]["symbol"] == "NEARUSDT"
 
 
 def test_pending_fills_reload_after_restart():
