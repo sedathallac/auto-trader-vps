@@ -2,12 +2,14 @@
 
 42 test metodu, 0 SKIP. Tüm DB'ler geçici dizinde; canlı state'e yazılmaz.
 """
+import copy
 import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import auto_trader
@@ -85,6 +87,89 @@ class _Resp:
 
     def json(self):
         return self._body
+
+
+class FakeEntryBinance:
+    """Boundary fake for the REAL open_coin entry flow (no network)."""
+
+    def __init__(self):
+        self.order = None
+        self.open = []
+        self.order_queries = []  # her query_order çağrısının AYRI parametreleri
+
+    def position_risk(self):
+        return []
+
+    def filters(self, symbol):
+        return {"PRICE_FILTER": {"tickSize": "0.01"},
+                "LOT_SIZE": {"stepSize": "0.1"},
+                "MIN_NOTIONAL": {"notional": "5"}}
+
+    def account_snapshot(self):
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
+    def set_leverage(self, symbol, lev):
+        return {"leverage": lev}
+
+    def order_book(self, symbol, limit=20):
+        return {"bids": [["3.195", "5000"]], "asks": [["3.196", "5000"]]}
+
+    def open_orders(self, symbol):
+        return list(self.open)
+
+    def query_order(self, symbol, order_id=None, orig_client_order_id=None):
+        # orderId ve origClientOrderId AYNI parametre değildir; hangi değerinin
+        # hangisine gittiği kayıt altında (asla takas edilemezler).
+        self.order_queries.append({"order_id": order_id,
+                                   "orig_client_order_id": orig_client_order_id})
+        return self.order
+
+
+class FakeEntryHB:
+    """HB boundary fake — DOĞRULANMIŞ sözleşme (kurulu imaj kaynakları):
+    custom_info.order_ids, aktif TrackedOrder'larin CONNECTOR-ÜRETIMI CLIENT
+    emir kimliklerini taşır (exchange_py_base.buy()/sell() client id döndürür;
+    exchange orderId DEĞİL). create_executor yalnız executor_id döndürür;
+    get_executor tekil kaydı döndürür; stop -> TERMINATED."""
+
+    def __init__(self, order_ids=(), status="NOT_STARTED", filled=0.0):
+        self.order_ids = list(order_ids)
+        self.status = status
+        self.filled = filled
+        self.stopped = []
+
+    def active_executors(self):
+        return []
+
+    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
+        # CreateExecutorResponse: emir kimliği YOK — yalnız executor kimliği.
+        return {"executor_id": "E1"}
+
+    def get_executor(self, eid):
+        return {"executor_id": eid, "status": self.status,
+                "filled_amount_quote": self.filled, "error_count": 0,
+                "custom_info": {"order_ids": list(self.order_ids)}}
+
+    def stop_executor(self, eid, keep_position=True):
+        self.stopped.append((eid, keep_position))
+        self.status = "TERMINATED"
+        return {"status": "ok"}
+
+
+class FakeRisk:
+    health_ok = True
+    migration_required = False
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, *a, **k):
+        return 200.0, "ok"
 
 
 class Base(unittest.TestCase):
@@ -468,19 +553,6 @@ class TestPendingFinalizeLifecycle(Base):
         self.assertEqual(len(r.active_reservations()), 1)
         self.assertEqual(out["waiting"], 1)
 
-    def test_terminal_zero_exec_flat_releases(self):
-        r = self._reserver_recording()
-        rid = r.reserve("NEARUSDT", set()).reservation_id
-        auto_trader._PENDING_FILLS = {"E1": self._ctx(
-            res_id=rid, deadline=time.time() - 1, entry_order_id=12345)}
-        hb = FakeHB(executor={"filled_amount_quote": 0.0, "error_count": 0})
-        b = FakeBinance([], order={"status": "CANCELED", "executedQty": "0"})
-        out = auto_trader._process_pending_fills(b, hb, None, None, r)
-        self.assertEqual(out["released"], 1)
-        self.assertNotIn("E1", auto_trader._PENDING_FILLS)
-        self.assertEqual(r.active_reservations(), [])
-        self.assertEqual(hb.stopped, [("E1", True)])
-
     def test_confirm_failure_retries_confirm_only(self):
         class Flaky(PositionReserver):
             def __init__(self, *a, **k):
@@ -668,6 +740,158 @@ class TestActiveExecutorsPagination(Base):
                 hb = auto_trader.HBAPI("http://hb", "u", "p")
                 with self.assertRaises(auto_trader.HBContractError):
                     hb.active_executors()
+
+
+# --------------------- 1: pending entry lifecycle (real open_coin)
+class TestPendingEntryLifecycle(Base):
+    """Gerçek open_coin akışı: entry CLIENT kimlikleri (custom_info.order_ids,
+    connector-üretimi — exchange orderId DEĞİL) pending history'ye taşınır;
+    retry kimlikleri eklenir, eski kimlikler ASLA silinmez; close/TP kimliği
+    entry history'sine giremez; rezervasyon yalnız DOĞRULANMIŞ terminal
+    (tüm kimlikler terminal + executedQty=0 + açık emir yok + flat + executor
+    TERMINATED) durumunda bırakılır; UNKNOWN'da KORUNUR."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_max = auto_trader.MAX_OPEN_POSITIONS
+        auto_trader.MAX_OPEN_POSITIONS = 2
+        names = ("check_liquidity", "check_correlation_limit", "decide_side",
+                 "calculate_atr", "calculate_position_size", "_live_cfg")
+        self._orig = {n: getattr(auto_trader, n) for n in names}
+        auto_trader.check_liquidity = lambda b, s: (True, "ok")
+        auto_trader.check_correlation_limit = lambda s, b: True
+        auto_trader.decide_side = lambda coin: (1, "LONG")
+        auto_trader.calculate_atr = lambda b, s, interval="15m", period=14: 0.02
+        auto_trader.calculate_position_size = lambda bal, coin: (200.0, 1.0)
+        auto_trader._live_cfg = lambda: SimpleNamespace(
+            is_live=False, max_position_pct=None, max_notional=0, max_leverage=20)
+
+    def tearDown(self):
+        for name, val in self._orig.items():
+            setattr(auto_trader, name, val)
+        auto_trader.MAX_OPEN_POSITIONS = self._orig_max
+        super().tearDown()
+
+    @staticmethod
+    def _mut_set(pending, now, eid, key, value):
+        """SAF test mutatoru: deadline/legacy-tohumlama gibi ZAMAN YOLCULUĞU
+        değişiklikları transaction üzerinden yapılır (transaction dışı bellek
+        yazımı disk hash uzlaşmasını bozar -> MALFORMED_STATE)."""
+        new = copy.deepcopy(pending)
+        ctx = new.get(str(eid))
+        if isinstance(ctx, dict):
+            ctx[key] = value
+        return new, True
+
+    def test_entry_identity_survives_retry_release_only_verified(self):
+        r = self.reserver()
+        hb = FakeEntryHB(order_ids=[], status="NOT_STARTED")
+        b = FakeEntryBinance()
+        coin = {"symbol": "NEARUSDT", "lastPrice": "3.196",
+                "quoteVolume": "1000000", "_score": 0.5, "CQ": 0.9,
+                "priceChangePercent": "2"}
+        # 0) create: create_executor yalnız executor_id döndürür; executor daha
+        #    emir koymamış olabilir → kimlik boş (pending+rezervasyon kurulur).
+        #    Exchange orderId alanı (entry_order_id) HİÇ yazılmaz.
+        self.assertTrue(auto_trader.open_coin(b, hb, coin, dry_run=False,
+                                              risk=FakeRisk(), reserver=r))
+        ctx = auto_trader._PENDING_FILLS["E1"]
+        self.assertEqual(ctx.get("entry_client_order_ids"), [])
+        self.assertIsNone(ctx.get("entry_client_order_id"))
+        self.assertNotIn("entry_order_id", ctx,
+                         "exchange orderId alanına client kimlik asla yazılmaz")
+        self.assertIsNotNone(ctx.get("res_id"))
+        self.assertEqual(len(r.active_reservations()), 1)
+        tx = auto_trader._pending_transaction
+        self.assertTrue(tx(self._mut_set, "E1", "deadline", time.time() + 300)[0])
+
+        # 1) Kimlik henüz yok: pending+rezervasyon korunur, otomatik release yok.
+        out = auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(out["waiting"], 1)
+        self.assertIn("E1", auto_trader._PENDING_FILLS)
+
+        # 2) RUNNING + ilk entry kimliği → history'ye hasat + atomik persist.
+        hb.status, hb.order_ids = "RUNNING", ["CID-1"]
+        auto_trader._process_pending_fills(b, hb, None, None, r)
+        ctx = auto_trader._PENDING_FILLS["E1"]
+        self.assertEqual(ctx["entry_client_order_ids"], ["CID-1"])
+        self.assertEqual(ctx["entry_client_order_id"], "CID-1")
+        disk = json.loads(auto_trader.PENDING_FILLS_JSON.read_text())
+        self.assertEqual(disk["pending"]["E1"]["entry_client_order_ids"], ["CID-1"],
+                         "kimlik atomik transaction ile diske inmiş olmalı")
+
+        # 3) iptal → retry: eski kimlik order_ids'ten düşer, yenisi gelir;
+        #    history ASLA ezilmez — her iki kimlik de korunur.
+        hb.order_ids = ["CID-2"]
+        auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(
+            auto_trader._PENDING_FILLS["E1"]["entry_client_order_ids"],
+            ["CID-1", "CID-2"], "retry kimliği history'ye eklenir, ezilmez")
+
+        # 4) close/TP kimliği entry history'sine ASLA giremez: hasat yalnız
+        #    NOT_STARTED/RUNNING'de (K1=B kurulumunda bu iki durumda close/TP
+        #    zaten oluşamaz — bu adım sağlamalık yoklamasıdır).
+        hb.status, hb.order_ids = "SHUTTING_DOWN", ["TP-1"]
+        auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(
+            auto_trader._PENDING_FILLS["E1"]["entry_client_order_ids"],
+            ["CID-1", "CID-2"], "SHUTTING_DOWN'da hasat durur; TP-1 adoption yok")
+
+        # 5) legacy exchange orderId (yalnız Binance yanıtından gelmiş olabilir):
+        #    kendi parametresiyle sorgulanır — origClientOrderId ile takas edilmez.
+        self.assertTrue(tx(self._mut_set, "E1", "entry_order_id", "12345")[0])
+        self.assertTrue(tx(self._mut_set, "E1", "deadline", time.time() - 1)[0])
+
+        # 6) UNKNOWN sorgu yanıtı → pending+rezervasyon KORUNUR (stop denenir,
+        #    release yoktur) ve UNKNOWN kimlikte zincir durur.
+        b.order = None
+        out = auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(out["waiting"], 1)
+        self.assertIn("E1", auto_trader._PENDING_FILLS)
+        self.assertEqual(len(r.active_reservations()), 1)
+        self.assertIn(("E1", True), hb.stopped, "stop her zaman keep_position=True")
+        self.assertEqual(
+            b.order_queries, [{"order_id": None, "orig_client_order_id": "CID-1"}],
+            "client kimlik yalnız orig_client_order_id parametresine gider; "
+            "UNKNOWN'da sonraki kimlikler sorgulanmaz")
+
+        # 7) executedQty>0 terminal no-fill DEĞİLDİR: dolum uzlaştırma yolu
+        #    yönetir → pending+rezervasyon korunur.
+        b.order = {"status": "CANCELED", "executedQty": "0.4"}
+        out = auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(out["waiting"], 1)
+        self.assertIn("E1", auto_trader._PENDING_FILLS)
+
+        # 8) Sembolde açık emir kaldıysa (yeni retry ihtimali) release engellenir.
+        nq = len(b.order_queries)
+        b.open = [{"symbol": "NEARUSDT", "orderId": 999}]
+        out = auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(out["waiting"], 1)
+        self.assertIn("E1", auto_trader._PENDING_FILLS)
+        self.assertEqual(len(b.order_queries), nq,
+                         "openOrders dolu → tekil sorguya gerek yok")
+        b.open = []
+
+        # 9) TÜM kimlikler doğrulanmış terminal + sıfır dolum + açık emir yok +
+        #    flat + executor TERMINATED → rezervasyon bırakılır.
+        b.order = {"status": "CANCELED", "executedQty": "0"}
+        out = auto_trader._process_pending_fills(b, hb, None, None, r)
+        self.assertEqual(out["released"], 1)
+        self.assertNotIn("E1", auto_trader._PENDING_FILLS)
+        self.assertEqual(r.active_reservations(), [])
+        self.assertTrue(all(s == ("E1", True) for s in hb.stopped))
+        # Kimlik alanları asla takas edilmemiş: client kimlik orderId paramına,
+        # exchange orderId origClientOrderId paramına GİRMEMİŞ olmalı.
+        for q in b.order_queries:
+            if q["orig_client_order_id"]:
+                self.assertIsNone(q["order_id"])
+                self.assertIn(q["orig_client_order_id"], ("CID-1", "CID-2"))
+            if q["order_id"]:
+                self.assertEqual(q["order_id"], "12345")
+        self.assertTrue(any(q["order_id"] == "12345"
+                            and q["orig_client_order_id"] is None
+                            for q in b.order_queries),
+                        "legacy exchange orderId kendi parametresiyle sorgulandı")
 
 
 if __name__ == "__main__":
