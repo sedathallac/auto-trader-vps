@@ -32,6 +32,11 @@ class FakeBinance:
     def get_available_balance(self, asset):
         return 1000.0
 
+    def account_snapshot(self):
+        # FAZ16 (4331dd1): gerçek giriş yolu artık TEK snapshot ister — fixture katmanı.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
     def order_book(self, symbol, limit=20):
         # FAZ11 kalite kapısı: 2.5 bps spread, ~800k USDT derinlik.
         return {"bids": [["79.99", "5000"]], "asks": [["80.01", "5000"]]}
@@ -41,6 +46,10 @@ class FakeBinance:
 
     def position_risk(self):
         return []                      # no open positions
+
+    def open_orders(self, symbol):
+        # FAZ15 Stage2b terminal-kanıt kapısı: openOrders listesi dönmek ZORUNDA.
+        return []
 
     def place_algo_sl(self, *a, **k):
         return {"algoId": 1}
@@ -65,6 +74,11 @@ class FakeHB:
         return {"executor_id": "EX1"}
 
     def get_executor(self, eid):
+        # FAZ15 Stage2b: terminal-kanıt kapısı stop SONRASI TERMINATED ister
+        # (stop öncesi ham dolum/sayaçlar görünür — UNFILLED + errors).
+        if (eid, True) in self.stopped:
+            return {"status": "TERMINATED", "filled_amount_quote": 0.0,
+                    "error_count": 8}
         return {"filled_amount_quote": 0.0, "error_count": 8}   # UNFILLED + errors
 
     def stop_executor(self, eid, keep_position=True):
@@ -72,14 +86,30 @@ class FakeHB:
         return {"status": "ok"}
 
 
+class _RiskOK:
+    """FAZ16 (4331dd1) giriş kapısının beklediği minimal RiskEngine testi.
+    Üretim kapısına dokunmaz; sadece 'sağlıklı, halt'sız, onaylayan' motoru taklit eder."""
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, balance, slippage, take_profit_pct=None, equity=None,
+                      max_position_pct=None):
+        return 50.0, "approved"
+
+
 class Faz2Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "risk_ledger.db")
-        self.reserver = PositionReserver(self.db, 2)
+        self.reserver = PositionReserver(self.db, 5)
         self.reserver.init_schema()
         self._orig_max = auto_trader.MAX_OPEN_POSITIONS
-        auto_trader.MAX_OPEN_POSITIONS = 2
+        auto_trader.MAX_OPEN_POSITIONS = 5
         self._orig = {}
         for name, val in [
             ("check_liquidity", lambda b, s: (True, "ok")),
@@ -97,6 +127,15 @@ class Faz2Base(unittest.TestCase):
         self._orig_pf = auto_trader.PENDING_FILLS_JSON
         auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
         auto_trader._PENDING_FILLS.clear()
+        # FAZ16 giriş kapısının modül globali: test kirliliğini kanonik biçimde yalıt.
+        _saved_health = auto_trader._entry_health_reasons()
+
+        def _restore(saved):
+            for k in list(auto_trader._entry_health_reasons()):
+                auto_trader._entry_health_clear(k)
+            for k, v in saved.items():
+                auto_trader._entry_health_set(k, v)
+        self.addCleanup(_restore, _saved_health)
 
     def tearDown(self):
         for n, v in self._orig.items():
@@ -115,7 +154,7 @@ class TestExecutionRobustness(Faz2Base):
     def test_unfilled_executor_releases_reservation_and_stops(self):
         fb = FakeBinance()
         hb = FakeHB()
-        r = auto_trader.open_coin(fb, hb, self._coin(), risk=None,
+        r = auto_trader.open_coin(fb, hb, self._coin(), risk=_RiskOK(),
                                   reserver=self.reserver, coordinator=None)
         self.assertTrue(r)          # FAZ14p: open_coin beklemez, dolum tick'te izlenir
         # FAZ15: release için TERMINAL emir kanıtı gerekir; HB orderId vermez, bu yüzden
@@ -132,10 +171,10 @@ class TestExecutionRobustness(Faz2Base):
                          "unfilled executor not stopped")
 
     def test_slot_reusable_after_fill_failure(self):
-        # after a fill-failure, both slots must be free again (no cap starvation).
+        # after a fill-failure, the reservation must be fully released.
         fb = FakeBinance()
         hb = FakeHB()
-        auto_trader.open_coin(fb, hb, self._coin(), risk=None,
+        auto_trader.open_coin(fb, hb, self._coin(), risk=_RiskOK(),
                               reserver=self.reserver, coordinator=None)
         for _c in auto_trader._PENDING_FILLS.values():
             _c["entry_order_id"] = 4242

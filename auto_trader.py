@@ -2428,7 +2428,8 @@ def _account_snapshot(binance):
                       "doğrulanamıyor; cüzdan bakiyesi equity yerine kullanılmaz"})
 
 
-def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None):
+def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None,
+              occupied_slots=None):
     # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
     # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
     if HB_OFFLINE:
@@ -2438,27 +2439,45 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if risk is None and not dry_run:
         log.critical("  atlandı: risk engine yok — gerçek yeni giriş kapalı (fail-closed)")
         return False
-    # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü (HB_OFFLINE'da HB'siz;
-    # yoksa bu ilk hb.active_executors() çağrısı offline'da patlar ve compare log'a ulaşılamaz).
-    if HB_OFFLINE:
-        _cur = set()
-    else:
-        try:
-            _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-        except Exception as e:
-            log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
-            return False
-    if not HB_OFFLINE and len(_cur) >= _effective_max_positions():
-        log.info(f"  C6: limit dolu ({len(_cur)}/{_effective_max_positions()}), atlanıyor")
-        return False
     symbol = coin["symbol"]
     # FAZ15b: global giriş kapısı — finalizasyon claim'i persist edilemediyse kapalı.
     if not HB_OFFLINE and _entry_gate_closed():
         log.critical(f"  atlandı: global giriş kapısı KAPALI ({_entry_gate_closed()})")
         return False
     # FAZ14t: canlı sembol kapısı — yasaklı sembole emir açılmaz (compare/dry-run etkilenmez).
+    # A2: bu kapı C6 sayımından ÖNCEYE alındı — yasaklı sembol için hiçbir borsa/HB
+    # API çağrısı yapılmamalı (sayım artık positionRisk okur; karar kümesi değişmedi,
+    # tüm kapılar AND reddidir, yalnız sıralama/log atfı netleşti).
     if not HB_OFFLINE and symbol.upper() in LIVE_BLOCKED_SYMBOLS:
         log.warning(f"  atlandı: canlı sembol kapısı ({symbol} yasaklı listede)")
+        return False
+    # C6-FIX / A2 (FAZ15 Stage2b sonu): defansif fail-closed limit kontrolü.
+    # SAYIM KAYNAĞI artık toplam slot kümesidir — _occupied_slots (borsa açık
+    # pozisyonları ∪ bekleyen dolumlar) — HB RUNNING-çift sayısı DEĞİL. Eski sayım
+    # hayaletleri ve crash'te RUNNING kalan stale DB satırlarını da sayıyordu; stop
+    # POST'u öyle bir satıra no-op, orphan temizliği yalnız API açılışında olduğu
+    # için kapı borsada daha az pozisyon varken kalıcı "doluyor" diyebiliyordu.
+    # Korunanlar: tavan _effective_max_positions() (canlıda LIVE_MAX_OPEN_POSITIONS),
+    # atomik rezervasyon kapısı (reserver.reserve, BEGIN IMMEDIATE) AYNEN geçerli;
+    # okuma doğrulanamazsa (None) giriş YOK (fail-closed); hayalet yine yalnız uyarı.
+    # `occupied_slots`: çağıranın (process_candidates) taze sayımı — üretim yolunda
+    # ek API çağrısı olmaz; yoksa burada kendimiz sayarız.
+    if HB_OFFLINE:
+        _cur_n = 0
+    else:
+        _occ = occupied_slots
+        if _occ is None:
+            try:
+                _occ, _ = _occupied_slots(binance, hb)
+            except Exception as e:
+                log.critical(f"🚨 C6: open_coin slot sayımı başarısız: {e} — fail-closed")
+                return False
+        if _occ is None:
+            log.critical("🚨 C6: open_coin slot sayımı doğrulanamadı, fail-closed")
+            return False
+        _cur_n = len(_occ)
+    if not HB_OFFLINE and _cur_n >= _effective_max_positions():
+        log.info(f"  C6: limit dolu ({_cur_n}/{_effective_max_positions()}), atlanıyor")
         return False
     pair = symbol.replace("USDT", "-USDT")
     price = float(coin["lastPrice"])
@@ -2747,7 +2766,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
                      reason=f"notional={target_notional}"),
             geometry=_geo,
             risk=(target_notional, "approved"),
-            exposure={"open_positions": len(_cur),
+            exposure={"open_positions": _cur_n,  # A2: dolu slot sayısı (borsa ∪ pending)
                       "max_positions": _effective_max_positions(),
                       "margin_usage": float(getattr(risk, "margin_usage", 0.0) or 0.0),
                       "margin_limit": 0.4},
@@ -4361,7 +4380,9 @@ def run_once(dry_run=False):
     if HB_OFFLINE:
         active = set()  # HB_OFFLINE: HB'siz; aktif executor yok sayılır (kalibrasyon modu)
     else:
-        # FAZ14v: slot sayımı borsa gerçeği ∪ HB executor'ları; okunamazsa fail-closed.
+        # A2: kapasite borsa pozisyonları ∪ pending fills ile hesaplanır.
+        # HB RUNNING executor çiftleri yalnız aynı sembolün yeniden seçilmesini
+        # önler; toplam slot kapasitesine dahil edilmez. Okuma hatası fail-closed.
         _slots, active = _occupied_slots(binance, hb)
         if _slots is None:
             log.critical("🚨 dolu slot sayısı doğrulanamadı — yeni giriş fail-closed engellendi")
@@ -4457,8 +4478,11 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
         try:
             # HB_OFFLINE: open_coin dry-run'a zorlanır — compare log üretilir ama GERÇEK
             # EMİR GÖNDERİLMEZ (HB'siz güvenli kalibrasyon/log toplama).
+            # A2: taze slot kümesi aşağıya geçirilir — open_coin aynı sayımı
+            # tekrar okumaz (üretim yolunda ek positionRisk/active_executors yok).
             if open_coin(binance, hb, c, dry_run=(dry_run or HB_OFFLINE), risk=risk,
-                         reserver=reserver, coordinator=coordinator):
+                         reserver=reserver, coordinator=coordinator,
+                         occupied_slots=_slots if not HB_OFFLINE else None):
                 ok += 1
         except Exception as e:
             log.exception(f"{c['symbol']} istisna: {e}")

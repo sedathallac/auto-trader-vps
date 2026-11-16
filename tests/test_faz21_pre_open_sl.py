@@ -73,6 +73,11 @@ class FakeBinance:
     def position_risk(self):
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": "81.27"}]
 
+    def account_snapshot(self):
+        # FAZ16 (4331dd1): gerçek giriş yolu artık TEK snapshot ister — fixture katmanı.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
     def open_orders(self, s):
         return []
 
@@ -107,12 +112,29 @@ class FakeHB:
         return {"status": "ok"}
 
 
+class _RiskOK:
+    """FAZ16 (4331dd1) giriş kapısının beklediği minimal RiskEngine testi.
+    Üretim kapısına dokunmaz; sadece 'sağlıklı, halt'sız, onaylayan' motoru taklit eder."""
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, balance, slippage, take_profit_pct=None, equity=None,
+                      max_position_pct=None):
+        # Bu testin boyutlandırma stub'ı (24.0) ile tutarlı hedef.
+        return 24.0, "approved"
+
+
 class Faz21Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "risk_ledger.db")
         self._orig_max = auto_trader.MAX_OPEN_POSITIONS
-        auto_trader.MAX_OPEN_POSITIONS = 2
+        auto_trader.MAX_OPEN_POSITIONS = 5
         self._orig = {}
         for n, v in [("check_liquidity", lambda b, s: (True, "ok")),
                      ("check_correlation_limit", lambda s, b: True),
@@ -150,7 +172,7 @@ class TestPreOpenReconciliation(Faz21Base):
     def test_leftover_sl_cancelled_before_new(self):
         fb = FakeBinance(); hb = FakeHB()
         cc = self._cc(fb, hb)
-        r = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
+        r = auto_trader.open_coin(fb, hb, self._coin(), risk=_RiskOK(), reserver=None,
                                   coordinator=cc)
         self.assertTrue(r)                       # emir kabul edildi, dolum bekliyor
         out = auto_trader._process_pending_fills(fb, hb, None, cc, None)

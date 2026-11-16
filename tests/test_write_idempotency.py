@@ -42,10 +42,18 @@ class _Server:
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n)
                 if self.path.startswith("/executors/search"):
-                    # report what was actually created so far
-                    data = [{"executor_id": f"E{i}", "trading_pair": "SOL-USDT",
-                             "status": "RUNNING"} for i, _ in enumerate(outer.posts)]
-                    return self._reply(200, {"data": data})
+                    # FAZ15 Stage2b: gerçek HBAPI gibi status filtresini uygula.
+                    search_filter = json.loads(body or b"{}")
+                    requested_status = search_filter.get("status")
+                    data = [
+                        {"executor_id": f"E{i}", "trading_pair": "SOL-USDT",
+                         "status": "RUNNING"}
+                        for i, _ in enumerate(outer.posts)
+                        if requested_status is None or requested_status == "RUNNING"
+                    ]
+                    return self._reply(200, {"data": data, "pagination": {
+                        "limit": 100, "has_more": False,
+                        "next_cursor": None, "total_count": len(data)}})
                 outer.posts.append(body)          # side effect happened
                 if len(outer.posts) == 1:
                     return self._reply(first_status, {"detail": "gateway"})

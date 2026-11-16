@@ -60,6 +60,11 @@ class FakeBinance:
     def set_leverage(self, symbol, lev):
         return {"leverage": lev}
 
+    def account_snapshot(self):
+        # FAZ16 (4331dd1): gerçek giriş yolu artık TEK snapshot ister — fixture katmanı.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
     def place_algo_sl(self, symbol, trig, qty, side):
         return self.sl_result            # -2021 -> algo_id None -> SL unverified
 
@@ -115,6 +120,22 @@ class FakeHB:
         return {"status": "ok"}
 
 
+class _RiskOK:
+    """FAZ16 (4331dd1) giriş kapısının beklediği minimal RiskEngine testi.
+    Üretim kapısına dokunmaz; sadece 'sağlıklı, halt'sız, onaylayan' motoru taklit eder."""
+    is_halted = False
+    halt_reason = ""
+    daily_trades = 0
+    consecutive_losses = 0
+    current_drawdown = 0.0
+    margin_usage = 0.0
+    cfg = {"max_leverage": 20}
+
+    def approve_trade(self, balance, slippage, take_profit_pct=None, equity=None,
+                      max_position_pct=None):
+        return 50.0, "approved"
+
+
 def _coordinator(binance, hb, db):
     store = CloseIntentStore(db)
     store.init_schema()
@@ -126,7 +147,7 @@ class LiveWiringBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "risk_ledger.db")
         self._orig_max = auto_trader.MAX_OPEN_POSITIONS
-        auto_trader.MAX_OPEN_POSITIONS = 2
+        auto_trader.MAX_OPEN_POSITIONS = 5
         # stub the pre-close scoring/market helpers so open_coin reaches the SL step
         self._orig = {}
         for name, val in [
@@ -144,6 +165,15 @@ class LiveWiringBase(unittest.TestCase):
         self._orig_pf = auto_trader.PENDING_FILLS_JSON
         auto_trader.PENDING_FILLS_JSON = Path(self.tmp) / "pending_fills.json"
         auto_trader._PENDING_FILLS.clear()
+        # FAZ16 giriş kapısının modül globali: test kirliliğini kanonik biçimde yalıt.
+        _saved_health = auto_trader._entry_health_reasons()
+
+        def _restore(saved):
+            for k in list(auto_trader._entry_health_reasons()):
+                auto_trader._entry_health_clear(k)
+            for k, v in saved.items():
+                auto_trader._entry_health_set(k, v)
+        self.addCleanup(_restore, _saved_health)
 
     def tearDown(self):
         for name, val in self._orig.items():
@@ -169,7 +199,7 @@ class TestOpenCoinReachesCoordinator(LiveWiringBase):
         cc, store = _coordinator(binance, hb, self.db)
         # REAL open_coin, SL placement fails (-2021) -> emergency close branch.
         res = auto_trader.open_coin(binance, hb, self._coin(), dry_run=False,
-                                    risk=None, reserver=None, coordinator=cc)
+                                    risk=_RiskOK(), reserver=None, coordinator=cc)
         self.assertTrue(res)                               # emir kabul edildi
         out = self._drive_fill(binance, hb, cc)
         self.assertEqual(out["failed"], 1)                 # SL doğrulanamadı
@@ -184,7 +214,7 @@ class TestOpenCoinReachesCoordinator(LiveWiringBase):
         binance = FakeBinance()
         hb = FakeHB()
         cc, store = _coordinator(binance, hb, self.db)
-        auto_trader.open_coin(binance, hb, self._coin(), coordinator=cc)
+        auto_trader.open_coin(binance, hb, self._coin(), risk=_RiskOK(), coordinator=cc)
         self._drive_fill(binance, hb, cc)
         posts_after_first = len(binance.order_posts)
         # a duplicate close trigger (e.g. a re-scan) must send NO second POST
@@ -201,7 +231,7 @@ class TestNoDirectBypass(LiveWiringBase):
         binance = FakeBinance()
         hb = FakeHB()
         cc, _ = _coordinator(binance, hb, self.db)
-        auto_trader.open_coin(binance, hb, self._coin(), coordinator=cc)
+        auto_trader.open_coin(binance, hb, self._coin(), risk=_RiskOK(), coordinator=cc)
         self._drive_fill(binance, hb, cc)
         self.assertNotEqual(hb.stopped, [], "close bypassed the coordinator handoff")
 
@@ -221,7 +251,8 @@ class TestRunOnceWiresCoordinator(LiveWiringBase):
         captured = {}
         real_open_coin = auto_trader.open_coin
 
-        def spy(binance, hb, c, dry_run=False, risk=None, reserver=None, coordinator=None):
+        def spy(binance, hb, c, dry_run=False, risk=None, reserver=None, coordinator=None,
+                occupied_slots=None):  # A2: open_coin yeni kwarg — imza güncel (doğrulanan: coordinator)
             captured["coordinator"] = coordinator
             return False
         auto_trader.open_coin = spy

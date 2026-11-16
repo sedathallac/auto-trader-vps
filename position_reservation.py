@@ -274,12 +274,17 @@ class PositionReserver:
             for r in rows:
                 rid, symbol = r["id"], r["symbol"]
                 state = (r["state"] or "PENDING").upper()
+                # Pending workflow owns the reservation until its lifecycle
+                # completes. This takes precedence even when the exchange
+                # position already exists: confirm retry still needs this row.
+                if symbol in keep or symbol in finalizing:
+                    rep.kept.append({"id": rid, "symbol": symbol, "state": state})
+                    continue
+                # No pending workflow remains: promote the reservation to the
+                # exchange position and remove the redundant DB slot.
                 if symbol in exch:
                     conn.execute("DELETE FROM position_reservations WHERE id=?", (rid,))
                     rep.promoted.append({"id": rid, "symbol": symbol})
-                    continue
-                if symbol in keep or symbol in finalizing:
-                    rep.kept.append({"id": rid, "symbol": symbol, "state": state})
                     continue
                 if state == "CONFIRMED":
                     age = _age_seconds(r["confirmed_at"], now)
