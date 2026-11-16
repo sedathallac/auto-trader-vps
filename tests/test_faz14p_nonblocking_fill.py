@@ -87,6 +87,7 @@ def test_pending_fill_registered_and_persisted():
 def test_pending_fills_reload_after_restart():
     auto_trader._register_pending_fill("E1", _ctx())
     auto_trader._PENDING_FILLS = {}
+    auto_trader._PENDING_LOADED[0] = False
     loaded = auto_trader._load_pending_fills()
     assert "E1" in loaded and loaded["E1"]["amount"] == 62.0
 
