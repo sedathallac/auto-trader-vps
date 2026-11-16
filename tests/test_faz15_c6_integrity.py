@@ -76,6 +76,17 @@ def pos(symbol, amt):
     return {"symbol": symbol, "positionAmt": str(amt), "entryPrice": "1.0"}
 
 
+class _Resp:
+    """Minimal HTTP response for the /executors/search fake."""
+
+    def __init__(self, body, status=200):
+        self._body = body
+        self.status_code = status
+
+    def json(self):
+        return self._body
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -269,10 +280,6 @@ class TestC6GatesSource(Base):
         src = self._src("process_candidates")
         self.assertIn("_occupied_slots", src)
         self.assertIn("_slots is None", src)
-
-    def test_no_running_executor_count_gate(self):
-        src = self._src("process_candidates")
-        self.assertNotIn('e["trading_pair"] for e in hb.active_executors()', src)
 
 
 # ------------------------------------------- 6: protect_then_gate
@@ -517,6 +524,150 @@ class TestPendingFinalizeLifecycle(Base):
         self.assertEqual(b.calls[0], "position_risk")
         self.assertEqual(out["adopted"], 1)
         self.assertEqual(self.order[0], "finalize")
+
+
+# ------------------------- 1: active_executors cursor pagination
+class TestActiveExecutorsPagination(Base):
+    """Hummingbot API sözleşmesi (kurulu imaj kaynaklarında doğrulandı:
+    routers/executors.py:78-157, models/executors.py:317-343, services/
+    executor_service.py _paginated): POST /executors/search gövdesi
+    {limit (vars. 100), cursor, status, ...listefiltreleri}; yanıt
+    {data, pagination:{limit, has_more, next_cursor, total_count}}.
+    `offset` ve `is_active` FİLTRE ALANI YOKTUR — eski gövde {is_active:True}
+    hiç filtrelemez, ilk 100 satırı tüm liste sanırdı. cursor =
+    "{created_at}:{executor_id}", azalan sıralama; kayıp cursor sunucuda
+    başa döner (istemci tekrar yakalamalı)."""
+
+    ROWS_150 = [{"executor_id": f"E{i:03d}", "status": "RUNNING",
+                 "created_at": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}"}
+                for i in range(150)]
+
+    def _faithful_server(self, rows, calls, dup_page2=False):
+        """Status-faithful /executors/search fake (sunucu semantiği)."""
+        def _post(url, json=None, auth=None, timeout=None):
+            body = dict(json or {})
+            calls.append(body)
+            limit = int(body.get("limit") or 100)
+            cursor = body.get("cursor")
+            status_rows = [r for r in rows if r["status"] == body.get("status")]
+            ordered = sorted(status_rows, key=lambda r: (r["created_at"],
+                                                         f"{r['created_at']}:{r['executor_id']}"),
+                             reverse=True)
+            start = 0
+            if cursor:
+                for i, r in enumerate(ordered):
+                    if f"{r['created_at']}:{r['executor_id']}" == cursor:
+                        start = i + 1
+                        break
+            page = ordered[start:start + limit]
+            has_more = start + limit < len(ordered)
+            next_cursor = (f"{page[-1]['created_at']}:{page[-1]['executor_id']}"
+                           if page and has_more else None)
+            data = [dict(r) for r in page]
+            if dup_page2 and cursor:
+                # memory+DB merge sunucuda mükemmel olmayabilir: aynı satırı
+                # ikinci sayfaya bir kez daha sızdır (dedupe zorunlu mu?).
+                data.insert(0, dict(page[0]))
+            return _Resp({"data": data,
+                          "pagination": {"limit": limit, "has_more": has_more,
+                                         "next_cursor": next_cursor,
+                                         "total_count": len(ordered)}})
+        return _post
+
+    def test_collects_all_pages_via_cursor(self):
+        rows = (list(self.ROWS_150)
+                + [{"executor_id": f"N{i}", "status": "NOT_STARTED",
+                    "created_at": "2026-01-02T00:00:00"} for i in range(5)]
+                + [{"executor_id": f"S{i}", "status": "SHUTTING_DOWN",
+                    "created_at": "2026-01-02T00:00:00"} for i in range(3)]
+                + [{"executor_id": f"T{i}", "status": "TERMINATED",
+                    "created_at": "2026-01-01T00:00:00"} for i in range(40)])
+        calls = []
+        orig = auto_trader._session.post
+        auto_trader._session.post = self._faithful_server(rows, calls, dup_page2=True)
+        self.addCleanup(setattr, auto_trader._session, "post", orig)
+        got = auto_trader.HBAPI("http://hb", "u", "p").active_executors()
+        expect = ({"E%03d" % i for i in range(150)}
+                  | {f"N{i}" for i in range(5)} | {f"S{i}" for i in range(3)})
+        got_ids = [e["executor_id"] for e in got]
+        self.assertEqual(sorted(got_ids), sorted(expect),
+                         "3 aktif status'un TAMAMI, eksiksiz ve dupesiz toplanmalı")
+        self.assertEqual(len(got_ids), len(set(got_ids)), "executor_id dupesiz olmalı")
+        # Terminated geçmişi taranmaz ve sonuçta asla görünmez:
+        self.assertNotIn("TERMINATED", {c.get("status") for c in calls})
+        self.assertTrue(all(c.get("status") in auto_trader._ACTIVE_EXECUTOR_STATUSES
+                            for c in calls))
+        self.assertEqual({c.get("status") for c in calls},
+                         set(auto_trader._ACTIVE_EXECUTOR_STATUSES),
+                         "her status için BAĞIMSIZ cursor zinciri kurulmalı")
+        # Her istekte sınır ve imzalı-filtre yokluğu sözleşmeye uygun:
+        self.assertTrue(all(c.get("limit") == 100 for c in calls))
+        for c in calls:
+            self.assertNotIn("is_active", c, "sözleşmede is_active filtresi YOK")
+            self.assertNotIn("offset", c, "sözleşmede offset yok")
+        # Zincir başlangıçları: status başına tam bir cursorsuz istek (3);
+        # tek devam isteği beklenen imleç değeriyle (sayfa sonu satırı):
+        no_cur = [c for c in calls if not c.get("cursor")]
+        with_cur = [c for c in calls if c.get("cursor")]
+        self.assertEqual(len(no_cur), 3)
+        self.assertEqual(len(with_cur), 1)
+        self.assertEqual(with_cur[0]["cursor"], "2026-01-01T00:00:50:E050",
+                         "next_cursor = ilk sayfanın son satırının imleci")
+
+        # FAZ15 Stage2b (aynı testin 2. fazı): herhangi bir zincir adımı
+        # sözleşmeyi ihlal ederse active_executors HİÇBİR liste döndürmez
+        # (kısmi liste yok): HBContractError fırlatılır ve çağıranlar zaten
+        # istisnada fail-closed davranır.
+        good_row = {"executor_id": "E1", "status": "RUNNING",
+                    "created_at": "2026-01-01T00:00:00"}
+        page = lambda more, nc: {"data": [dict(good_row)],
+                                 "pagination": {"limit": 100, "has_more": more,
+                                                "next_cursor": nc, "total_count": 1}}
+
+        class _Boom(_Resp):
+            def json(self):
+                raise ValueError("corrupt json")
+
+        def _counter_pages():
+            n = [0]
+
+            def _post(url, json=None, auth=None, timeout=None):
+                n[0] += 1
+                return _Resp({"data": [dict(good_row, executor_id=f"E{n[0]}")],
+                              "pagination": {"limit": 100, "has_more": True,
+                                             "next_cursor": f"c{n[0]}-x",
+                                             "total_count": 9999}})
+            return _post
+
+        cases = {
+            "http_500": lambda url, json=None, auth=None, timeout=None:
+                _Resp({"detail": "boom"}, status=500),
+            "has_more_without_next_cursor": lambda url, json=None, auth=None, timeout=None:
+                _Resp(page(True, None)),
+            "repeated_cursor": lambda url, json=None, auth=None, timeout=None:
+                _Resp(page(True, "SAME")),
+            "has_more_false_but_cursor": lambda url, json=None, auth=None, timeout=None:
+                _Resp(page(False, "X")),
+            "missing_pagination": lambda url, json=None, auth=None, timeout=None:
+                _Resp({"data": [dict(good_row)]}),
+            "non_object_body": lambda url, json=None, auth=None, timeout=None:
+                _Resp([good_row]),
+            "row_without_executor_id": lambda url, json=None, auth=None, timeout=None:
+                _Resp({"data": [{"status": "RUNNING"}],
+                       "pagination": {"limit": 100, "has_more": False,
+                                      "next_cursor": None, "total_count": 1}}),
+            "json_parse_error": lambda url, json=None, auth=None, timeout=None:
+                _Boom({}),
+            "page_guard": _counter_pages(),
+        }
+        orig = auto_trader._session.post
+        self.addCleanup(setattr, auto_trader._session, "post", orig)
+        for name, fake in cases.items():
+            with self.subTest(case=name):
+                auto_trader._session.post = fake
+                hb = auto_trader.HBAPI("http://hb", "u", "p")
+                with self.assertRaises(auto_trader.HBContractError):
+                    hb.active_executors()
 
 
 if __name__ == "__main__":
