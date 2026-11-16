@@ -54,14 +54,25 @@ def test_shadow_service_uses_compare_mode():
 
 
 def test_risk_engine_creates_its_schema_in_a_fresh_state_dir(tmp_path):
-    """Yeni state dizininde risk_state tablosu yoktu → FAIL-CLOSED halt. Şema artık kodda."""
+    """Yeni state dizininde DB yok → sessiz oluşturma YOK, açık FAIL-CLOSED.
+
+    Sözleşme (FAZ16): normal RiskEngine başlatma boş DB/şema kurmaz. Store
+    yoksa yeni giriş kapalıdır; HALTED uydurulmaz. Kapanış/SL yolları bu
+    kapıdan geçmediği için mevcut pozisyonlar korunur.
+    """
     import risk_engine
     db = tmp_path / "risk_ledger.db"
     eng = risk_engine.RiskEngine({"db_file": str(db)})
-    assert eng.is_halted is False, f"fresh state dir halted: {eng.halt_reason}"
-    import sqlite3
-    cols = [r[1] for r in sqlite3.connect(str(db)).execute("PRAGMA table_info(risk_state)")]
-    assert "peak_equity" in cols and "is_halted" in cols and "last_reset_date" in cols
+    assert not db.exists(), "fresh state dir: DB sessizce oluşturulmamalı"
+    assert eng.health_ok is False, "store yokken sağlıklı görünmemeli"
+    assert "risk DB yok" in (eng.health_reason or ""), eng.health_reason
+    assert eng.is_halted is False, "store yokluğu HALTED değildir"
+    ok, why = auto_trader._risk_entry_gate(eng)
+    assert ok is False and why.startswith("risk_store:"), why
+    approved, reason = eng.approve_trade(1000.0, 0.02, 0.04)
+    assert approved is None and "entry_health" in reason, reason
+    for fn in (auto_trader.coordinate_close, auto_trader.reconcile_positions):
+        assert "_risk_entry_gate" not in inspect.getsource(fn), fn.__name__
 
 
 def test_risk_engine_schema_is_idempotent(tmp_path):
