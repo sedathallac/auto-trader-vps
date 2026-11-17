@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """auto_trader.py v4 — otonom kalite tarayıcı + native SL koruma"""
 import os, sys, time, hmac, hashlib, logging, argparse, json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 import requests
@@ -871,6 +871,24 @@ def _recover_stale_executor_net_pnl(executor, binance):
     return float(net_pnl), close_ms / 1000.0
 
 
+def _mark_sl_epoch_closed(symbol):
+    """FAZ14x: K2-flat kaniti gorulen sembolun aktif SL placement epoch'unu
+    CLOSED terminal duruma al (sl_placement.mark_closed_flat). SL hanesi
+    muhasebe degildir: yardimci HICBIR zamanayi sync'yi kirmez (best-effort,
+    yutulur). Sadece (symbol, token) eslesmesi guncellenir — yeni donemin
+    PENDING'ine dokunmaz; satir silinmez (denetim tarihi korunur)."""
+    try:
+        from sl_placement import SlPlacementStore
+        _store = SlPlacementStore(SL_LEDGER_DB)
+        _row = _store.get(symbol)
+        if _row and _row.get("state") in ("PENDING", "PLACED"):
+            if _store.mark_closed_flat(symbol, _row.get("token", "")):
+                log.info(f"  SL hanesi: {symbol} epoch CLOSED (exchange-flat kaniti)")
+    except Exception as _sle:
+        log.debug(f"  SL hanesi CLOSED atlandi ({symbol}): "
+                  f"{type(_sle).__name__}: {_sle}")
+
+
 def sync_risk_engine(risk, hb, binance=None):
     """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY).
 
@@ -905,10 +923,42 @@ def sync_risk_engine(risk, hb, binance=None):
 
     reported = 0
     max_close_ts = last_ts
+    # FAZ14x (KUSUR 2 — fail-OPEN yutma): HB arama cevabı ARTIK doğrulanır.
+    # HTTP hatası / JSON-bozukluğu / "data" listesi olmayan gövde (ör. hata
+    # JSON'u) "0 executor" SAYILMAZ; sync bu turda hiçbir şey yapmaz ve
+    # watermark'ı ilerletmez. (raw openAlgoOrders'ın izlediği desen.)
     try:
-        r = requests.post(f"{HB_API}/executors/search", json={},
-                          auth=hb.auth, timeout=15).json()
-        all_execs = r.get("data", [])
+        _resp = requests.post(f"{HB_API}/executors/search", json={},
+                              auth=hb.auth, timeout=15)
+    except Exception as _he:
+        log.critical(f"🚨 C3: HB /executors/search erisilemedi, sync ATLANDI "
+                     f"(watermark ilerlemedi): {type(_he).__name__}: {_he}")
+        return
+    if getattr(_resp, "status_code", 200) != 200:
+        log.critical(f"🚨 C3: HB /executors/search HTTP {getattr(_resp, 'status_code', '?')}, "
+                     f"sync ATLANDI (watermark ilerlemedi)")
+        return
+    try:
+        r = _resp.json()
+    except Exception as _je:
+        log.critical(f"🚨 C3: HB arama govdesi JSON degil, sync ATLANDI: {_je}")
+        return
+    if not isinstance(r, dict) or not isinstance(r.get("data"), list):
+        _keys = list(r)[:5] if isinstance(r, dict) else type(r).__name__
+        log.critical(f"🚨 C3: HB arama govdesi beklenmeyen sekilde "
+                     f"(hata/anahtarsiz cevap?), sync ATLANDI: {_keys}")
+        return
+    all_execs = r["data"]
+    # FAZ14x (KUSUR 1): `closed_at <= last_ts` atlamasi KALDIRILDI. Global
+    # watermark, K2 yuzunden ertelenmis ESKI bir TERMINATED kapanisini kalici
+    # yok ediyordu (ilerleyen watermark eski ts'i geciyordu). Idempotency tek
+    # kaynaktan gelir: trade_ledger.executor_id (reported_ids). Watermark yalniz
+    # gozlem amaçlıdır ve asla islenmemis bir kapanisin ONUNE gecmez (clamp).
+    deferred_ts = []
+    _retry = getattr(sync_risk_engine, '_stale_retry', {})
+    _now = time.time()
+    _today_utc = datetime.now(_tz.utc).date()
+    try:
         terminated = [e for e in all_execs if e.get("status") == "TERMINATED"]
         log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, {len(reported_ids)} in ledger")
         # K2: single exchange snapshot used to confirm each close is really flat.
@@ -924,10 +974,6 @@ def sync_risk_engine(risk, hb, binance=None):
             if eid in reported_ids:
                 continue
             closed_at = float(e.get("close_timestamp") or 0)
-            if closed_at <= last_ts:
-                # Pre-watermark: skip (already handled via migration or previous sync)
-                continue
-            pnl = float(e.get("net_pnl_quote") or 0)
             pair = e.get("trading_pair")
             # K2 gate: do NOT record a close (final PnL) unless the exchange
             # confirms this symbol is flat. Fail-closed on error/stale/partial.
@@ -936,12 +982,54 @@ def sync_risk_engine(risk, hb, binance=None):
                 log.critical(f"🚨 K2: executor {str(eid)[:12]} TERMINATED ama borsa "
                              f"flat DEĞİL/doğrulanamadı ({_symbol}) — PnL YAZILMADI, "
                              f"kapanmış sayılmadı (fail-closed)")
+                deferred_ts.append(closed_at)
                 continue
-            closed_at_iso = datetime.fromtimestamp(closed_at).isoformat() if closed_at else None
-            inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso)
+            # FAZ14x (KUSUR 3 — kanonsuz PnL standardi): HB muhasebesi
+            # eksik/0 ise 0 PnL UYDURULMAZ (canlı ledger'daki 15 sıfır kaydın
+            # aday kök nedeni). Stale yoluyla AYNI kanonik standart uygulanır:
+            # Binance fill-dongusu kaniti (realized - fee + funding). Kanit
+            # yoksa kayit ERTELENIR; sonraki turda yeniden denenir.
+            _raw_pnl = e.get("net_pnl_quote")
+            try:
+                pnl = float(_raw_pnl) if _raw_pnl not in (None, "") else None
+            except (TypeError, ValueError):
+                pnl = None
+            _source = "hb_terminated"
+            if pnl is None or pnl == 0.0:
+                if _now - _retry.get(eid, 0) < 120:
+                    deferred_ts.append(closed_at)
+                    continue
+                _retry[eid] = _now
+                try:
+                    pnl, _rb_close_ts = _recover_stale_executor_net_pnl(e, binance)
+                    if _rb_close_ts:
+                        closed_at = float(_rb_close_ts)
+                    _source = "binance_fill_verified"
+                except Exception as _ze:
+                    log.error(f"  PnL kanitsiz {str(eid)[:12]} ({pair}): HB "
+                              f"net_pnl_quote yok/sifir ve fill-dongusu kaniti "
+                              f"alinamadi ({type(_ze).__name__}: {_ze}) — "
+                              f"PnL YAZILMADI, ertelendi (0 uydurulmadi)")
+                    deferred_ts.append(closed_at)
+                    continue
+            # FAZ14x (KUSUR 4 — tek muhasebe standardi): normal yol da stale
+            # yoluyla ayni gun-kapisini kullanir; gecmis tarihli kapanis
+            # bugunun daily_pnl/ardisik-zarar sayacina ISLENMEZ. Saat dili UTC.
+            closed_at_iso = (datetime.fromtimestamp(closed_at, tz=_tz.utc).isoformat()
+                             if closed_at else None)
+            _update_daily = bool(closed_at) and (
+                datetime.fromtimestamp(closed_at, tz=_tz.utc).date() == _today_utc)
+            inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso,
+                                              affect_daily=_update_daily,
+                                              source=_source)
             if inserted:
                 reported += 1
-                log.info(f"  RiskEngine PnL: {pair} -> {pnl:+.4f} ({msg})")
+                reported_ids.add(eid)
+                log.info(f"  RiskEngine PnL: {pair} -> {pnl:+.4f} [{_source}] ({msg})")
+                # FAZ14x: K2-flat kanitli sembolun SL epoch'u terminal CLOSED
+                # (canlıda 15 ölü PLACED satırı birikmesinin kapanis ayağı).
+                if _symbol:
+                    _mark_sl_epoch_closed(_symbol)
             else:
                 log.debug(f"  skip {eid[:12]}: {msg}")
             if closed_at > max_close_ts:
@@ -951,8 +1039,6 @@ def sync_risk_engine(risk, hb, binance=None):
         _stale = [e for e in all_execs
                   if e.get('status') == 'RUNNING'
                   and e.get('is_trading') is False]
-        _retry = getattr(sync_risk_engine, '_stale_retry', {})
-        _now = time.time()
         for e in _stale:
             eid = e.get('executor_id')
             if not eid or eid in reported_ids:
@@ -968,15 +1054,18 @@ def sync_risk_engine(risk, hb, binance=None):
                 _pnl, _close_ts = _recover_stale_executor_net_pnl(e, binance)
                 _close_iso = datetime.fromtimestamp(_close_ts, tz=_tz.utc).isoformat()
                 _update_daily = (
-                    datetime.fromtimestamp(_close_ts).date() == datetime.now().date()
+                    datetime.fromtimestamp(_close_ts, tz=_tz.utc).date() == _today_utc
                 )
                 inserted, msg = risk.record_trade(
-                    eid, pair, _pnl, _close_iso, affect_daily=_update_daily
+                    eid, pair, _pnl, _close_iso, affect_daily=_update_daily,
+                    source="binance_stale_recovery"
                 )
                 if inserted:
                     reported += 1
                     reported_ids.add(eid)
                     max_close_ts = max(max_close_ts, _close_ts)
+                    if symbol:
+                        _mark_sl_epoch_closed(symbol)
                     log.warning(
                         f'  Binance fill-recovery: {pair} -> {_pnl:+.8f} '
                         f'(stale executor {str(eid)[:12]}, {msg})'
@@ -993,6 +1082,16 @@ def sync_risk_engine(risk, hb, binance=None):
     except Exception as e:
         log.warning(f"  RiskEngine sync HATA: {type(e).__name__}: {e}")
         return
+
+    # FAZ14x (KUSUR 1 — clamp): watermark islenmemis (K2/kanit yuzunden
+    # ertelenmis) en eski kapanisin ONUNE gecmez; boylece ilerde watermark
+    # tabanli bir atlamaya dönülse bile ertelenen kapaniş kaybolmaz.
+    if deferred_ts:
+        _oldest_deferred = min(deferred_ts)
+        if _oldest_deferred < max_close_ts:
+            log.info(f"  sync watermark clamp: {max_close_ts:.0f} -> "
+                     f"{_oldest_deferred:.0f} (ertelenen kapanis var)")
+            max_close_ts = _oldest_deferred
 
     try:
         now = datetime.now(_tz.utc).isoformat()
@@ -3043,11 +3142,12 @@ def run_once(dry_run=False):
         log.critical(f"🚨 CloseCoordinator kurulamadı, fallback doğrudan kapanış: {e}")
 
     # FAZ 1.2: Günlük reset kontrolü
-    today = datetime.now().date().isoformat()
+    # FAZ14x: tek kanonik saat dili UTC (DB UTC yazıyor; çağrı yeri yerel tutuyor,
+    # UPSERT de alanı hiç yazmıyordu -> donmuş tarih -> her restart reset_daily).
+    # Artık tarihi reset_daily(reset_date=...) kalıcılaştırır.
+    today = datetime.now(timezone.utc).date().isoformat()
     if risk.state.get("last_reset_date") != today:
-        risk.reset_daily()
-        risk.state["last_reset_date"] = today
-        risk._save_state()
+        risk.reset_daily(reset_date=today)
         log.info(f"  Günlük sayaçlar sıfırlandı ({today})")
 
     # FAZ 1.2: Son taramadan bu yana kapanan executor PnL'lerini bildir

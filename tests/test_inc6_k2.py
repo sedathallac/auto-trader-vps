@@ -56,12 +56,15 @@ class _FakeHB:
 class _FakeRisk:
     def __init__(self):
         self.recorded = []
-    def record_trade(self, eid, pair, pnl, iso):
+    def record_trade(self, eid, pair, pnl, iso, **kw):
+        # FAZ14x fixture uyarlamasi: cagri sozlesmesine affect_daily/source kw
+        # eklendi; bu fake yalniz K2 kapisini test eder, kw'lari yutar.
         self.recorded.append((eid, pair, pnl))
         return True, "ok"
 
 
 class _FakeResp:
+    status_code = 200  # FAZ14x fixture uyarlamasi: sync artik HTTP durumunu dogrular
     def __init__(self, data): self._data = data
     def json(self): return self._data
 

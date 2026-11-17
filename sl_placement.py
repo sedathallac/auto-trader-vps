@@ -14,7 +14,9 @@ from exchange truth so a NEW position period supersedes a prior PLACED intent.
 
 States: PENDING (owner acquired, about to place) -> PLACED (SL confirmed placed). On a
 placement FAILURE the owner release()s so reality is reflected (the existing -2021 /
-OPEN_UNPROTECTED alarm then governs; no silent block).
+OPEN_UNPROTECTED alarm then governs; no silent block). FAZ14x adds CLOSED: a terminal
+state set when sync sees exchange-flat evidence for that epoch (mark_closed_flat), so
+settled epochs stop showing as live PLACED rows; rows are never deleted.
 """
 import sqlite3
 from datetime import datetime, timezone
@@ -101,6 +103,34 @@ class SlPlacementStore:
                 "UPDATE sl_placements SET state='PLACED', updated_at=? WHERE symbol=? AND token=?",
                 (_now(), symbol, token))
             conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def mark_closed_flat(self, symbol: str, token: str) -> bool:
+        """FAZ14x: K2-flat kanıtı görülen epoch'u CLOSED terminal durumuna alır.
+
+        Canlı kanıt: pozisyon kapanınca PLACED satırı silinmiyor/terminal
+        olmuyordu; 15 ölü PLACED satırı birikti. Kayıt SİLİNMEZ (denetim tarihi
+        korunur). Yalnız (symbol, token) EŞLEŞMESİ ve aktif durum
+        (PENDING/PLACED) güncellenir — bayat bir flat-kanıtı yeni dönemin
+        PENDING'ine dokunamaz. Yeni dönem acquire'ı CLOSED'ı supersede eder
+        (token farklı ya da CLOSED _ACTIVE değil). Rowcount>0 ise True.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE sl_placements SET state='CLOSED', updated_at=? "
+                "WHERE symbol=? AND token=? AND state IN ('PENDING','PLACED')",
+                (_now(), symbol, token))
+            conn.execute("COMMIT")
+            return (cur.rowcount or 0) > 0
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 

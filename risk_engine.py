@@ -119,6 +119,7 @@ class RiskEngine:
                         consecutive_losses=excluded.consecutive_losses,
                         daily_trades=excluded.daily_trades,
                         daily_pnl=excluded.daily_pnl,
+                        last_reset_date=excluded.last_reset_date,
                         is_halted=excluded.is_halted,
                         halt_reason=excluded.halt_reason,
                         updated_at=excluded.updated_at
@@ -133,11 +134,14 @@ class RiskEngine:
 
     def record_trade(
         self, executor_id, trading_pair, net_pnl_quote,
-        closed_at_iso=None, affect_daily=True
+        closed_at_iso=None, affect_daily=True, source="sync"
     ):
         """C3: Atomic, idempotent PnL record.
         Returns (inserted: bool, message: str).
-        Duplicate executor_id -> (False, 'already-recorded')."""
+        Duplicate executor_id -> (False, 'already-recorded').
+        FAZ14x: `source` provenance etiketi (sync | hb_terminated |
+        binance_fill_verified | binance_stale_recovery); varsayılan 'sync' —
+        eski çağrılar davranışsız. """
         try:
             now = datetime.now(timezone.utc).isoformat()
             with self._db() as conn:
@@ -145,8 +149,9 @@ class RiskEngine:
                     conn.execute("""
                         INSERT INTO trade_ledger
                             (executor_id, trading_pair, net_pnl_quote, closed_at, recorded_at, source)
-                        VALUES (?, ?, ?, ?, ?, 'sync')
-                    """, (executor_id, trading_pair, net_pnl_quote, closed_at_iso, now))
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (executor_id, trading_pair, net_pnl_quote, closed_at_iso, now,
+                          source or "sync"))
                 except sqlite3.IntegrityError:
                     conn.rollback()
                     return False, "already-recorded"
@@ -198,7 +203,7 @@ class RiskEngine:
             self.current_drawdown = (self.peak_equity - current_equity) / self.peak_equity
         # FAZ10: gerçekleşmemiş zarar da günlük limiti tetikler. Gün başı equity
         # baz alınır; realized-only muhasebe açık pozisyon zararını gizliyordu.
-        today = datetime.now().date().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()  # FAZ14x: UTC (DB dili)
         if self.state.get("day_start_equity_date") != today or not self.day_start_equity:
             self.day_start_equity = current_equity
             self.state["day_start_equity"] = current_equity
@@ -295,11 +300,18 @@ class RiskEngine:
         self.daily_trades += 1
         self._save_state()
 
-    def reset_daily(self):
+    def reset_daily(self, reset_date=None):
+        """FAZ14x: reset tarihi burada kalıcılaştırılır. `reset_date` verilmezse
+        bellekteki state/last_reset_date korunur; çağrı yerinin ayrıca
+        state['last_reset_date'] + _save_state() set etmesine gerek yok —
+        UPSERT artık bu alanı yazıyor (donmuş-tarih restart bug'ı kapandı)."""
         self.daily_trades = 0
         self.daily_pnl = 0.0
         self.day_start_equity = 0.0
         self.state.pop("day_start_equity", None)
         self.state.pop("day_start_equity_date", None)
+        if reset_date:
+            self.last_reset_date = reset_date
+            self.state["last_reset_date"] = reset_date
         self._save_state()
         log.info("🌅 Günlük sayaçlar sıfırlandı")

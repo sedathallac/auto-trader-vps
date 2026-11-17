@@ -5,7 +5,10 @@ from datetime import datetime, timezone, timedelta
 
 from pathlib import Path as _P
 import sys as _s
-_DB = _P.home() / '.trading_archive.db'
+try:  # FAZ14x: tek gercek kaynak — auto_trader/archiver ile ayni dosya
+    from auto_trader import TRADING_ARCHIVE_DB as _DB
+except Exception:
+    _DB = _P.home() / '.trading_archive.db'
 if not _DB.exists():
     print('HATA: DB bulunamadi: ' + str(_DB))
     _s.exit(1)

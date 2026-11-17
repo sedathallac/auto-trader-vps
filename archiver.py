@@ -7,10 +7,14 @@ from datetime import datetime
 from pathlib import Path
 sys.path.insert(0, os.path.expanduser("~"))
 
-from auto_trader import BinanceAPI, HBAPI
+from auto_trader import BinanceAPI, HBAPI, TRADING_ARCHIVE_DB
 
 LOG = Path.home() / "archiver.log"
-DB = Path.home() / ".trading_archive.db"
+# FAZ14x: TEK GERÇEK KAYNAK. auto_trader kayıt yazarken TRADING_ARCHIVE_DB
+# (STATE_DIR tabanlı) kullanıyor; archiver HOME sabitiyle ayrı dosyaya
+# yazıyordu — HOME/STATE_DIR ayrıştığında watermark'lar başka dosyaya
+# gidiyor, denetlenen DB'de sonsuza dek NULL kalıyor (canlı: 12 NULL).
+DB = TRADING_ARCHIVE_DB
 
 log = logging.getLogger("archiver")
 log.setLevel(logging.INFO)
