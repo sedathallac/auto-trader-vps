@@ -39,6 +39,7 @@ class FakeBinance:
         self._algo_for = algo_for if algo_for is not None else [{"algoId": 123,
                                                                  "quantity": "0.6"}]
         self.order_posts = []
+        self._opened = False
 
     def filters(self, symbol):
         return {"LOT_SIZE": {"stepSize": "0.1"}, "PRICE_FILTER": {"tickSize": "0.01"},
@@ -69,7 +70,12 @@ class FakeBinance:
         return {"dualSidePosition": False}
 
     def position_risk(self):
+        if not getattr(self, '_opened', False):
+            return []
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": "80"}]
+
+    def _simulate_fill(self):
+        self._opened = True
 
     def open_orders(self, symbol):
         return []
@@ -149,6 +155,7 @@ class F1Base(unittest.TestCase):
 
     def _drive_fill(self, fb, hb, cc):
         """FAZ14p: open_coin bloklamaz; dolum sonraki tick'te işlenir."""
+        fb._simulate_fill()
         return auto_trader._process_pending_fills(fb, hb, None, cc, None)
 
 

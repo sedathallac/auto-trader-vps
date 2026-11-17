@@ -131,7 +131,10 @@ class RiskEngine:
         except Exception as e:
             log.critical(f"🚨 C3: risk state KAYDEDILEMEDI: {e}")
 
-    def record_trade(self, executor_id, trading_pair, net_pnl_quote, closed_at_iso=None):
+    def record_trade(
+        self, executor_id, trading_pair, net_pnl_quote,
+        closed_at_iso=None, affect_daily=True
+    ):
         """C3: Atomic, idempotent PnL record.
         Returns (inserted: bool, message: str).
         Duplicate executor_id -> (False, 'already-recorded')."""
@@ -147,6 +150,12 @@ class RiskEngine:
                 except sqlite3.IntegrityError:
                     conn.rollback()
                     return False, "already-recorded"
+
+                # Historical recovery belongs in the ledger, not today's
+                # daily counters or consecutive-loss state.
+                if not affect_daily:
+                    conn.commit()
+                    return True, "ledger-only (historical close)"
 
                 self.daily_pnl += net_pnl_quote
                 if net_pnl_quote < 0:

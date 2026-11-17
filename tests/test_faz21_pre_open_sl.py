@@ -37,6 +37,7 @@ class FakeBinance:
         self.cancelled_algos = []
         self._orphan = {"algoId": 786683, "orderType": "STOP_MARKET", "symbol": SYM}
         self.order_posts = []
+        self._opened = False
 
     def filters(self, s):
         return {"LOT_SIZE": {"stepSize": "0.001"}, "PRICE_FILTER": {"tickSize": "0.01"},
@@ -71,7 +72,12 @@ class FakeBinance:
         return {"dualSidePosition": False}
 
     def position_risk(self):
+        if not getattr(self, '_opened', False):
+            return []
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": "81.27"}]
+
+    def _simulate_fill(self):
+        self._opened = True
 
     def open_orders(self, s):
         return []
@@ -153,6 +159,7 @@ class TestPreOpenReconciliation(Faz21Base):
         r = auto_trader.open_coin(fb, hb, self._coin(), risk=None, reserver=None,
                                   coordinator=cc)
         self.assertTrue(r)                       # emir kabul edildi, dolum bekliyor
+        fb._simulate_fill()
         out = auto_trader._process_pending_fills(fb, hb, None, cc, None)
         self.assertEqual(out["filled"], 1)       # dolum onaylandı, SL yolu çalıştı
         # the orphan SL (786683) was cancelled before placing the new one...

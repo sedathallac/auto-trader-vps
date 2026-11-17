@@ -39,6 +39,7 @@ class FakeBinance:
         self.entry = entry
         self.sl_result = sl_result if sl_result is not None else {"code": -2021}
         self.order_posts = []
+        self._opened = False
 
     # --- used by open_coin before the close ---
     def filters(self, symbol):
@@ -52,10 +53,6 @@ class FakeBinance:
     # sınır fake'i gerçek API yüzeyini (bakiye + positionRisk) sağlamak zorunda.
     def get_balance(self, asset="USDT"):
         return 1000.0
-
-    def position_risk(self):
-        return [{"symbol": "SOLUSDT", "positionAmt": str(self.amt),
-                 "entryPrice": self.entry, "unRealizedProfit": "0"}]
 
     def set_leverage(self, symbol, lev):
         return {"leverage": lev}
@@ -72,7 +69,12 @@ class FakeBinance:
 
     # --- used by the CloseCoordinator / adapter ---
     def position_risk(self):
+        if not self._opened:
+            return []
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": self.entry}]
+
+    def _simulate_fill(self):
+        self._opened = True
 
     def position_mode(self):
         return {"dualSidePosition": False}      # ONEWAY
@@ -159,6 +161,7 @@ class LiveWiringBase(unittest.TestCase):
 
     def _drive_fill(self, binance, hb, cc):
         """FAZ14p: open_coin bloklamaz; dolum sonraki tick'te işlenir."""
+        binance._simulate_fill()
         return auto_trader._process_pending_fills(binance, hb, None, cc, None)
 
 

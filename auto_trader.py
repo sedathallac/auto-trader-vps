@@ -628,6 +628,249 @@ def is_flat_confirmed(positions, symbol):
     return False  # symbol absent -> not confirmed flat
 
 
+
+def _recover_stale_executor_net_pnl(executor, binance):
+    """Recover a stale RUNNING executor only from an exact Binance fill cycle.
+
+    Requires one x-nb entry client ID, a FILLED entry order, matching entry fills,
+    a complete opposite-side close quantity, quote-asset commissions and a
+    successful funding-fee query. Ambiguous cases fail closed.
+    """
+    import json as _json
+    from decimal import Decimal as _D
+
+    def _client_ids(value, found):
+        if isinstance(value, str):
+            if value.startswith("x-nb"):
+                found.add(value)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(key, str) and key.startswith("x-nb"):
+                    found.add(key)
+                _client_ids(child, found)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                _client_ids(child, found)
+
+    info = executor.get("custom_info")
+    if isinstance(info, str):
+        try:
+            info = _json.loads(info)
+        except Exception as exc:
+            raise ValueError(f"custom_info JSON invalid: {exc}")
+
+    client_ids = set()
+    _client_ids(info, client_ids)
+    if len(client_ids) != 1:
+        raise ValueError(f"expected exactly one x-nb entry client ID, found {len(client_ids)}")
+
+    pair = executor.get("trading_pair")
+    if not pair:
+        raise ValueError("executor trading_pair missing")
+
+    symbol = pair.replace("-", "").upper()
+    if not symbol.endswith("USDT"):
+        raise ValueError(f"unsupported quote asset for automatic net PnL: {pair}")
+    quote_asset = "USDT"
+
+    entry = binance.query_order(
+        symbol, orig_client_order_id=next(iter(client_ids))
+    )
+    if not isinstance(entry, dict) or entry.get("code") is not None:
+        raise ValueError(f"Binance entry order lookup failed: {entry!r}")
+    if entry.get("status") != "FILLED":
+        raise ValueError(f"entry order not FILLED: {entry.get('status')!r}")
+
+    entry_order_id = int(entry.get("orderId") or 0)
+    entry_ms = int(entry.get("time") or 0)
+    entry_side = str(entry.get("side") or "").upper()
+    entry_qty = _D(str(entry.get("executedQty") or "0"))
+
+    if not entry_order_id or not entry_ms or entry_side not in ("BUY", "SELL") or entry_qty <= 0:
+        raise ValueError("entry order lacks valid orderId/time/side/executedQty")
+
+    # Fetch the complete userTrades sequence from just before the entry.
+    all_trades = []
+    from_id = None
+    for page in range(100):
+        params = {"symbol": symbol, "limit": 1000}
+        if from_id is None:
+            params["startTime"] = max(0, entry_ms - 1000)
+        else:
+            params["fromId"] = from_id
+
+        batch = binance._get("/fapi/v1/userTrades", params, signed=True)
+        if not isinstance(batch, list):
+            raise ValueError(f"userTrades returned non-list: {batch!r}")
+
+        all_trades.extend(batch)
+        if len(batch) < 1000:
+            break
+        from_id = int(batch[-1].get("id", 0)) + 1
+    else:
+        raise ValueError("userTrades pagination limit reached; history may be incomplete")
+
+    all_trades.sort(key=lambda row: (
+        int(row.get("time", 0)), int(row.get("id", 0))
+    ))
+
+    entry_rows = [
+        row for row in all_trades
+        if int(row.get("orderId", -1)) == entry_order_id
+    ]
+    if not entry_rows:
+        raise ValueError("entry order has no matching userTrades fills")
+
+    entry_filled = sum(
+        (_D(str(row.get("qty") or "0")) for row in entry_rows), _D("0")
+    )
+    tolerance = _D("0.00000001")
+    if abs(entry_filled - entry_qty) > tolerance:
+        raise ValueError(
+            f"entry fill mismatch: order={entry_qty}, userTrades={entry_filled}"
+        )
+
+    last_entry_key = max(
+        (int(row.get("time", 0)), int(row.get("id", 0)))
+        for row in entry_rows
+    )
+    exit_side = "BUY" if entry_side == "SELL" else "SELL"
+
+    exit_rows = []
+    exit_qty = _D("0")
+    for row in all_trades:
+        key = (int(row.get("time", 0)), int(row.get("id", 0)))
+        if key <= last_entry_key:
+            continue
+        if int(row.get("orderId", -1)) == entry_order_id:
+            continue
+
+        side = str(row.get("side") or "").upper()
+        if side == entry_side:
+            raise ValueError(
+                "another same-direction fill occurred before the original "
+                "position was fully closed; attribution is ambiguous"
+            )
+        if side != exit_side:
+            continue
+
+        exit_rows.append(row)
+        exit_qty += _D(str(row.get("qty") or "0"))
+
+        if exit_qty > entry_qty + tolerance:
+            raise ValueError("closing fills exceed entry quantity; possible reversal")
+        if exit_qty >= entry_qty - tolerance:
+            break
+
+    if abs(exit_qty - entry_qty) > tolerance or not exit_rows:
+        raise ValueError(
+            f"closing fills incomplete: entry={entry_qty}, close={exit_qty}"
+        )
+
+    close_ms = max(int(row.get("time", 0)) for row in exit_rows)
+    if close_ms < entry_ms:
+        raise ValueError("closing timestamp precedes entry")
+
+    # Every matched closing fill must belong to a Binance order explicitly
+    # marked reduceOnly. This prevents a later opposite-direction entry from
+    # being mistaken for the close of this executor.
+    exit_order_ids = {int(row.get("orderId", -1)) for row in exit_rows}
+    if not exit_order_ids or -1 in exit_order_ids:
+        raise ValueError("closing trade is missing a valid orderId")
+
+    orders_by_id = {}
+    order_cursor = None
+    for page in range(100):
+        order_params = {"symbol": symbol, "limit": 1000}
+        if order_cursor is None:
+            order_params["startTime"] = max(0, entry_ms - 1000)
+        else:
+            order_params["orderId"] = order_cursor
+        order_params["endTime"] = close_ms + 1000
+
+        order_batch = binance._get(
+            "/fapi/v1/allOrders", order_params, signed=True
+        )
+        if not isinstance(order_batch, list):
+            raise ValueError(
+                f"allOrders lookup failed: {order_batch!r}"
+            )
+
+        for order in order_batch:
+            try:
+                oid = int(order.get("orderId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if oid in exit_order_ids:
+                orders_by_id[oid] = order
+
+        if exit_order_ids.issubset(orders_by_id):
+            break
+        if len(order_batch) < 1000:
+            break
+        order_cursor = int(order_batch[-1].get("orderId") or 0) + 1
+    else:
+        raise ValueError("allOrders pagination limit reached")
+
+    missing_orders = exit_order_ids - set(orders_by_id)
+    if missing_orders:
+        raise ValueError(
+            f"closing order IDs absent from allOrders: {sorted(missing_orders)}"
+        )
+
+    for oid, order in orders_by_id.items():
+        raw_reduce_only = order.get("reduceOnly")
+        is_reduce_only = (
+            raw_reduce_only is True
+            or raw_reduce_only == 1
+            or (
+                isinstance(raw_reduce_only, str)
+                and raw_reduce_only.strip().lower() in ("true", "1")
+            )
+        )
+        if not is_reduce_only:
+            raise ValueError(
+                f"closing order {oid} is not explicitly reduceOnly"
+            )
+
+    fee_total = _D("0")
+    realized_total = _D("0")
+    for row in entry_rows + exit_rows:
+        commission = _D(str(row.get("commission") or "0"))
+        asset = str(row.get("commissionAsset") or "")
+        if commission > 0 and asset != quote_asset:
+            raise ValueError(
+                f"commission paid in {asset}, not {quote_asset}; conversion required"
+            )
+        fee_total += commission
+
+    for row in exit_rows:
+        realized_total += _D(str(row.get("realizedPnl") or "0"))
+
+    # Include funding debits/credits during this exact position interval.
+    funding_rows = binance._get(
+        "/fapi/v1/income",
+        {
+            "symbol": symbol,
+            "incomeType": "FUNDING_FEE",
+            "startTime": entry_ms,
+            "endTime": close_ms,
+            "limit": 1000,
+        },
+        signed=True,
+    )
+    if not isinstance(funding_rows, list) or len(funding_rows) >= 1000:
+        raise ValueError("funding history unavailable or potentially truncated")
+
+    funding_total = sum(
+        (_D(str(row.get("income") or "0")) for row in funding_rows),
+        _D("0"),
+    )
+
+    net_pnl = realized_total - fee_total + funding_total
+    return float(net_pnl), close_ms / 1000.0
+
+
 def sync_risk_engine(risk, hb, binance=None):
     """C3: Sync closed executor PnLs to SQLite ledger (idempotent via PRIMARY KEY).
 
@@ -646,7 +889,14 @@ def sync_risk_engine(risk, hb, binance=None):
 
     try:
         with _sq.connect(str(db_path), timeout=10) as conn:
-            meta = conn.execute("SELECT last_close_ts FROM sync_meta WHERE id=1").fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_meta "
+                "(id, last_close_ts, updated_at) VALUES (1, 0, ?)",
+                (datetime.now(_tz.utc).isoformat(),),
+            )
+            meta = conn.execute(
+                "SELECT last_close_ts FROM sync_meta WHERE id=1"
+            ).fetchone()
             last_ts = float(meta[0]) if meta else 0.0
             reported_ids = {r[0] for r in conn.execute("SELECT executor_id FROM trade_ledger")}
     except Exception as e:
@@ -696,6 +946,48 @@ def sync_risk_engine(risk, hb, binance=None):
                 log.debug(f"  skip {eid[:12]}: {msg}")
             if closed_at > max_close_ts:
                 max_close_ts = closed_at
+
+        # Recover externally closed executors that Hummingbot left RUNNING.
+        _stale = [e for e in all_execs
+                  if e.get('status') == 'RUNNING'
+                  and e.get('is_trading') is False]
+        _retry = getattr(sync_risk_engine, '_stale_retry', {})
+        _now = time.time()
+        for e in _stale:
+            eid = e.get('executor_id')
+            if not eid or eid in reported_ids:
+                continue
+            if _now - _retry.get(eid, 0) < 120:
+                continue
+            pair = e.get('trading_pair')
+            symbol = pair.replace('-', '') if pair else None
+            if not is_flat_confirmed(_positions, symbol):
+                continue
+            _retry[eid] = _now
+            try:
+                _pnl, _close_ts = _recover_stale_executor_net_pnl(e, binance)
+                _close_iso = datetime.fromtimestamp(_close_ts, tz=_tz.utc).isoformat()
+                _update_daily = (
+                    datetime.fromtimestamp(_close_ts).date() == datetime.now().date()
+                )
+                inserted, msg = risk.record_trade(
+                    eid, pair, _pnl, _close_iso, affect_daily=_update_daily
+                )
+                if inserted:
+                    reported += 1
+                    reported_ids.add(eid)
+                    max_close_ts = max(max_close_ts, _close_ts)
+                    log.warning(
+                        f'  Binance fill-recovery: {pair} -> {_pnl:+.8f} '
+                        f'(stale executor {str(eid)[:12]}, {msg})'
+                    )
+            except Exception as _re:
+                log.error(
+                    f'  Binance fill-recovery skipped {str(eid)[:12]} '
+                    f'({pair}): {type(_re).__name__}: {_re}'
+                )
+        sync_risk_engine._stale_retry = _retry
+
         if reported:
             log.info(f"  RiskEngine: {reported} yeni kapanis islendi")
     except Exception as e:
@@ -2004,24 +2296,31 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
     if HB_OFFLINE:
         dry_run = True
-    # C6-FIX: Fonksiyon başında defansif fail-closed limit kontrolü (HB_OFFLINE'da HB'siz;
-    # yoksa bu ilk hb.active_executors() çağrısı offline'da patlar ve compare log'a ulaşılamaz).
-    if HB_OFFLINE:
-        _cur = set()
-    else:
-        try:
-            _cur = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-        except Exception as e:
-            log.critical(f"🚨 C6: open_coin executor sayısı alınamadı, fail-closed: {e}")
-            return False
-    if not HB_OFFLINE and len(_cur) >= _effective_max_positions():
-        log.info(f"  C6: limit dolu ({len(_cur)}/{_effective_max_positions()}), atlanıyor")
-        return False
+
     symbol = coin["symbol"]
-    # FAZ14t: canlı sembol kapısı — yasaklı sembole emir açılmaz (compare/dry-run etkilenmez).
+
+    # FAZ14t: sembol kapısı — HERHANGİ bir API çağrısından ÖNCE
     if not HB_OFFLINE and symbol.upper() in LIVE_BLOCKED_SYMBOLS:
         log.warning(f"  atlandı: canlı sembol kapısı ({symbol} yasaklı listede)")
         return False
+
+    # Slot kapasitesi + already-open (position_risk buradan sonra güvenli)
+    if HB_OFFLINE:
+        _cur_slots, _cur_pairs = set(), set()
+    else:
+        _cur_slots, _cur_pairs = _occupied_slots(binance, hb)
+        if _cur_slots is None:
+            log.critical("🚨 C6: slot durumu okunamadı, fail-closed: yeni giriş yok")
+            return False
+        if len(_cur_slots) >= _effective_max_positions():
+            log.info(f"  C6: limit dolu ({len(_cur_slots)}/{_effective_max_positions()}), atlanıyor")
+            return False
+        if (_norm_symbol(symbol) in _cur_slots
+                or any(_norm_symbol(p) == _norm_symbol(symbol) for p in _cur_pairs)):
+            log.info(f"  C6: {symbol} zaten açık/bekleyen veya executor kilidinde; atlandı")
+            return False
+
+    _cur = _cur_slots
     pair = symbol.replace("USDT", "-USDT")
     price = float(coin["lastPrice"])
     log.info(f"→ {pair} fiyat={price} hacim={float(coin['quoteVolume']):,.0f} skor={coin['_score']:.3f}")
@@ -2881,18 +3180,8 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
         return 0, 0, 0
     ok = 0
     for c in candidates:
-        # C6-FIX: Her çağrıdan hemen önce pozisyon sayısını yeniden kontrol et
-        if HB_OFFLINE:
-            _cur_active = set()  # HB_OFFLINE: kalibrasyon modu, limit kontrolü HB'siz
-        else:
-            try:
-                _cur_active = {e["trading_pair"] for e in hb.active_executors() if e.get("status") == "RUNNING"}
-            except Exception as e:
-                log.critical(f"🚨 C6: döngü içi executor sayısı alınamadı, fail-closed: {e}")
-                break
-        if not HB_OFFLINE and len(_cur_active) >= _effective_max_positions():
-            log.info(f"🚫 C6: limit doldu ({len(_cur_active)}/{_effective_max_positions()}), döngüden çıkılıyor")
-            break
+        # C6 kapasite kontrolü her aday için open_coin içinde yapılır.
+        # create_executor öncesindeki atomik son kabul PositionReserver.reserve() işlemidir.
         try:
             # HB_OFFLINE: open_coin dry-run'a zorlanır — compare log üretilir ama GERÇEK
             # EMİR GÖNDERİLMEZ (HB'siz güvenli kalibrasyon/log toplama).
