@@ -248,5 +248,597 @@ class TestPnlStandard(SyncHarness):
         self.assertTrue(rec.get("affect_daily", False))
 
 
+class TestFlatEvidenceContract(unittest.TestCase):
+    """FAZ14x-2-A — katı flat-kanıtı sözleşmesi (birim düzeyi, deterministik).
+
+    Zorunlu durumlar: eksik alan / None / boş string / hatalı string / NaN /
+    Infinity -> False; açık miktar -> False; açıkça 0 -> True; sembol yok ->
+    False; çelişkili çoklu kayıt -> False. Boolean miktar sayısal sayılmaz.
+    """
+
+    def _rec(self, amt):
+        return {"symbol": "BTCUSDT", "positionAmt": amt}
+
+    def test_list_not_positions(self):
+        self.assertFalse(at.is_flat_confirmed(None, "BTCUSDT"))
+        self.assertFalse(at.is_flat_confirmed({"code": -1130}, "BTCUSDT"))
+
+    def test_symbol_absent_is_never_flat(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("0")], "ETHUSDT"))
+
+    def test_missing_positionAmt_field(self):
+        self.assertFalse(at.is_flat_confirmed([{"symbol": "BTCUSDT"}], "BTCUSDT"),
+                         "positionAmt alanı yokken flat dendi")
+
+    def test_none_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec(None)], "BTCUSDT"))
+
+    def test_empty_string_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("")], "BTCUSDT"))
+        self.assertFalse(at.is_flat_confirmed([self._rec("   ")], "BTCUSDT"))
+
+    def test_bad_string_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("abc")], "BTCUSDT"))
+
+    def test_nan_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("nan")], "BTCUSDT"),
+                         "NaN string flat sayıldı")
+        self.assertFalse(at.is_flat_confirmed([self._rec(float("nan"))], "BTCUSDT"),
+                         "NaN float flat sayıldı")
+
+    def test_infinity_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("inf")], "BTCUSDT"))
+        self.assertFalse(at.is_flat_confirmed([self._rec(float("inf"))], "BTCUSDT"))
+        self.assertFalse(at.is_flat_confirmed([self._rec(float("-inf"))], "BTCUSDT"))
+
+    def test_open_amount(self):
+        self.assertFalse(at.is_flat_confirmed([self._rec("-0.3")], "BTCUSDT"))
+        self.assertFalse(at.is_flat_confirmed([self._rec("0.1")], "BTCUSDT"))
+
+    def test_explicit_zero_is_flat(self):
+        self.assertTrue(at.is_flat_confirmed([self._rec("0")], "BTCUSDT"))
+        self.assertTrue(at.is_flat_confirmed([self._rec("0.00")], "BTCUSDT"))
+        self.assertTrue(at.is_flat_confirmed([self._rec(0)], "BTCUSDT"))
+
+    def test_bool_amount_not_numeric(self):
+        # hayati nokta: False -> float 0.0 -> flat TUZAĞI.
+        self.assertFalse(at.is_flat_confirmed([self._rec(False)], "BTCUSDT"),
+                         "boolean False miktar flat sayıldı")
+        self.assertFalse(at.is_flat_confirmed([self._rec(True)], "BTCUSDT"))
+
+    def test_duplicate_conflicting_records_ambiguous(self):
+        recs = [{"symbol": "BTCUSDT", "positionAmt": "0"},
+                {"symbol": "BTCUSDT", "positionAmt": "-5"}]
+        self.assertFalse(at.is_flat_confirmed(recs, "BTCUSDT"),
+                         "çelişkili çoklu kayıt flat sayıldı")
+
+    def test_duplicate_records_even_identical_are_ambiguous(self):
+        # Sözleşme 'açık ve TEKİL kayıt' ister: yinelenen kayıt kanıt değil.
+        recs = [self._rec("0"), self._rec("0")]
+        self.assertFalse(at.is_flat_confirmed(recs, "BTCUSDT"))
+
+    def test_non_dict_rows_ignored_not_crash(self):
+        recs = ["garbage", None, 42, self._rec("0")]
+        self.assertTrue(at.is_flat_confirmed(recs, "BTCUSDT"))
+
+
+class TestSweepMissingAmt(SyncHarness):
+    """Sweep düzeyi: positionAmt alanı eksik/bozuk kayıt PLACED epoch'u
+    kapatmamalı (birim + entegrasyon aynı standardı görmeli)."""
+
+    def _seed(self, symbol="BTCUSDT", token="LONG:100"):
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        store.acquire(symbol, token)
+        store.mark_placed(symbol, token)
+        return store
+
+    def test_missing_amt_field_spared(self):
+        store = self._seed()
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT"}]  # positionAmt YOK
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "positionAmt eksik kayıtla epoch CLOSED edildi")
+
+    def test_bool_false_amt_spared(self):
+        store = self._seed()
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": False}]
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "boolean False snapshot ile epoch CLOSED edildi")
+
+
+class TestOldSnapshotVsNewEpoch(SyncHarness):
+    """B-4/B-6 deterministik yarış kilidi (sync düzeyi): sweep aday listesi
+    okunduktan SONRA yeni epoch oluşursa eski snapshot onu kapayamaz."""
+
+    def test_stale_snapshot_after_new_epoch_noop(self):
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        store.acquire("BTCUSDT", "LONG:100")
+        store.mark_placed("BTCUSDT", "LONG:100")
+        # Snapshot T1 döneminde alındı (flat).
+        stale = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.assertTrue(at.is_flat_confirmed(stale, "BTCUSDT"))
+        self.search_payload = {"data": []}
+        self.positions = stale
+        self.run_sync()  # T1 CLOSED
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED")
+        # Aynı (bayat) snapshot ile YENİ epoch: farklı token -> sweep'in
+        # mark_closed_flat'ı T1 token'ı ile koşullu; T2 kendi token'ında
+        # AÇIK pozisyon varsayılarak korunur (flat değilse kimse kapatmaz).
+        store.acquire("BTCUSDT", "SHORT:95")  # yeni dönem PENDING
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "-0.4"}]  # açık
+        self.run_sync()
+        row = store.get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PENDING", "SHORT:95"),
+                         "eski snapshot mantığı yeni epoch'u bozdu")
+
+
+class TestSlFlatSweep(SyncHarness):
+    """FAZ14x-2 — geçmiş yetim PLACED satırları reported_ids'ten bağımsız
+    exchange-flat kanıtıyla CLOSED olmalı; AÇIK pozisyon korunmalı."""
+
+    def _seed_store(self, symbol, token):
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        store.acquire(symbol, token)
+        store.mark_placed(symbol, token)
+        return store
+
+    def test_orphan_placed_closes_despite_reported_ids_skip(self):
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        # Eski kapanış ZATEN ledger'da: executor akışı `reported_ids` yüzünden
+        # atlar — sweep yine de kapatmalı (bulgu 3'un çekirdek senaryosu).
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO trade_ledger (executor_id) VALUES ('OLD-EID')")
+        conn.commit()
+        conn.close()
+        self.search_payload = {"data": [term("OLD-EID", "BTC-USDT", 1_600_000_000, pnl=-0.1)]}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"},
+                          {"symbol": "FILUSDT", "positionAmt": "-326.6"}]
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED",
+                         "yetim PLACED, flat kanıtına rağmen CLOSED olmadı")
+        self.assertEqual(self.eids(), {"OLD-EID"}, "ledger değişmemeliydi (skip sürer)")
+
+    def test_open_position_epoch_spared(self):
+        store = self._seed_store("FILUSDT", "SHORT:2")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "FILUSDT", "positionAmt": "-326.6"}]
+        self.run_sync()
+        self.assertEqual(store.get("FILUSDT")["state"], "PLACED",
+                         "AÇık pozisyonun SL epoch'u kapatıldı (KORUMA İHLALİ)")
+
+    def test_sweep_fail_closed_on_bad_snapshot(self):
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = {"code": -1130, "msg": "positionRisk down"}  # dict = bozuk
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "bozuk snapshot'ta kayıt kapatıldı (fail-open)")
+
+    def test_symbol_absent_from_snapshot_not_closed(self):
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "ETHUSDT", "positionAmt": "0"}]  # BTC YOK
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "sembol listede yokken flat sayıldı")
+
+    def test_empty_snapshot_closes_nothing(self):
+        # Canlı sözleşme: positionRisk hiç boş liste dönmez (kapalı semboller
+        # amt=0 ile gelir — 08:01-08:03 kapanışlarının canlı yazılma kanıtı).
+        # Boş liste = sözleşme ihlali/mock → fail-closed: hiçbir şey kapanmaz.
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = []
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "boş snapshot'ta kayıt kapatıldı")
+
+    def test_pending_epoch_never_swept(self):
+        # PENDING = sahibinin yerleştirmesi sürüyor; flat snapshot bayat
+        # olabilir → sweep PENDING'e dokunmaz (yarış sıkılaştırması).
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        store.acquire("BTCUSDT", "LONG:100")  # PENDING (placed değil)
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PENDING",
+                         "sweep devam eden yerleştirmeyi bozdu")
+
+    def test_sweep_idempotent_across_ticks(self):
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        first = store.get("BTCUSDT")["state"]
+        self.run_sync()
+        second = store.get("BTCUSDT")
+        self.assertEqual((first, second["state"]), ("CLOSED", "CLOSED"),
+                         "sweep idempotent değil")
+
+    def test_isolation_ledger_db_redirected_to_tmp(self):
+        # Kanıt: sweep'in açtığı SL_LEDGER_DB bu testin tmp dosyasıdır;
+        # import-zamanı varsayılanına (gerçek home/state DB) dokunulmaz.
+        import tempfile
+        self.assertEqual(str(at.SL_LEDGER_DB), self.db)
+        self.assertTrue(str(at.SL_LEDGER_DB).startswith(tempfile.gettempdir()),
+                        "SL_LEDGER_DB tmp dizini dışında — izolasyon ihlali")
+        store = self._seed_store("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        conn = sqlite3.connect(self.db)
+        try:
+            st = conn.execute("SELECT state FROM sl_placements WHERE symbol='BTCUSDT'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(st, "CLOSED", "CLOSED tmp DB'ye yazılmadı")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSnapshotEpochRace(SyncHarness):
+    """FAZ14x-2 BULGU 1/2 — snapshot↔SL-epoch yarışı (gerçek interleave).
+
+    Hook, position_risk() çağrısı İÇİNDE (snapshot alındıktan hemen sonra,
+    sweep list_active'ı çağırmadan ÖNCE) çalışır: T1 snapshot → T2 acquire →
+    T3 mark_placed → T4 list_active → T5 bayat snapshot uygulanır. Doğrulama
+    mock çağrı sayısıyla değil, gerçek SQLite satır durumuyla yapılır.
+    """
+
+    class _RacyBinance:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def position_risk(self):
+            snap = self._owner.positions  # T1: snapshot (bayat kalacak)
+            hook = self._owner.race_hook
+            if hook:
+                self._owner.race_hook = None
+                hook()  # T2/T3: snapshot SONRASI epoch hareketi
+            return snap
+
+    def _store(self):
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        return store
+
+    def _seed_placed(self, symbol, token):
+        store = self._store()
+        store.acquire(symbol, token)
+        store.mark_placed(symbol, token)
+        return store
+
+    def setUp(self):
+        super().setUp()
+        self.race_hook = None
+
+    def _run_racy(self):
+        at.sync_risk_engine._stale_retry = {}
+        at.sync_risk_engine(self.risk, _FakeHB(),
+                            binance=self._RacyBinance(self))
+
+    # A — snapshot sonrası, list_active ÖNCESİ yeni epoch acquire+PLACED.
+    # Eski (kusurlu) davranış: bayat flat snapshot yeni PLACED epoch'u CLOSED
+    # eder (token/sıra koşulu yok). Beklenen güvenli son durum: PLACED korunur.
+    def test_A_epoch_placed_between_snapshot_and_list_active_survives(self):
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+
+        def hook():
+            from sl_placement import ACQUIRED
+            store = self._store()
+            assert store.acquire("BTCUSDT", "LONG:100") == ACQUIRED
+            store.mark_placed("BTCUSDT", "LONG:100")
+
+        self.race_hook = hook
+        self._run_racy()
+        row = self._store().get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PLACED", "LONG:100"),
+                         "snapshot'tan SONRA doğan PLACED epoch, bayat flat "
+                         "snapshot ile CLOSED edildi (BULGU 1)")
+
+    # B — snapshot sonrası eski epoch yeni epoch tarafından supersede edilir
+    # (yeni token, PENDING). Bayat snapshot hiçbir durumda onu bozamamalı.
+    def test_B_superseded_epoch_after_snapshot_survives(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.race_hook = lambda: store.acquire("BTCUSDT", "SHORT:95")
+        self._run_racy()
+        row = store.get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PENDING", "SHORT:95"),
+                         "supersede edilmiş yeni epoch bayat snapshot'la bozuldu")
+
+    # C — yeni epoch AYNI symbol+side+entryPrice token'ını taşıyor (token
+    # eşleşmesi yetmez kanıtı). Eski davranış: token eşleştiği için bayat
+    # snapshot yeni dönemi kapatır. Beklenen: PLACED korunur.
+    def test_C_same_token_revival_not_closed_by_stale_snapshot(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()  # meşru kapanış: eski dönem CLOSED olur
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED")
+
+        def hook():
+            from sl_placement import ACQUIRED
+            assert store.acquire("BTCUSDT", "LONG:100") == ACQUIRED  # aynı token
+            store.mark_placed("BTCUSDT", "LONG:100")  # PLACED, güncel updated_at
+
+        self.race_hook = hook
+        self._run_racy()  # aynı (artık bayat) flat snapshot tekrar uygulanıyor
+        row = store.get("BTCUSDT")
+        self.assertEqual(row["state"], "PLACED",
+                         "aynı token'lı YENİ dönem bayat snapshot ile CLOSED "
+                         "edildi — symbol+side+entryPrice eşleşmesi yeterli değil")
+
+    # D1 — BULGU 2: executor-akışı helper'ı GÜNCEL satırı yeniden okuyup
+    # token'ını kendisi alıyor; kapanan executor'la ilinti yok. Eski
+    # davranış: ilintisiz güncel PLACED epoch'u kapattı. Beklenen: korunur.
+    def test_D1_executor_helper_cannot_close_unrelated_current_epoch(self):
+        store = self._seed_placed("BTCUSDT", "LONG:999")
+        at._mark_sl_epoch_closed("BTCUSDT")
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "helper, kapanan executor'la ilintisi kanıtlanmamış "
+                         "güncel epoch'u CLOSED etti (BULGU 2)")
+
+    # D2 — aynı bulgunun sync-ucu: TERMINATED executor kapanışı, snapshot
+    # sonrası doğmuş yeni PLACED epoch'u kapatmamalı; kapanış yine kaydedilmeli.
+    def test_D2_executor_close_preserves_new_placed_epoch(self):
+        self.search_payload = {"data": [term("OLDX", "BTC-USDT", 1_600_000_000, pnl=-0.2)]}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+
+        def hook():
+            store = self._store()
+            store.acquire("BTCUSDT", "LONG:100")
+            store.mark_placed("BTCUSDT", "LONG:100")
+
+        self.race_hook = hook
+        self._run_racy()
+        self.assertIn("OLDX", self.eids(), "executor kapanışı kaydedilmeliydi")
+        row = self._store().get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PLACED", "LONG:100"),
+                         "eski executor kapanışı yeni PLACED epoch'u kapattı")
+
+    # E — snapshot ve DB güncellemesi ARASINDA (list_active OKUNDUKTAN SONRA)
+    # yeni epoch açılır: token koşulu bayat güncellemeyi 0 satırda bırakmalı.
+    def test_E_epoch_created_between_list_active_and_update(self):
+        import sl_placement as sp
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        _orig = sp.SlPlacementStore.list_active
+        seen = {"n": 0}
+
+        def racy(self_):
+            rows = _orig(self_)
+            seen["n"] += 1
+            if seen["n"] == 1:  # aday listesi okundu; TAM O ANDA yeni sahiplenici
+                store.acquire("BTCUSDT", "SHORT:95")
+            return rows
+
+        sp.SlPlacementStore.list_active = racy
+        try:
+            self.run_sync()
+        finally:
+            sp.SlPlacementStore.list_active = _orig
+        row = store.get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PENDING", "SHORT:95"),
+                         "list_active sonrası doğan epoch bayat kanıtla bozuldu")
+
+    # F — aynı sweep iki kez: idempotent; CLOSED kalan satır değişmez,
+    # ikinci tur hiçbir şey yapmaz.
+    def test_F_repeated_sweep_is_idempotent(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        first = store.get("BTCUSDT")
+        self.run_sync()
+        second = store.get("BTCUSDT")
+        self.assertEqual((first["state"], second["state"]), ("CLOSED", "CLOSED"))
+        self.assertEqual(second["token"], "LONG:100")
+
+    # G1 — sweep PENDING'e hiçbir koşulda dokunmaz (flat snapshot'a rağmen).
+    def test_G1_pending_survives_sweep(self):
+        store = self._store()
+        store.acquire("BTCUSDT", "LONG:100")  # PENDING kalır
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PENDING")
+
+    # G2 — executor-akışı da PENDING'i yalnız-flat-kanıtıyla kapatmamalı.
+    # Eski davranış: helper PENDING satırını CLOSED etti. Beklenen: PENDING.
+    def test_G2_executor_flow_never_closes_pending(self):
+        store = self._store()
+        store.acquire("BTCUSDT", "LONG:100")  # PENDING (yerleştirme sürüyor)
+        self.search_payload = {"data": [term("OLDP", "BTC-USDT", 1_600_000_000, pnl=-0.1)]}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        self.assertIn("OLDP", self.eids(), "executor kapanışı kaydedilmeliydi")
+        self.assertEqual(store.get("BTCUSDT")["state"], "PENDING",
+                         "PENDING kayıt flat kanıtıyla CLOSED edildi (madde 7)")
+
+    # H — guard meşru kapanışı ÖLDÜRMEMELİ: snapshot öncesi oluşmuş PLACED
+    # epoch, exchange-flat görüldüğünde CLOSED olur (FAZ14x canlı düzeltisi).
+    def test_H_legit_pre_snapshot_placed_epoch_still_closes(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED",
+                         "zaman guard'ı meşru kapanışı engelledi")
+
+
+class TestGenerationSafety(SyncHarness):
+    """FAZ14x-2 nesil-2: updated_at DUVAR SAATİDİR; NTP/saat geri alınırsa
+    yeni epoch, snapshot kesitinden DAHA ESKİ timestamp alabilir ve saat-koşullu
+    guard'ı atlatır. Bu sınıf saat-geri-alımı simülasyonlarıyla bunu kanıtlar;
+    düzeltme SQLite üzerinde monoton INTEGER generation kullanır (saat-bağımsız).
+
+    Simülasyon: race_hook, position_risk() çağrısı İÇİNDE (snapshot istek-anı
+    kaydedildikten sonra) sl_placement._now'u 1 saat GERİYE alır ve o saatle
+    yeni epoch acquire/mark_placed yapar — gerçek bir NTP step-back'in DB'ye
+    yazdırdığı tam durumdur.
+    """
+
+    class _RacyBinance:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def position_risk(self):
+            snap = self._owner.positions
+            hook = self._owner.race_hook
+            if hook:
+                self._owner.race_hook = None
+                hook()
+            return snap
+
+    def _store(self):
+        from sl_placement import SlPlacementStore
+        store = SlPlacementStore(self.db)
+        store.init_schema()
+        return store
+
+    def _seed_placed(self, symbol, token):
+        store = self._store()
+        store.acquire(symbol, token)
+        store.mark_placed(symbol, token)
+        return store
+
+    def setUp(self):
+        super().setUp()
+        self.race_hook = None
+
+    def _run_racy(self):
+        at.sync_risk_engine._stale_retry = {}
+        at.sync_risk_engine(self.risk, _FakeHB(),
+                            binance=self._RacyBinance(self))
+
+    def _rewound(self, fn):
+        """fn() boyunca sl_placement._now 1 saat geriye alınır (NTP step-back)."""
+        import sl_placement as sp
+        from datetime import datetime as _dt, timezone as _tzu, timedelta as _td
+        real = sp._now
+        try:
+            sp._now = lambda: (_dt.now(_tzu.utc) - _td(hours=1)).isoformat()
+            fn()
+        finally:
+            sp._now = real
+
+    # N1 — SAAT GERİ GERİDERKEN yeni epoch korunmalı. (Eski kod: geri-saatli
+    # updated_at < snap_iso'yu sağladığı için bayat snapshot yeni PLACED epoch'u
+    # kapatır → RED.)
+    def test_N1_clock_rewind_new_epoch_survives(self):
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+
+        def hook():
+            from sl_placement import ACQUIRED
+
+            def born_in_the_past():
+                store = self._store()
+                assert store.acquire("BTCUSDT", "LONG:100") == ACQUIRED
+                store.mark_placed("BTCUSDT", "LONG:100")
+            self._rewound(born_in_the_past)
+
+        self.race_hook = hook
+        self._run_racy()
+        row = self._store().get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PLACED", "LONG:100"),
+                         "saat geriye alınmış yeni PLACED epoch, bayat flat "
+                         "snapshot ile CLOSED edildi (saat-guard'ı aşıldı)")
+
+    # N2 — saat geriye giderken AYNI TOKEN'la yeniden doğan epoch korunmalı.
+    def test_N2_clock_rewind_same_token_revival_survives(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+        self.run_sync()  # meşru kapanış (normal saat)
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED")
+
+        def hook():
+            from sl_placement import ACQUIRED
+
+            def reborn_in_the_past():
+                assert store.acquire("BTCUSDT", "LONG:100") == ACQUIRED
+                store.mark_placed("BTCUSDT", "LONG:100")
+            self._rewound(reborn_in_the_past)
+
+        self.race_hook = hook
+        self._run_racy()
+        self.assertEqual(store.get("BTCUSDT")["state"], "PLACED",
+                         "aynı token'lı, geri-saatli yeniden doğan dönem bayat "
+                         "snapshot ile CLOSED edildi")
+
+    # N3 — saat geriye gitse de PENDING sweep'e asla yakalanmaz.
+    def test_N3_pending_survives_sweep_under_clock_rewind(self):
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+
+        def hook():
+            def pending_in_the_past():
+                self._store().acquire("BTCUSDT", "LONG:100")  # PENDING
+            self._rewound(pending_in_the_past)
+
+        self.race_hook = hook
+        self._run_racy()
+        row = self._store().get("BTCUSDT")
+        self.assertEqual((row["state"], row["token"]), ("PENDING", "LONG:100"),
+                         "geri-saatli PENDING kayıt sweep ile kapatıldı")
+
+    # N4 — açık pozisyonun SL kaydı, saat karmaşasında da korunur.
+    def test_N4_open_position_epoch_survives_under_clock_rewind(self):
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "-0.4"}]  # AÇIK
+
+        def hook():
+            def placed_in_the_past():
+                store = self._store()
+                store.acquire("BTCUSDT", "LONG:100")
+                store.mark_placed("BTCUSDT", "LONG:100")
+            self._rewound(placed_in_the_past)
+
+        self.race_hook = hook
+        self._run_racy()
+        row = self._store().get("BTCUSDT")
+        self.assertEqual(row["state"], "PLACED",
+                         "açık pozisyonun SL epoch'u kapatıldı")
+
+    # N5 — Yaşamlılık: saat geriye alınsa bile snapshot-öncesi PLACED epoch'un
+    # meşru exchange-flat kapanışı çalışmaya devam etmeli.
+    def test_N5_legit_close_survives_clock_rewind_during_sweep(self):
+        store = self._seed_placed("BTCUSDT", "LONG:100")  # normal saatli eski satır
+        self.search_payload = {"data": []}
+        self.positions = [{"symbol": "BTCUSDT", "positionAmt": "0"}]
+
+        def hook():
+            import sl_placement as sp
+            from datetime import datetime as _dt, timezone as _tzu, timedelta as _td
+            real = sp._now
+            try:
+                sp._now = lambda: (_dt.now(_tzu.utc) - _td(hours=1)).isoformat()
+                time.sleep(0)  # hook tek ömürlük; satırlar normal saatli
+            finally:
+                sp._now = real
+
+        # hook sweep sırasında hiçbir satır YAZMIYOR (saat yalnız okuma
+        # evresinde karışık); CLOSED yine de gerçekleşmeli.
+        self.race_hook = lambda: None
+        self._run_racy()
+        self.assertEqual(store.get("BTCUSDT")["state"], "CLOSED",
+                         "meşru kapanış bozuldu")

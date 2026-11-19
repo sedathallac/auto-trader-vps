@@ -838,20 +838,42 @@ def heartbeat_tick():
 
 
 def is_flat_confirmed(positions, symbol):
-    """K2: a position is 'flat' ONLY when `positions` is a valid list that
-    CONTAINS `symbol` with positionAmt == 0. A non-list (API error), a missing /
-    mismatched symbol, a non-zero amount, or an unparseable amount all return
-    False — so an outage, a stale/partial snapshot or a partial close is NEVER
-    mistaken for a closed position (fail-closed)."""
+    """K2 fail-closed flat-kanıtı sözleşmesi (FAZ14x-2, katı).
+
+    True YALNIZ ve YALNIZ şu durumda: snapshot geçerli bir listedir, sembol
+    listeda TAM BİR kayıtla bulunur ve o kaydın `positionAmt` alanı AÇIKÇA
+    mevcuttur, geçerli bir sayıdır (bool/None/boş string/hatalı string değil),
+    sonludur (NaN/±Inf değil) ve tam olarak 0'dır.
+
+    Aksi TÜM durumlar False: snapshot list değil (API hatası/hata gövdesi),
+    sembol listede yok, aynı sembol için birden çok/çelişkili kayıt
+    (çokanlamlı -> kanıt yok), positionAmt alanı yok, None, boş,
+    dönüştürülemez, NaN, ±Inf, veya sıfırdan farklı. Sembolün listede
+    bulunmaması HİÇBİR KOŞULDA flat kanıtı sayılmaz; kesinti, bayat/eksik
+    snapshot veya kısmi kapanış asla 'kapandı' gibi yorumlanmaz. Boolean
+    miktarı sayısal kabul edilmez (False -> 0.0 akışına düşülmez).
+    """
     if not isinstance(positions, list):
         return False
-    for p in positions:
-        if p.get("symbol") == symbol:
-            try:
-                return float(p.get("positionAmt", "nan")) == 0.0
-            except (TypeError, ValueError):
-                return False
-    return False  # symbol absent -> not confirmed flat
+    matches = [p for p in positions
+               if isinstance(p, dict) and p.get("symbol") == symbol]
+    if len(matches) != 1:
+        return False  # sembol yok YA DA birden çok/çelişkili kayıt -> kanıt yok
+    rec = matches[0]
+    if "positionAmt" not in rec:
+        return False  # alan yok != sıfır
+    raw = rec["positionAmt"]
+    if isinstance(raw, bool) or raw is None:
+        return False
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    try:
+        amt = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if amt != amt or amt in (float("inf"), float("-inf")):
+        return False  # NaN / ±Infinity sayılmaz
+    return amt == 0.0
 
 
 def _recover_stale_executor_net_pnl(executor, binance):
@@ -1096,22 +1118,44 @@ def _recover_stale_executor_net_pnl(executor, binance):
     return float(net_pnl), close_ms / 1000.0
 
 
-def _mark_sl_epoch_closed(symbol):
-    """FAZ14x: K2-flat kaniti gorulen sembolun aktif SL placement epoch'unu
-    CLOSED terminal duruma al (sl_placement.mark_closed_flat). SL hanesi
-    muhasebe degildir: yardimci HICBIR zamanayi sync'yi kirmez (best-effort,
-    yutulur). Sadece (symbol, token) eslesmesi guncellenir — yeni donemin
-    PENDING'ine dokunmaz; satir silinmez (denetim tarihi korunur)."""
+def _mark_sl_epoch_closed(symbol, max_gen=None):
+    """FAZ14x: K2-flat kaniti gorulen sembolun SL placement epoch'unu CLOSED
+    terminal duruma al (sl_placement.mark_closed_flat). SL hanesi muhasebe
+    degildir: yardimci HICBIR zamanayi sync'yi kirmez (best-effort, yutulur);
+    satir silinmez (denetim tarihi korunur).
+
+    FAZ14x-2 (BULGU 2 — ilintisiz kapatma yaris): helper guncel satiri
+    yeniden okuyup token'ini KENDISI aliyordu; kapanan executor'la bu token
+    arasinda kanitlanmis bir ilinti yoktu — snapshot sonrasi dogan yeni aktif
+    epoch yanlislikla CLOSED edilebiliyordu. Kati kurallar (nesil-2,
+    SAAT-BAGIMSIZ):
+      * max_gen = bu sync tur'unun exchange IstEGINDEN ONCE yakaladigi SL
+        generation sayaci. Zorunludur; None ise HICBIR sey kapatilmaz
+        (fail-closed — siralama kanitsizsa flat kanitina guvenilmez).
+      * Guncel satirin token'i YENIDEN OKUNMAZ ve bayat kapanisa ATFEDILMEZ;
+        beklenen epoch/generation UPDATE'in GENERATION kosuluyla eslesir.
+      * Yalniz PLACED kapanir; PENDING'e flat kanitiyla hicbir zaman
+        dokunulmaz (yerlestirmenin sahibi devam ediyor olabilir; basarisiz
+        yerlestirme zaten release() ile birakir, farkli-tokenli yeni donem
+        acquire'i supersede eder).
+      * Generation kosulu mark_closed_flat icindeki kosullu UPDATE'tedir (ayni
+        BEGIN IMMEDIATE): snapshot'tan sonra olusan/guncellenen ya da ayni
+        token'la yeniden dogan epoch 0 satir etkilenir; NTP step-back bu
+        sirayi atlatamaz.
+    """
     try:
+        if max_gen is None:
+            log.debug(f"  SL hanesi CLOSED atlandi ({symbol}): "
+                      f"snapshot generation kaniti yok — fail-closed")
+            return
         from sl_placement import SlPlacementStore
         _store = SlPlacementStore(SL_LEDGER_DB)
-        _row = _store.get(symbol)
-        if _row and _row.get("state") in ("PENDING", "PLACED"):
-            if _store.mark_closed_flat(symbol, _row.get("token", "")):
-                log.info(f"  SL hanesi: {symbol} epoch CLOSED (exchange-flat kaniti)")
+        if _store.mark_closed_flat(symbol, token=None, max_gen=max_gen):
+            log.info(f"  SL hanesi: {symbol} epoch CLOSED (exchange-flat kaniti)")
     except Exception as _sle:
         log.debug(f"  SL hanesi CLOSED atlandi ({symbol}): "
                   f"{type(_sle).__name__}: {_sle}")
+
 
 def _hb_executors_all(hb, page_limit=200, max_pages=50):
     """POST /executors/search — tüm sayfalar. Dönüş: (list|None, error|None).
@@ -1220,6 +1264,23 @@ def sync_risk_engine(risk, hb, binance=None):
     log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, "
              f"{len(reported_ids)} in ledger")
 
+    # FAZ14x-2 nesil-2 (BULGU 1 — sıra sözleşmesi, SAAT-BAĞIMSIZ): snapshot
+    # İSTEĞİNDEN ÖNCE SL generation sayacı yakalanır; bu sayaçtan SONRA
+    # acquire/mark_placed olan (ya da aynı token'la yeniden doğan) hiçbir
+    # SL epoch'u BU snapshot'ın flat kanıtıyla CLOSED EDİLEMEZ. Duvar saati
+    # (updated_at) yalnız defter-kaydıdır; NTP step-back koşullu UPDATE'i
+    # atlatamaz — monoton SQLite sayacı atomiktir. Sayaç okunamazsa
+    # _snap_gen=None kalır ve sweep/executor-akışı fail-closed olur.
+    _snap_gen = None
+    try:
+        from sl_placement import SlPlacementStore as _SLS0
+        _sls0 = _SLS0(SL_LEDGER_DB)
+        _sls0.init_schema()
+        _snap_gen = _sls0.current_generation()
+    except Exception as _ge:
+        _snap_gen = None
+        log.debug(f"  SL generation okunamadı (flat-sweep fail-closed): "
+                  f"{type(_ge).__name__}: {_ge}")
     try:
         _positions = binance.position_risk() if binance is not None else None
     except Exception as _pe:
@@ -1227,6 +1288,45 @@ def sync_risk_engine(risk, hb, binance=None):
         log.warning(f"  K2: positionRisk alınamadı (flat teyidi yok): {_pe}")
     if not isinstance(_positions, list):
         _entry_health_set("sync", "positionRisk alınamadı (flat teyidi yok)")
+
+    # FAZ14x-2: SL hanesi FLAT-SWEEP. Executor-akışlı CLOSED yalnız YENİ
+    # ledger INSERT'inde tetikleniyordu; reported_ids atlaması yüzünden
+    # geçmiş yetim PLACED satırları (canlı: 17) hiç kapanmıyordu. Sweep
+    # trade_ledger'dan BAĞIMSIZdır: borsa-gerçeği snapshot'ta flat
+    # doğrulanan sembolün aktif epoch'u CLOSED olur. Açık pozisyonlara
+    # ASLA dokunmaz (is_flat_confirmed fail-closed); snapshot bozuk/eksikse
+    # hiçbir şey kapanmaz.
+    try:
+        if _snap_gen is not None and isinstance(_positions, list) and _positions:
+            from sl_placement import SlPlacementStore as _SLS
+            _sls = _SLS(SL_LEDGER_DB)
+            for _r in _sls.list_active():
+                # FAZ14x-2 yarış sıkılaştırması: YALNIZ PLACED kapatılır.
+                # PENDING = sahibinin yerleştirmesi DEVAM EDİYOR; flat
+                # snapshot bayat olabilir (pozisyon henüz borsada
+                # görünmüyor) — devam eden yerleştirmeye dokunulmaz.
+                # CLOSED semantiği yeni dönem acquire'ını asla kilitmez
+                # (supersede) ve mark_placed CLOSED'ı PLACED'a geri
+                # çevirir (self-heal).
+                # TOKEN YETMEZ (test C): SIDE:entryPrice epoch'a özgü
+                # değildir; aynı token yeni dönemde yeniden doğabilir.
+                # Asıl sıra-kilidi max_gen=_snap_gen'dedir (SAAT-BAĞIMSIZ
+                # monoton SQLite sayacı): snapshot İSTEĞİNDEN önce
+                # yakalanan generation; sonrasında acquire/mark_placed
+                # görmüş satır (yeni ya da aynı token'la yeniden-doğan
+                # dönem, NTP step-back'li saat damgalı bile olsa) gen'i
+                # > max_gen taşır ve bu kanıtla 0 satır etkilenir; koşullu
+                # UPDATE aynı BEGIN IMMEDIATE içinde olduğu için
+                # list_active→UPDATE arası yarış da kapanır (test E).
+                if _r["state"] != "PLACED":
+                    continue
+                if is_flat_confirmed(_positions, _r["symbol"]):
+                    if _sls.mark_closed_flat(_r["symbol"], _r["token"],
+                                             max_gen=_snap_gen):
+                        log.info(f"  SL hanesi: {_r['symbol']} epoch CLOSED "
+                                 f"(exchange-flat sweep)")
+    except Exception as _swe:
+        log.debug(f"  SL flat-sweep atlandı: {type(_swe).__name__}: {_swe}")
 
     reported = 0
     max_close_ts = last_ts
@@ -1317,7 +1417,7 @@ def sync_risk_engine(risk, hb, binance=None):
                 # FAZ14x: K2-flat kanitli sembolun SL epoch'u terminal CLOSED
                 # (canlıda 15 ölü PLACED satırı birikmesinin kapanis ayağı).
                 if _symbol:
-                    _mark_sl_epoch_closed(_symbol)
+                    _mark_sl_epoch_closed(_symbol, _snap_gen)
             else:
                 _unresolved.append(eid)
                 log.debug(f"  skip {eid[:12]}: {msg}")
@@ -1354,7 +1454,7 @@ def sync_risk_engine(risk, hb, binance=None):
                     reported_ids.add(eid)
                     max_close_ts = max(max_close_ts, _close_ts)
                     if symbol:
-                        _mark_sl_epoch_closed(symbol)
+                        _mark_sl_epoch_closed(symbol, _snap_gen)
                     log.warning(
                         f'  Binance fill-recovery: {pair} -> {_pnl:+.8f} '
                         f'(stale executor {str(eid)[:12]}, {msg})'
