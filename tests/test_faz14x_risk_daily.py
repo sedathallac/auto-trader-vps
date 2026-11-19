@@ -44,15 +44,43 @@ class RiskDailyHarness(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "risk_ledger.db")
         # production trade_ledger şeması (source kolonu dahil) — RiskEngine
-        # bu tabloyu oluşturmaz, canlıda auto_trader kurar; test aynılar.
+        # bu tabloyu oluşturmaz; canlıda deploy şeması kurar. FAZ16 sonrası
+        # RiskEngine ayrıca risk_state/sync_meta da OLUŞTURMAZ (startup
+        # otomatik-migration YASAK — test_risk_engine_integrity sözleşmesi).
+        # Bu yüzden test, canlı deploy'un izlediği gerçek yolu taklit eder:
+        # FAZ14x-çağı şeması kurulur ve risk_migration.apply ile göçürülür.
+        # Davranış assertleri DEĞİŞMEDEN korunur (görev kuralı: test
+        # gevşetilmez; kurulum gerçek migrate yoluna alınır).
         conn = sqlite3.connect(self.db)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS trade_ledger (
                 executor_id TEXT PRIMARY KEY, trading_pair TEXT, net_pnl_quote REAL,
                 closed_at TEXT, recorded_at TEXT, source TEXT DEFAULT 'sync')
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS risk_state (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                peak_equity REAL NOT NULL DEFAULT 0,
+                consecutive_losses INTEGER NOT NULL DEFAULT 0,
+                daily_trades INTEGER NOT NULL DEFAULT 0,
+                daily_pnl REAL NOT NULL DEFAULT 0,
+                last_reset_date TEXT NOT NULL,
+                is_halted INTEGER NOT NULL DEFAULT 0, halt_reason TEXT,
+                updated_at TEXT NOT NULL)
+        """)
+        conn.execute("INSERT OR IGNORE INTO risk_state "
+                     "(id, last_reset_date, updated_at) VALUES (1, '2020-01-01', 'init')")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                last_close_ts REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)
+        """)
+        conn.execute("INSERT OR IGNORE INTO sync_meta "
+                     "(id, last_close_ts, updated_at) VALUES (1, 0, 'init')")
         conn.commit()
         conn.close()
+        import risk_migration
+        risk_migration.apply(self.db, do_backup=True)
         cfg = dict(CFG)
         cfg["db_file"] = self.db
         self.cfg = cfg
@@ -76,10 +104,17 @@ class TestLastResetDatePersistence(RiskDailyHarness):
         Kritik: init anında tablo `or now[:10]` ile BUGÜNÜ yazar (self-heal).
         Kanıt için BUGÜN OLMAYAN bir sentinel gerekir; SET'de alan yoksa DB
         eski (init) tarihte kalır — canlıdaki 2026-11-15 donmasının mekanizması.
+
+        FAZ16 entegrasyon notu (korunan değişmez): test ORİJİNALDE state
+        sözlüğüne yazıyordu (FAZ14x çağrı sözleşmesi). Entegre ağaçta tek
+        otorite bellek-özniteliğidir (risk_engine._save_state docstring'i +
+        FAZ16 TestBaseline sözleşmesi); state yalnız aynadır. Değiştirilemez
+        değişmez — 'yeni tarih DB'ye yazılır ve reload'da geri döner' —
+        HİÇBİR assert'i değiştirmeden otorite kanalı üzerinden sabitlenir.
         """
-        self.engine._save_state()  # satırı init-değeriyle (bugün) INSERT et
+        self.engine._save_state()  # satırı init-değeriyle INSERT/UPSERT et
         sentinel = "2020-01-02"
-        self.engine.state["last_reset_date"] = sentinel
+        self.engine.last_reset_date = sentinel  # FAZ16 otorite kanalı (öznitelik)
         self.engine._save_state()  # artık UPDATE yolu çalışır
         db_date = self._raw("SELECT last_reset_date FROM risk_state WHERE id=1")[0]
         self.assertEqual(db_date, sentinel,

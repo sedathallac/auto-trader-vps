@@ -1074,7 +1074,7 @@ def sync_risk_engine(risk, hb, binance=None):
     _unresolved = []  # FAZ16 entry-health: bu turda çözümlenemeyen kapanışlar
     _retry = getattr(sync_risk_engine, '_stale_retry', {})
     _now = time.time()
-    _today_utc = datetime.now(_tz.utc).date()
+    _today_utc = datetime.now(timezone.utc).date()
     try:
         for e in terminated:
             eid = e.get("executor_id")
@@ -1132,10 +1132,10 @@ def sync_risk_engine(risk, hb, binance=None):
             # FAZ14x (KUSUR 4 — tek muhasebe standardi): normal yol da stale
             # yoluyla ayni gun-kapisini kullanir; gecmis tarihli kapanis
             # bugunun daily_pnl/ardisik-zarar sayacina ISLENMEZ. Saat dili UTC.
-            closed_at_iso = (datetime.fromtimestamp(closed_at, tz=_tz.utc).isoformat()
+            closed_at_iso = (datetime.fromtimestamp(closed_at, tz=timezone.utc).isoformat()
                              if closed_at else None)
             _update_daily = bool(closed_at) and (
-                datetime.fromtimestamp(closed_at, tz=_tz.utc).date() == _today_utc)
+                datetime.fromtimestamp(closed_at, tz=timezone.utc).date() == _today_utc)
             inserted, msg = risk.record_trade(eid, pair, pnl, closed_at_iso,
                                               closed_at_epoch=(closed_at or None),
                                               affect_daily=_update_daily,
@@ -1171,9 +1171,9 @@ def sync_risk_engine(risk, hb, binance=None):
             _retry[eid] = _now
             try:
                 _pnl, _close_ts = _recover_stale_executor_net_pnl(e, binance)
-                _close_iso = datetime.fromtimestamp(_close_ts, tz=_tz.utc).isoformat()
+                _close_iso = datetime.fromtimestamp(_close_ts, tz=timezone.utc).isoformat()
                 _update_daily = (
-                    datetime.fromtimestamp(_close_ts, tz=_tz.utc).date() == _today_utc
+                    datetime.fromtimestamp(_close_ts, tz=timezone.utc).date() == _today_utc
                 )
                 inserted, msg = risk.record_trade(
                     eid, pair, _pnl, _close_iso, closed_at_epoch=(_close_ts or None),
@@ -4235,7 +4235,7 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
             last_order_sync TEXT
         )""")
         from datetime import datetime as _dt, timezone as _tz
-        _now = _dt.now(_tz.utc).isoformat().replace("+00:00", "Z")
+        _now = _dt.now(timezone.utc).isoformat().replace("+00:00", "Z")
         _adb.execute("""
             INSERT INTO archive_symbols (symbol, first_seen_at, last_seen_at, source)
             VALUES (?, ?, ?, ?)

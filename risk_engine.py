@@ -263,6 +263,11 @@ class RiskEngine:
         FAZ16: migration gerektiren eski şemada (day_start_equity/open_keys yok)
         yalnız TEMEL kolonlar yazılır; kayıt sessizce düşmez, `migration_required`
         bayrağı merkezi kapıyı kapatır.
+
+        FAZ14x→FAZ16 entegrasyon: öznitelik (self.last_reset_date) TEK otoritedir;
+        state sözlüğü yalnız AYNADIR (FAZ16 startup-migration-yasak sözleşmesi ve
+        TestBaseline bu yönü sabitler). FAZ14x-çağı state-override çağrı yolu
+        entegre ağaçta KALDIRILDI — kanonik yazma yolu reset_daily(reset_date=).
         """
         self.state["last_reset_date"] = self.last_reset_date
         now = iso_utc(utc_now())
