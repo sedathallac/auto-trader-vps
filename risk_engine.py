@@ -84,6 +84,82 @@ def parse_close_epoch(closed_at_epoch, closed_at):
     return dt.timestamp()
 
 
+HB_NAIVE_TZ_OFFSET_SECONDS = 10800.0  # eski yazar UTC+03:00, yermesiz (F4: 27/27)
+
+
+def reconcile_naive_closed_at(conn, hb_rows_by_eid, tolerance=0.001):
+    """FAZ17 §12.5 — naive `closed_at` satırlarına YALNIZ HB tam eşleşmesiyle
+    `closed_at_epoch` backfill eder. Saat UYDURULMAZ.
+
+    Kanıt (F4, 2026-11-19): canlı ledger'daki 27 naive closed_at = HB UTC
+    closed_at + TAM 10800.000s (27/27, mikrosaniye birebir). Eski yazar
+    (≤01229ce) yerel saati yermesiz yazdı; parse_close_epoch bunları doğru
+    reddediyor ama günlük eşik/ardışık hesap kör kalıyor.
+
+    Satır başına deterministik sözleşme — YALNIZ hepsi birdense yazılır:
+      * satır hiç çözümlenemiyor (parse_close_epoch None) ve closed_at
+        çözümlenebilir NAIVE;
+      * executor_id HB sözlüğünde var ve close_timestamp sonlu/>0;
+      * |naive_epoch − 10800 − hb_epoch| <= tolerance (±1ms; mikrosaniye
+        birebir kanıtlı, tam olmayan eşleşme tahmine çevrilmez).
+    closed_at ORİJİNAL metni korunur (raw preserved); geçerli epoch'u olan
+    satıra asla dokunulmaz → ikinci koşu no-op (idempotent). Çağıran YALNIZ
+    tamamlanma-kanıtlı (cursor/total_count) HB listesiyle çağırmalıdır.
+    Dönüş: {"backfilled", "ambiguous", "already_ok", "invalid"} sayaçları.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_ledger)")}
+    if not {"executor_id", "closed_at", "closed_at_epoch"} <= cols:
+        raise ValueError("trade_ledger şeması eski: closed_at/closed_at_epoch "
+                         "kolonları yok — migration olmadan backfill yapılmaz")
+    res = {"backfilled": 0, "ambiguous": 0, "already_ok": 0, "invalid": 0}
+    rows = conn.execute("SELECT executor_id, closed_at, closed_at_epoch "
+                        "FROM trade_ledger").fetchall()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for eid, iso, epoch in rows:
+            if parse_close_epoch(epoch, iso) is not None:
+                res["already_ok"] += 1
+                continue
+            if not iso:
+                res["invalid"] += 1
+                continue
+            try:
+                dt = datetime.fromisoformat(str(iso))
+            except (TypeError, ValueError):
+                res["invalid"] += 1
+                continue
+            if dt.tzinfo is not None:
+                # Aware olup çözümlenemeyen tuhaf durum: saat uydurulmaz.
+                res["invalid"] += 1
+                continue
+            hb = hb_rows_by_eid.get(str(eid)) if eid is not None else None
+            hb_ts = None
+            if isinstance(hb, dict):
+                try:
+                    v = float(hb.get("close_timestamp"))
+                    hb_ts = v if math.isfinite(v) and v > 0 else None
+                except (TypeError, ValueError):
+                    hb_ts = None
+            if hb_ts is None:
+                res["ambiguous"] += 1
+                continue
+            naive_as_utc = dt.replace(tzinfo=timezone.utc).timestamp()
+            if abs((naive_as_utc - HB_NAIVE_TZ_OFFSET_SECONDS) - hb_ts) <= tolerance:
+                conn.execute("UPDATE trade_ledger SET closed_at_epoch=? "
+                             "WHERE executor_id=?", (hb_ts, eid))
+                res["backfilled"] += 1
+            else:
+                res["ambiguous"] += 1
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    return res
+
+
 def connect_rw(db_file, create=False):
     """Mevcut SQLite dosyasını read-write aç. `create=False` iken dosya YOKSA hata."""
     p = Path(db_file)

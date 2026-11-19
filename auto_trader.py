@@ -1292,6 +1292,26 @@ def sync_risk_engine(risk, hb, binance=None):
     log.info(f"  RiskEngine sync: {len(all_execs)} exec, {len(terminated)} TERM, "
              f"{len(reported_ids)} in ledger")
 
+    # FAZ17 §12.5: eski (≤01229ce) yazarın naive UTC+03:00 closed_at satırları
+    # YALNIZ HB tam eşleşmesiyle epoch'lanır (executor_id + naive−10800s ==
+    # hb.close_timestamp ±1ms); saat uydurulmaz, raw korunur, idempotent.
+    # Buraya geliş = tamamlanma KANITI (err None); PARTIAL yukarıda döndü.
+    # Backfill mutabakat-kolaylaştırıcısıdır: hata sync hattını KIRAMAZ
+    # (bugünkü UNRESOLVED zaten güvenli varsayılan).
+    try:
+        _hb_by_eid = {e["executor_id"]: e for e in terminated
+                      if isinstance(e.get("executor_id"), str) and e["executor_id"]}
+        _rconn = risk_engine_mod.connect_rw(db_path)
+        try:
+            _rec = risk_engine_mod.reconcile_naive_closed_at(_rconn, _hb_by_eid)
+        finally:
+            _rconn.close()
+        if _rec["backfilled"] or _rec["invalid"]:
+            log.info(f"  §12.5 closed_at mutabakatı: {_rec}")
+    except Exception as _re:
+        log.warning(f"  §12.5 closed_at mutabakatı atlandı: "
+                    f"{type(_re).__name__}: {_re}")
+
     # FAZ14x-2 nesil-2 (BULGU 1 — sıra sözleşmesi, SAAT-BAĞIMSIZ): snapshot
     # İSTEĞİNDEN ÖNCE SL generation sayacı yakalanır; bu sayaçtan SONRA
     # acquire/mark_placed olan (ya da aynı token'la yeniden doğan) hiçbir
