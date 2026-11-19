@@ -1308,11 +1308,11 @@ def sync_risk_engine(risk, hb, binance=None):
         _apply = os.environ.get("FAZ17_CLOSED_AT_BACKFILL", "0") == "1"
         _rconn = risk_engine_mod.connect_rw(db_path)
         try:
-            if _apply:
-                _rec = risk_engine_mod.reconcile_naive_closed_at(_rconn, _hb_by_eid)
-            else:
-                _rec = risk_engine_mod.reconcile_naive_closed_at(
-                    _rconn, _hb_by_eid, dry_run=True)
+            # TEK çağrı (kod incelemesi P0): dry_run doğrudan bayrak DEĞERİNDEN
+            # türer — bayrak kontrol edilmeden yazılabilir bir çağrı yolu
+            # yoktur; bayrak kapalıyken fonksiyon yalnız would_backfill sayar.
+            _rec = risk_engine_mod.reconcile_naive_closed_at(
+                _rconn, _hb_by_eid, dry_run=not _apply)
         finally:
             _rconn.close()
         if _rec.get("backfilled") or _rec.get("invalid") or (

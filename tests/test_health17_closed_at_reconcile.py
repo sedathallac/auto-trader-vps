@@ -316,6 +316,54 @@ class TestSyncWiring(Base):
         self.assertIsNone(self.row("E_NAIVE")[1],
                           "PARTIAL sync naive satıra dokundu (fail-open!)")
 
+    def _spy_reconcile(self):
+        """Gerçek sync_risk_engine() çağrı yolunu gözle: kaç çağrı, hangi
+        dry_run değeri, hangi sonuç döndü (P0: bayrak kontrolsiz yazılabilir
+        çağrı YOLU OLMAMALI — tek çağrı, dry_run=not apply)."""
+        orig = risk_engine.reconcile_naive_closed_at
+        calls = []
+
+        def spy(conn, hb_rows_by_eid, **kw):
+            res = orig(conn, hb_rows_by_eid, **kw)
+            calls.append({"kwargs": dict(kw), "result": dict(res)})
+            return res
+
+        self.addCleanup(setattr, risk_engine, "reconcile_naive_closed_at", orig)
+        risk_engine.reconcile_naive_closed_at = spy
+        return calls
+
+    def test_real_sync_path_single_dry_run_call_by_default(self):
+        # Env YOK (operatör onaysız varsayılan): gerçek sync → TEK çağrı,
+        # dry_run=True, would_backfill raporlanır, DB'YE YAZILMAZ.
+        calls = self._spy_reconcile()
+        rows = self._terminated()
+        self._run_sync({"data": rows, "pagination": {
+            "limit": 200, "has_more": False, "next_cursor": None,
+            "total_count": len(rows)}})
+        self.assertEqual(len(calls), 1, f"tek çağrı sözleşmesi bozuldu: {calls}")
+        self.assertIs(calls[0]["kwargs"].get("dry_run"), True,
+                      "bayrak kapalıyken dry_run=False ile çağrıldı (yazım riski!)")
+        self.assertEqual(calls[0]["result"].get("would_backfill"), 1,
+                         "APPLY kapalıyken would_backfill raporlanmadı")
+        self.assertEqual(calls[0]["result"].get("backfilled"), 0)
+        self.assertIsNone(self.row("E_NAIVE")[1], "varsayılan mod canlı DB'ye yazdı")
+
+    def test_real_sync_path_apply_flag_passes_dry_run_false(self):
+        # Bayrak AÇIK: tek çağrı, dry_run=False, backfill gerçekleşir, raw durur.
+        self._enable_apply()
+        calls = self._spy_reconcile()
+        rows = self._terminated()
+        self._run_sync({"data": rows, "pagination": {
+            "limit": 200, "has_more": False, "next_cursor": None,
+            "total_count": len(rows)}})
+        self.assertEqual(len(calls), 1, f"tek çağrı sözleşmesi bozuldu: {calls}")
+        self.assertIs(calls[0]["kwargs"].get("dry_run"), False,
+                      "APPLY açıkken dry_run=True geçti — backfill yapılmıyor")
+        self.assertEqual(calls[0]["result"].get("backfilled"), 1)
+        iso, epoch = self.row("E_NAIVE")
+        self.assertAlmostEqual(epoch, self.hb_ts, 6)
+        self.assertEqual(iso, self.naive, "raw closed_at bozuldu")
+
 
 if __name__ == "__main__":
     unittest.main()
