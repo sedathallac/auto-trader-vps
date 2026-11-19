@@ -363,7 +363,7 @@ class _FakeBinanceSL:
     def _get(self, path, params=None, signed=False):
         return []
 
-    def place_algo_sl(self, sym, trig, qty, side):
+    def place_algo_sl(self, sym, trig, qty, side, **_faz18kw):
         self.placed.append(sym)
         return {"algoId": 1}
 

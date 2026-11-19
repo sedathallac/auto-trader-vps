@@ -55,7 +55,7 @@ class FakeBinance:
     def set_leverage(self, symbol, lev):
         return {"leverage": lev}
 
-    def place_algo_sl(self, symbol, trig, qty, side):
+    def place_algo_sl(self, symbol, trig, qty, side, **_faz18kw):
         return {"algoId": 123}
 
     def open_algo_orders_for(self, symbol):          # old inline check source

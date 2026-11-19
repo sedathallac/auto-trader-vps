@@ -61,7 +61,7 @@ class FakeBinance:
     def cancel_order(self, symbol, order_id=None, orig_client_order_id=None):
         return {"status": "CANCELED"}
 
-    def place_algo_sl(self, symbol, trig, qty, side):
+    def place_algo_sl(self, symbol, trig, qty, side, **_faz18kw):
         self.algo_posts.append((symbol, qty, side))     # would be a NEW SL (must NOT happen on close)
         return {"algoId": 1}
 

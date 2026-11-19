@@ -62,7 +62,7 @@ class FakeBinance:
             self._orphan = None
         return {"algoId": algo_id, "code": "200", "msg": "success"}
 
-    def place_algo_sl(self, s, trig, qty, side):
+    def place_algo_sl(self, s, trig, qty, side, **_faz18kw):
         return {"algoId": 878098}
 
     def open_algo_orders_raw(self, s):          # sl_status source -> the NEW valid SL

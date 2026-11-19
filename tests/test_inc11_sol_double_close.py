@@ -355,7 +355,7 @@ class TestSlCoverageRootCause(unittest.TestCase):
             return {"PRICE_FILTER": {"tickSize": "0.01"}}
         def _get(self, path, params=None, signed=False):
             return []
-        def place_algo_sl(self, sym, trig, qty, side):
+        def place_algo_sl(self, sym, trig, qty, side, **_faz18kw):
             self.placed.append((sym, trig, qty, side))
             return {"algoId": 1}
 

@@ -245,6 +245,10 @@ RISK_CONFIG = {
     "sl_max_pct": 0.10,
     "tp_min_pct": 0.020,
     "tp_max_pct": 0.15,
+    # FAZ18 (1.6): koşullu emir (SL/TP algo) marjin tamponu, yüzde. 0 → kapı kapalı.
+    "faz18_conditional_margin_buffer_pct": 20,
+    # FAZ18 (1.1): exchange-tarafı algo TP — operatör politikası, varsayılan KAPALI.
+    "faz18_tp_algo_enabled": False,
 }
 
 # Faz 5: balina eşikleri RISK_CONFIG içinde (muhafazakâr başlangıç, ⚠️ CALIBRATION-REQUIRED).
@@ -535,13 +539,74 @@ class BinanceAPI:
     def cancel_algo_order(self, algo_id):
         return self._post("/fapi/v1/algoOrder", {"algoId": algo_id}, method="DELETE")
 
-    def place_algo_sl(self, symbol, trigger_price, quantity, side):
+    def get_algo_order(self, algo_id=None, client_algo_id=None):
+        """GET /fapi/v1/algoOrder — TEK algo durumu (FAZ1.2 doğrulama + FAZ1.3
+        restart re-map: clientAlgoId ile yeniden bulunur). Ham yanıt döner:
+        başarıda dict (algoStatus NEW/PARTIALLY_FILLED/...), hatada error dict."""
+        params = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        if client_algo_id:
+            params["clientAlgoId"] = client_algo_id
+        return self._get("/fapi/v1/algoOrder", params, signed=True)
+
+    def place_algo_sl(self, symbol, trigger_price, quantity, side,
+                      position_side=None, close_position=False,
+                      client_algo_id=None, working_type="MARK_PRICE"):
+        """POST /fapi/v1/algoOrder — FAZ18 koşullu STOP_MARKET SL (Algo Service).
+
+        FAZ1.1 doktrini (testlerde kilitli):
+          * workingType=MARK_PRICE VARSAYILAN — FAZ0 bulgusu: 2026-11 penceresin-
+            deki 76/76 SL varsayılan CONTRACT_PRICE (son fiyat) ile yerleştirilmiş;
+            son-fiyat iğnesi/manipülasyonu tetiklemeye açık. Mark fiyatı esas.
+          * close_position=True → closePosition=true gönderilir ve quantity ile
+            reduceOnly GÖNDERİLMEZ (API doküman kuralı; ihlalde ValueError —
+            2026-11'deki qty=0/eksik-kapsama artefaktlarının kalıcı ilacı).
+          * close_position=False → quantity + reduceOnly=true (ONEWAY eski formu;
+            HEDGE'de reduceOnly reddedilir → position_side verilmeli).
+          * client_algo_id → newClientAlgoId: idempotent yeniden-eşleme anahtarı
+            (restart sonrası GET algoOrder?clientAlgoId=).
+        countdownCancelAll HİÇBİR YOLDA kullanılmaz (FAZ1.7 — tek çağrıda tüm
+        SL'leri siler; guard testi: tests/test_faz18_exit_protection.py).
+        """
         sl_side = "SELL" if side == 1 else "BUY"
-        return self._post("/fapi/v1/algoOrder", {
-            "algoType": "CONDITIONAL", "symbol": symbol, "side": sl_side,
-            "type": "STOP_MARKET", "triggerPrice": f"{trigger_price:.8f}",
-            "quantity": f"{quantity:.8f}", "reduceOnly": "true",
-        })
+        if close_position and quantity is not None:
+            raise ValueError("closePosition=true ile quantity/reduceOnly birlikte gönderilemez (API doc rule)")
+        if (not close_position) and quantity is None:
+            raise ValueError("closePosition=false için quantity zorunlu")
+        params = {"algoType": "CONDITIONAL", "symbol": symbol, "side": sl_side,
+                  "type": "STOP_MARKET", "triggerPrice": f"{trigger_price:.8f}",
+                  "workingType": working_type}
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = f"{float(quantity):.8f}"
+            if not position_side:
+                params["reduceOnly"] = "true"   # HEDGE: reduceOnly reddedilir
+        if position_side:
+            params["positionSide"] = position_side
+        if client_algo_id:
+            params["newClientAlgoId"] = str(client_algo_id)[:36]
+        return self._post("/fapi/v1/algoOrder", params)
+
+    def place_algo_tp(self, symbol, trigger_price, side, position_side=None,
+                      client_algo_id=None, working_type="MARK_PRICE"):
+        """POST /fapi/v1/algoOrder — FAZ18 TAKE_PROFIT_MARKET TP'si (1.1 TP yolu).
+        closePosition=true (pozisyonun tamamı), workingType=MARK_PRICE. Maker
+        LIMIT TP alternatifi REGULAR /fapi/v1/order reduceOnly LIMIT ile atılır
+        (koşullu değildir, −4120 kapsamı dışı) — bu metod algo-TP içindir.
+        Çağırılması FAZ18_TP_ALGO politika anahtarına bağlıdır (operatör
+        kararı; kapanış davranışını değiştirir)."""
+        tp_side = "SELL" if side == 1 else "BUY"
+        params = {"algoType": "CONDITIONAL", "symbol": symbol, "side": tp_side,
+                  "type": "TAKE_PROFIT_MARKET",
+                  "triggerPrice": f"{trigger_price:.8f}",
+                  "closePosition": "true", "workingType": working_type}
+        if position_side:
+            params["positionSide"] = position_side
+        if client_algo_id:
+            params["newClientAlgoId"] = str(client_algo_id)[:36]
+        return self._post("/fapi/v1/algoOrder", params)
 
     def market_order(self, symbol, side, quantity, reduce_only=True):
         """POST /fapi/v1/order — MARKET emir.
@@ -1748,6 +1813,251 @@ def should_block_new_entries(unprotected=None):
     return len(u) > 0
 
 
+# ------------------------------------------------------------- FAZ18 (FAZ1)
+# Exchange-doğrulamalı koruma sözleşmesi. FAZ0 bulgusu: ack (algoId) tek başına
+# yeterli kanıt değil — emir daha sonra sessizce kaybolabiliyor ve kapanış HB'ye
+# hiç yansımıyordu. Bundan böyle: ACK + İKİLİ DOĞRULAMA (GET algoOrder durumu
+# ve/veya openAlgoOrders varlığı); doğrulama KESİN-KAYIP ise fail-closed kapanış.
+_SL_LIVE_STATUS = ("NEW", "PARTIALLY_FILLED")
+
+
+def verify_sl_ack(binance, symbol, algo_id):
+    """FAZ1.2 ikili doğrulama. DÖNER: ("OK"|"MISSING"|"UNKNOWN", detay).
+
+    OK      → GET algoOrder algoStatus ∈ {NEW, PARTIALLY_FILLED} VEYA emir
+              openAlgoOrders'ta algoId ile mevcut.
+    MISSING → her iki güvenilir uç da emri TÖNKÜYLE döndürmüyor (API hatası değil,
+              gerçek yokluk). Yalnız bu durumda fail-closed kapanışa izin verilir.
+    UNKNOWN → sorgu uçları güvenilir yanıt vermedi (istisna/error dict) VEYA
+              boundary GET'i hiç taşımıyor (yokluk KANITLANAMAZ). Kör KAPATMA
+              YOK; alarm + giriş kilidi (OPEN_UNPROTECTED) sürer.
+    """
+    if algo_id is None:
+        return ("MISSING", "ack algoId içermiyor")
+    has_get = hasattr(binance, "get_algo_order")
+    q_err, g = None, None
+    if has_get:
+        try:
+            g = binance.get_algo_order(algo_id=algo_id)
+        except Exception as e:
+            g, q_err = None, type(e).__name__
+        if isinstance(g, dict) and g.get("algoId") is not None and "code" not in g:
+            if str(g.get("algoStatus")) in _SL_LIVE_STATUS:
+                return ("OK", f"algoStatus={g.get('algoStatus')}")
+        elif isinstance(g, dict) and "code" in g:
+            q_err = f"algoOrder code={g.get('code')}"
+    try:
+        o = binance.open_algo_orders_raw(symbol)
+    except Exception as e:
+        return ("UNKNOWN", f"openAlgoOrders istisna {type(e).__name__}"
+                           + (f"; {q_err}" if q_err else ""))
+    lst = o if isinstance(o, list) else (
+        o.get("orders") if isinstance(o, dict) and isinstance(o.get("orders"), list)
+        else None)
+    if lst is None:
+        return ("UNKNOWN", f"doğrulama uçları güvensiz{': ' + str(q_err) if q_err else ''}")
+    if any(str(x.get("algoId")) == str(algo_id) for x in lst):
+        return ("OK", "openAlgoOrders")
+    if not has_get:
+        # Eski/minimum boundary: tek kaynaklı "yok" ile yıkıcı karar VERİLEMEZ.
+        return ("UNKNOWN", "GET /fapi/v1/algoOrder yok; yokluk kanıtlanamadı")
+    return ("MISSING", f"algoOrder:{q_err or 'boş'} + openAlgoOrders'ta yok")
+
+
+def find_algo_by_client_id(binance, symbol, client_algo_id):
+    """FAZ18 (1.8 ack-kaybı) — newClientAlgoId ile emir arama.
+
+    place yanıtı kaybolduğunda EMİR EXCHANGE'TE OLUŞMUŞ OLABİLİR. DÖNER:
+      ("FOUND", algoId-str) → emir bulundu (canlı).
+      ("ABSENT", detay)     → en az bir KESİN-yok kanıtı (GET error-code ve/veya
+                              başarılı openAlgoOrders listesi) + hiçbir varlık
+                              kanıtı yok → yeniden deneme GÜVENLİ.
+      ("UNKNOWN", detay)    → kanıt yetersiz (istisna/güvensiz yanıt/GET'siz
+                              boundary) → epoch PENDING KALIR (çift-SL koruması
+                              yeniden denemeden önce gelir).
+    """
+    proofs = 0
+    if hasattr(binance, "get_algo_order"):
+        try:
+            g = binance.get_algo_order(client_algo_id=client_algo_id)
+        except Exception as e:
+            return ("UNKNOWN", f"cid GET istisna {type(e).__name__}")
+        if isinstance(g, dict):
+            if g.get("algoId") is not None and "code" not in g:
+                return ("FOUND", str(g["algoId"]))
+            if "code" in g:
+                proofs += 1
+            else:
+                return ("UNKNOWN", "cid GET anlamsız yanıt")
+        else:
+            return ("UNKNOWN", "cid GET anlamsız yanıt")
+    try:
+        raw = (binance.open_algo_orders_raw(symbol)
+               if hasattr(binance, "open_algo_orders_raw") else None)
+    except Exception as e:
+        return ("UNKNOWN", f"openAlgoOrders istisna {type(e).__name__}")
+    if not isinstance(raw, list):
+        return ("UNKNOWN", "openAlgoOrders güvensiz yanıt")
+    proofs += 1
+    for a in raw:
+        if (isinstance(a, dict)
+                and str(a.get("clientAlgoId")) == str(client_algo_id)):
+            return ("FOUND", str(a.get("algoId")))
+    if proofs:
+        return ("ABSENT", f"{proofs} kesin-yok kanıtı, varlık kanıtı yok")
+    return ("UNKNOWN", "kanıt ucu yok")
+
+
+def record_protection_event(db_path, symbol, event, detail="",
+                            algo_id=None, client_algo_id=None):
+    """FAZ1.2 ledger olayı (PROTECTION_FAILED vb.) — EKLENMESİ güvenli
+    `sl_protection_events` tablosu; mevcut ledger satırlarına DOKUNULMAZ (§0
+    değişmez). Yazım hatası istisna FIRLATMAZ (alarm zaten log.critical ile
+    verildi); only-add denetim izi. Testlerde tmp db verilir."""
+    try:
+        conn = risk_engine_mod.connect_rw(db_path)
+    except Exception:
+        return False
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sl_protection_events ("
+            "ts TEXT NOT NULL, symbol TEXT NOT NULL, event TEXT NOT NULL, "
+            "detail TEXT, algo_id TEXT, client_algo_id TEXT)")
+        conn.execute(
+            "INSERT INTO sl_protection_events VALUES (?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), str(symbol), str(event),
+             str(detail)[:500],
+             str(algo_id) if algo_id is not None else None,
+             str(client_algo_id) if client_algo_id else None))
+        return True
+    except Exception as e:
+        log.warning(f"  sl_protection_events yazılamadı ({symbol}): {e}")
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def fail_closed_unprotected(binance, pos, reason, coordinator=None,
+                            risk=None, db_path=None):
+    """FAZ1.2 fail-closed: KESİNLEŞMİŞ koruma yokluğu (verify MISSING) →
+    pozisyon reduceOnly MARKET ile kapatılır + CRITICAL alarm + ledger
+    PROTECTION_FAILED. UNKNOWN'dan ASLA çağrılmaz (kör kapatma yok).
+    Kapanış tek yetkiden (coordinate_close) geçer; coordinator yoksa ham
+    close_position (reduceOnly) kullanılır ve sonuç kontrol edilir."""
+    sym = pos["symbol"]
+    amt = float(pos["positionAmt"])
+    log.critical(f"🚨 PROTECTION_FAILED {sym}: {reason} — fail-closed: pozisyon "
+                 f"reduceOnly MARKET ile KAPATILIYOR (amt={amt})")
+    closed = False
+    try:
+        if coordinator is not None:
+            coordinate_close(coordinator, binance, sym, "PROTECTION_FAILED",
+                             side=1 if amt > 0 else 2, amount=abs(amt))
+            closed = True
+        else:
+            r = binance.close_position(sym, amt)
+            closed = isinstance(r, dict) and r.get("status") not in (None, "NOOP") \
+                and "code" not in r
+    except Exception as e:
+        log.critical(f"🚨🚨 PROTECTION_FAILED {sym}: kapanış BAŞARISIZ: {e} "
+                     f"!!! MANUEL MUDAHALE !!!")
+    if db_path:
+        record_protection_event(db_path, sym, "PROTECTION_FAILED",
+                                f"{reason}; closed={closed}",
+                                algo_id=None)
+    if risk is not None:
+        try:
+            risk.is_halted = True
+            risk.halt_reason = f"PROTECTION_FAILED: {sym}"
+            risk._save_state()
+        except Exception as e:
+            log.warning(f"  PROTECTION_FAILED halt yazılamadı: {e}")
+    return closed
+
+
+def conditional_margin_gate(available, target_notional, dyn_lev, buffer_pct=None):
+    """FAZ18 (1.6) — koşullu emir marjin tamponu.
+
+    Koşullu emirler (SL/TP algo) yerleşim anında serbest marjinden pay yer;
+    closePosition modunda kilit olmasa da qty-moduna düşüş ve tetikleme
+    anındaki hesap riski karşısında giriş marjini ÜZERİNDE bir tampon
+    aranır: gereken = notional/kaldıraç × (1 + buffer%/100). buffer_pct
+    RISK_CONFIG["faz18_conditional_margin_buffer_pct"] (varsayılan 20);
+    0 → kapı devre dışı. Yetersizse giriş AÇILMAZ (fail-closed tarafı).
+    """
+    try:
+        _av = float(available)
+        _nt = float(target_notional)
+        _lev = max(1, int(dyn_lev or 1))
+    except (TypeError, ValueError):
+        return False, "marjin girdisi okunamadı (fail-closed)"
+    if buffer_pct is None:
+        buffer_pct = RISK_CONFIG.get("faz18_conditional_margin_buffer_pct", 20)
+    _entry_margin = _nt / _lev
+    if not buffer_pct:
+        return _av >= _entry_margin, f"tampon kapalı, giriş marjini {_entry_margin:.2f}"
+    _need = _entry_margin * (1.0 + float(buffer_pct) / 100.0)
+    if _av < _need:
+        return False, (f"kullanılabilir marjin yetersiz: {_av:.2f} < "
+                       f"{_need:.2f} (giriş marjini {_entry_margin:.2f} + "
+                       f"koşullu-emir tamponu %{buffer_pct})")
+    return True, f"marjin ok ({_av:.2f} ≥ {_need:.2f})"
+
+
+def remap_placed_algos(binance, store):
+    """FAZ18 (1.3) — PLACED satırı ↔ exchange kimlik mutabakatı (restart re-map).
+
+    Satırda algo_id varsa ve hâlâ live → dokunma. Değilse kimliği YENİDEN BUL:
+      (a) client_algo_id ile GET /fapi/v1/algoOrder → live kayıt → onu benimse;
+      (b) openAlgoOrders'ta sembolün geçerli STOP algo'su → onu benimse.
+    Bulunamazsa satıra DOKUNULMAZ (uydurma yok); yerleştirme/fail-closed kararı
+    sl_status yolunundur. Idempotent: tekrar çağırma no-op. GEN ALZAMAZ —
+    kapanış kanıtları geçersiz kılmaz (remap_algo_ids koşullu UPDATE)."""
+    remapped = {}
+    try:
+        rows = store.list_active()
+    except Exception:
+        return remapped
+    for row in rows or []:
+        if row.get("state") != "PLACED":
+            continue
+        sym, aid, cid = row["symbol"], row.get("algo_id"), row.get("client_algo_id")
+        if aid:
+            v, _d = verify_sl_ack(binance, sym, aid)
+            if v == "OK":
+                continue
+        found = None
+        if cid and hasattr(binance, "get_algo_order"):
+            try:
+                g = binance.get_algo_order(client_algo_id=cid)
+                if (isinstance(g, dict) and g.get("algoId") is not None
+                        and str(g.get("algoStatus")) in _SL_LIVE_STATUS):
+                    found = g["algoId"]
+            except Exception:
+                found = None
+        if found is None:
+            try:
+                for o in binance.open_algo_orders_for(sym) or []:
+                    if ("STOP" in str(o.get("orderType") or o.get("type")
+                                       or "").upper()
+                            and o.get("algoId")):
+                        found = o["algoId"]
+                        break
+            except Exception:
+                found = None
+        if found is not None:
+            try:
+                if store.remap_algo_ids(sym, row["token"], found, cid):
+                    log.info(f"  🔗 FAZ18 re-map {sym}: {aid} → {found}")
+                    remapped[sym] = found
+            except Exception as e:
+                log.warning(f"  FAZ18 re-map yazımı {sym}: {e}")
+    return remapped
+
+
 def new_entry_allowed(drift, stale, mode_ok, unprotected):
     """Pure new-entry gate (K6): allowed only when NONE of the blockers hold.
     Independent of the protection check, which runs regardless of drift/stale."""
@@ -1889,6 +2199,24 @@ def ensure_sl_coverage(binance):
         if not open_pos:
             log.info("SL kontrolü: açık pozisyon yok")
             return
+        # K-3 cross-process SL-placement intent (same shared ledger as reservation).
+        # FAZ18: creation moved BEFORE the status loop so remap_placed_algos can
+        # reconcile PLACED-row exchange identity even when coverage is PRESENT.
+        try:
+            from sl_placement import SlPlacementStore, ACQUIRED as _SL_ACQ
+            _sl_store = SlPlacementStore(SL_LEDGER_DB)
+            _sl_store.init_schema()
+        except Exception as _e:
+            log.warning(f"K-3 SlPlacementStore kurulamadı: {_e}")
+            _sl_store = None
+            _SL_ACQ = "ACQUIRED"
+        if _sl_store is not None:
+            # FAZ18 (1.3): yerleştirmeden ÖNCE mevcut PLACED satırlarının
+            # exchange kimliğini tazele (restart/elle-müdahale re-map'i).
+            try:
+                remap_placed_algos(binance, _sl_store)
+            except Exception as _e:
+                log.warning(f"  FAZ18 re-map hatası: {_e}")
         # RC-2 fix: validate REAL protective coverage mode-aware via the inc10.1
         # sl_status (NOT "any algo order exists"). For each open position the real
         # positionRisk amount, ONEWAY/HEDGE mode, side, symbol, order type, side,
@@ -1935,16 +2263,9 @@ def ensure_sl_coverage(binance):
                 log.info(f"✅ SL koruması tam ({len(open_pos)} pozisyon)")
             return
         log.warning(f"⚠️  SL eksik (ONEWAY, yerleştirilecek): {missing}")
-        # K-3 cross-process SL-placement intent (same shared ledger as reservation).
-        try:
-            from sl_placement import SlPlacementStore, ACQUIRED as _SL_ACQ
-            _sl_store = SlPlacementStore(SL_LEDGER_DB)
-            _sl_store.init_schema()
-        except Exception as _e:
-            log.warning(f"K-3 SlPlacementStore kurulamadı: {_e}")
-            _sl_store = None
-            _SL_ACQ = "ACQUIRED"
         for sym in missing:
+            _cid = None
+            _tok = None
             try:
                 # Stop uncontrolled retry: a symbol already flagged -2021 is NOT
                 # re-sent (resending the same trigger just fails again). Keep the
@@ -1975,18 +2296,41 @@ def ensure_sl_coverage(binance):
                 if _sl_store is not None and _sl_store.acquire(sym, _tok) != _SL_ACQ:
                     log.info(f"  ⏸️ {sym} SL yerleştirme başka process'te (BUSY) — atlandı")
                     continue
-                r = binance.place_algo_sl(sym, trig, qty, side)
+                # FAZ18 (1.1/1.2/1.3): closePosition=true + MARK_PRICE +
+                # newClientAlgoId; ack tek başına kanıt DEĞİL — verify_sl_ack
+                # OK olmadan PLACED yazılmaz; KESİN MISSING fail-closed kapatır.
+                _cid = ("fa18" + sym + str(int(time.time() * 1000)))[-36:]
+                r = binance.place_algo_sl(sym, trig, None, side,
+                                          close_position=True,
+                                          client_algo_id=_cid)
+                _v, _vd = (None, None)
+                if isinstance(r, dict) and r.get("algoId"):
+                    _v, _vd = verify_sl_ack(binance, sym, r["algoId"])
                 if _sl_store is not None:
-                    if isinstance(r, dict) and r.get("algoId"):
-                        _sl_store.mark_placed(sym, _tok)
+                    if _v == "OK":
+                        _sl_store.mark_placed(sym, _tok, algo_id=r["algoId"],
+                                              client_algo_id=r.get("clientAlgoId") or _cid,
+                                              working_type="MARK_PRICE")
                     else:
-                        _sl_store.release(sym, _tok)   # failure -> allow reality/retry
+                        _sl_store.release(sym, _tok)  # failure -> reality/retry
+                if _v == "MISSING":
+                    # ack var, emir exchange'te YOK (kanıtlı) → FAZ1.2 fail-closed.
+                    log.critical(f"🚨 OPEN_UNPROTECTED {sym}: SL ack sonrası "
+                                 f"doğrulanamadı (MISSING: {_vd}) — yeni giriş "
+                                 f"durduruldu; fail-closed kapanış deneniyor")
+                    fail_closed_unprotected(binance, p,
+                                            f"post-ack verify MISSING ({_vd}); "
+                                            f"place={r}", db_path=SL_LEDGER_DB)
+                    _OPEN_UNPROTECTED[sym] = -1
+                    continue
                 _new, _action = note_sl_outcome(_OPEN_UNPROTECTED, sym, r)
                 _OPEN_UNPROTECTED.clear()
                 _OPEN_UNPROTECTED.update(_new)
                 if _action == "PROTECTED":
                     log.info(f"  ✅ {sym} SL gönderildi: trigger={trig} qty={qty} "
-                             f"algoId={r['algoId']} → OPEN_PROTECTED")
+                             f"algoId={r['algoId']} "
+                             f"(doğrulama: {_vd or 'boundary doğrulama yok'}) "
+                             f"→ OPEN_PROTECTED")
                 elif _action == "UNPROTECTED_2021":
                     # -2021: OPEN_UNPROTECTED. Do NOT change the stop price and do
                     # NOT close the position (separate security procedures).
@@ -2000,6 +2344,33 @@ def ensure_sl_coverage(binance):
                                  f"giriş durduruldu")
             except Exception as e:
                 log.exception(f"  {sym} SL istisna: {e}")
+                # FAZ18 (1.8) ACK-KAYBI: place yanıtı alınamadı — emir exchange'te
+                # OLUŞMUŞ OLABİLİR. newClientAlgoId ile araştır: FOUND → PLACED
+                # işaretle; KESİN ABSENT → epoch serbest (sonraki tur dener);
+                # UNKNOWN → PENDING KALIR (çift-SL koruması yeniden denemeden önce
+                # gelir) ve alarm sürer. Kör release/tekrar GÖNDERME YOK.
+                if _sl_store is not None and _cid:
+                    try:
+                        _s2, _i2 = find_algo_by_client_id(binance, sym, _cid)
+                        if _s2 == "FOUND":
+                            _sl_store.mark_placed(
+                                sym, _tok, algo_id=_i2, client_algo_id=_cid,
+                                working_type="MARK_PRICE")
+                            log.warning(f"  ⚠️ {sym} ack kaybı telafi: algoId={_i2} "
+                                        f"clientAlgoId={_cid} exchange'te bulundu "
+                                        f"→ PLACED (çift SL gönderilmedi)")
+                        elif _s2 == "ABSENT":
+                            _sl_store.release(sym, _tok)
+                            log.critical(f"🚨 {sym} ack kaybı: emir KESİN YOK "
+                                         f"({_i2}) — epoch serbest, sonraki tur "
+                                         f"deneyecek; bu tur korumasız")
+                        else:
+                            log.critical(f"🚨 {sym} ack kaybı: durum UNKNOWN "
+                                         f"({_i2}) — PENDING korundu (çift-SL "
+                                         f"guard); doğrulanana dek alarm sürer")
+                    except Exception as _e2:
+                        log.warning(f"  {sym} ack-kaybı araştırması başarısız: "
+                                    f"{_e2} (PENDING korundu)")
     except Exception as e:
         log.exception(f"ensure_sl_coverage: {e}")
 
@@ -3284,6 +3655,14 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     _lev_ok, _lev_detail = leverage_policy.leverage_ok(dyn_lev, sl_pct)
     if not _lev_ok:
         log.warning(f"  atlandı: kaldıraç güvenli değil ({_lev_detail})")
+        return False
+
+    # FAZ18 (1.6): giriş marjini + koşullu-emir tamponu kullanılabilir marjini
+    # aşıyorsa giriş YOK — SL/TP yerleşimi marjin kıtlığında ack alamaz ve
+    # pozisyon korumasız kalır (Mission C F24 kalan kusurlar).
+    _mg_ok, _mg_why = conditional_margin_gate(available, target_notional, dyn_lev)
+    if not _mg_ok:
+        log.warning(f"  atlandı: {_mg_why}")
         return False
 
     # FAZ11 Katman 4: 12 adımlı uçuş öncesi kontrol (yalnız canlı; compare dokunulmaz).
@@ -4648,11 +5027,17 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
         except Exception as e:
             log.warning(f"  pre-open SL reconciliation hatasi: {e}")
 
-        sr = binance.place_algo_sl(symbol, trig, amount, side)
+        # FAZ18 (1.1/1.3): closePosition + MARK_PRICE + newClientAlgoId; exchange
+        # kimlikleri satıra yazılır (restart re-map/watchdog kanıtı).
+        _fcid = ("fa18" + symbol + str(int(time.time() * 1000)))[-36:]
+        sr = binance.place_algo_sl(symbol, trig, None, side,
+                                   close_position=True, client_algo_id=_fcid)
         algo_id = sr.get("algoId") if isinstance(sr, dict) else None
         if _oc_store is not None and _oc_tok is not None:
             if isinstance(sr, dict) and sr.get("algoId"):
-                _oc_store.mark_placed(symbol, _oc_tok)
+                _oc_store.mark_placed(symbol, _oc_tok, algo_id=algo_id,
+                                      client_algo_id=sr.get("clientAlgoId") or _fcid,
+                                      working_type="MARK_PRICE")
             else:
                 _oc_store.release(symbol, _oc_tok)   # failure -> reflect reality/retry
     # === /K-4 ===
@@ -4686,6 +5071,10 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
     if not sl_verified:
         log.critical(f"  🚨 SL DOGRULANAMADI! (durum={sl_state}, algoId={algo_id}). "
                      f"Pozisyon acil KAPATILIYOR!")
+        # FAZ1.2: denetim izi — doğrulanamama olayı ledger'a YAZILIR (additive).
+        record_protection_event(SL_LEDGER_DB, symbol, "SL_UNVERIFIED",
+                                f"state={sl_state} algoId={algo_id}",
+                                algo_id=algo_id)
         try:
             # Single close authority (inc13): coordinated reduce-only close, not a
             # raw market POST — idempotent + flat-confirmed + cross-process guarded.
@@ -4701,6 +5090,30 @@ def _finalize_open(binance, hb, symbol, side, amount, sl_pct, tp_pct, price, fil
         return False
     else:
         log.info(f"  ✅ SL dogrulandi (algoId={algo_id}, qty={amount})")
+
+    # FAZ18 (1.1 TP yolu): exchange-tarafı TAKE_PROFIT_MARKET (closePosition,
+    # MARK_PRICE). POLİTİKA anahtarı `faz18_tp_algo_enabled` kapalıysa
+    # (VARSAYILAN) HİÇ gönderilmez — kapanış davranışını değiştirir, operatör
+    # kararıdır. Açıkken yalnız SL DOĞRULANDIKTAN sonra; ack doğrulanamazsa
+    # pozisyon TP'siz kalabilir (SL koruması sürer) + denetim olayı.
+    if RISK_CONFIG.get("faz18_tp_algo_enabled") and sl_verified and tp_pct:
+        try:
+            _tp_trig = (price * (1 + tp_pct)) if side == 1 else (price * (1 - tp_pct))
+            _tp_trig = round(round(_tp_trig / tick) * tick, 8)
+            _tpcid = ("fa18tp" + symbol + str(int(time.time() * 1000)))[-36:]
+            _tp = binance.place_algo_tp(symbol, _tp_trig, side,
+                                        client_algo_id=_tpcid)
+            if isinstance(_tp, dict) and _tp.get("algoId"):
+                log.info(f"  ✅ TP algo yerleşti (algoId={_tp['algoId']}, "
+                         f"trig={_tp_trig}, MARK_PRICE/closePosition)")
+            else:
+                log.warning(f"  ⚠️ TP algo ack alınamadı ({_tp}) — TP'siz "
+                            f"pozisyon (SL koruması sürüyor)")
+                record_protection_event(
+                    SL_LEDGER_DB, symbol, "TP_PLACEMENT_FAILED", str(_tp)[:200],
+                    algo_id=_tp.get("algoId") if isinstance(_tp, dict) else None)
+        except Exception as e:
+            log.warning(f"  TP algo hatası {symbol}: {e}")
 
     if RISK_CONFIG.get("risk_guards_enabled", False):
         try:

@@ -74,7 +74,7 @@ class FakeBinance:
     def _get(self, path, params=None, signed=False):
         return []                          # klines empty -> ATR falls back to default
 
-    def place_algo_sl(self, sym, trig, qty, side):
+    def place_algo_sl(self, sym, trig, qty, side, **_faz18kw):
         self.placed.append({"sym": sym, "trig": trig, "qty": qty, "side": side})
         r = self._place_result
         return r(sym) if callable(r) else r

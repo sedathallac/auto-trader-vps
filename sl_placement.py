@@ -78,6 +78,13 @@ class SlPlacementStore:
         if cols and "gen" not in cols:
             conn.execute(
                 "ALTER TABLE sl_placements ADD COLUMN gen INTEGER NOT NULL DEFAULT 0")
+        # FAZ18 (1.3) additive: exchange-kimlik kolonları. PLACED artık YALNIZ
+        # ack ile değil, saklanmış algoId/clientAlgoId ile doğrulanabilir;
+        # restart re-map bu alanlarla yapılır. Eski satırlar NULL kalır.
+        for _c in ("algo_id", "client_algo_id", "working_type"):
+            if cols and _c not in cols:
+                conn.execute(
+                    f"ALTER TABLE sl_placements ADD COLUMN {_c} TEXT")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sl_placement_meta ("
             "id INTEGER PRIMARY KEY CHECK (id=1), gen INTEGER NOT NULL DEFAULT 0)")
@@ -216,19 +223,52 @@ class SlPlacementStore:
         finally:
             conn.close()
 
-    def mark_placed(self, symbol: str, token: str) -> None:
+    def mark_placed(self, symbol: str, token: str, algo_id=None,
+                    client_algo_id=None, working_type=None) -> None:
         """Epoch güvenliği için kritik durum geçişi: yeni gen alır. Böylece
         PENDING iken alınmış bir flat-snapshot, PLACED olduktan SONRA o satırı
-        eski kanıtla kapayamaz."""
+        eski kanıtla kapayamaz.
+
+        FAZ18 (1.3): exchange-doğrulamalı PLACED — çağıran YALNIZ ack (algoId)
+        sonrası gelmeli; algoId/clientAlgoId/workingType satıra KALICI olarak
+        yazılır (restart re-map ve watchdog denetimi bu kimlikle yapılır)."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._migrate(conn)
             conn.execute(
-                "UPDATE sl_placements SET state='PLACED', updated_at=?, gen=? "
+                "UPDATE sl_placements SET state='PLACED', updated_at=?, gen=?, "
+                "algo_id=COALESCE(?, algo_id), "
+                "client_algo_id=COALESCE(?, client_algo_id), "
+                "working_type=COALESCE(?, working_type) "
                 "WHERE symbol=? AND token=?",
-                (_now(), self._next_gen(conn), symbol, token))
+                (_now(), self._next_gen(conn),
+                 str(algo_id) if algo_id is not None else None,
+                 client_algo_id, working_type, symbol, token))
             conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def remap_algo_ids(self, symbol: str, token: str, algo_id,
+                       client_algo_id=None) -> bool:
+        """FAZ18 (1.3) idempotent re-map: PLACED satırının exchange-emir
+        kimliğini güncel gerçeğe taşır (ör. restart sonrası GET
+        algoOrder?clientAlgoId ile bulunan yeni/gerçek algoId). Epoch değişmez
+        — GEN ALZAMAZ (tetikçi yalnız token/state列'larını izler; bu UPDATE
+        gen'i oynatmaz, kapanış kanıtlarını geçersiz kılmaz)."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._migrate(conn)
+            cur = conn.execute(
+                "UPDATE sl_placements SET updated_at=?, "
+                "algo_id=COALESCE(?, algo_id), "
+                "client_algo_id=COALESCE(?, client_algo_id) "
+                "WHERE symbol=? AND token=? AND state='PLACED'",
+                (_now(), str(algo_id) if algo_id is not None else None,
+                 client_algo_id, symbol, token))
+            conn.execute("COMMIT")
+            return (cur.rowcount or 0) > 0
         finally:
             conn.close()
 
@@ -294,7 +334,8 @@ class SlPlacementStore:
         conn = self._connect()
         try:
             r = conn.execute(
-                "SELECT symbol, token, state, gen FROM sl_placements WHERE symbol=?",
+                "SELECT symbol, token, state, gen, algo_id, client_algo_id, "
+                "working_type FROM sl_placements WHERE symbol=?",
                 (symbol,)
             ).fetchone()
             return dict(r) if r else None
@@ -307,7 +348,8 @@ class SlPlacementStore:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT symbol, token, state, gen FROM sl_placements "
+                "SELECT symbol, token, state, gen, algo_id, client_algo_id, "
+                "working_type FROM sl_placements "
                 "WHERE state IN ('PENDING','PLACED')"
             ).fetchall()
             return [dict(r) for r in rows]
