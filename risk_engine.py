@@ -185,7 +185,30 @@ class RiskEngine:
         self.health_reason = None
         self.migration_required = False
         self._open_keys = set()
+        # F25: ardışık GEÇERSİZ equity okuması (0.0 sentinel = API hatası/BAN,
+        # ölçüm DEĞİL). Bellek-içi; süreç yeniden başlarsa sıfırlanır (fail-safe
+        # yön: tekrar üretime girerken öz-test ayrıca kanıt ister).
+        self._bad_equity_streak = 0
         self._load_state()
+
+    # ------------------------------------------------- M-2 DD hesaplama sözleşmesi
+    # dd_ratio ve dd_pct AYRI alanlar; peak-DD ile daily-DD AYRI formüllerdir ve
+    # birbirinin yerine kullanılmaz. current_drawdown mevcut dd_ratio taşıyıcısıdır.
+    @property
+    def dd_ratio(self):
+        """(peak_equity - current_equity) / peak_equity — peak tabanlı, oransal."""
+        return self.current_drawdown
+
+    @property
+    def dd_pct(self):
+        return self.current_drawdown * 100.0
+
+    @property
+    def daily_dd_ratio(self):
+        """(day_start_equity - current_equity) / day_start_equity — gün tabanı."""
+        if self.day_start_equity > 0:
+            return (self.day_start_equity - self.current_equity) / self.day_start_equity
+        return 0.0
 
     # ---------------------------------------------------------------- health
     def _block(self, reason):
@@ -470,16 +493,37 @@ class RiskEngine:
         self._save_state()
 
     # -------------------------------------------------------------- equity
+    def _record_bad_equity(self):
+        """F25 fail-safe: geçersiz/okunamayan equity TEK başına halt DEĞİLDİR
+        (health17 sözleşmesi: sahte halt yasak); ama ARDIŞIK N okuma "equity
+        okunamıyor" demektir → şüphede HALT (BLOK2 İŞ0.6). Halt nedeni daima
+        EQUITY_UNAVAILABLE'dır — sahte "Drawdown" hükmü üretilmez.
+        F25 kanıtı: 19-Kas 02:35:02Z tek sentinel 0.0 guard'sız kodda DD=%100
+        halt üretti; guard sonrası ise alarmsız sessizce sürdü (52 sentinel)."""
+        self._bad_equity_streak += 1
+        if (self._bad_equity_streak >= int(self.cfg.get("bad_equity_streak", 3))
+                and not self.is_halted):
+            self.is_halted = True
+            self.halt_reason = (f"EQUITY_UNAVAILABLE: ardışık "
+                                f"{self._bad_equity_streak} geçersiz equity "
+                                f"okuması (son bilinen eq={self.current_equity:.2f}, "
+                                f"peak={self.peak_equity:.2f})")
+            log.critical(f"🚨 DEVRE KESİCİ: {self.halt_reason}")
+            self._save_state()
+
     def update_equity(self, current_equity):
         """Equity güncelle; günlük baseline'ı KALICI ve tek seferlik kur."""
         try:
             eq = float(current_equity)
         except (TypeError, ValueError):
             self._block("equity geçersiz (sayısal değil)")
+            self._record_bad_equity()
             return False
         if not math.isfinite(eq) or eq <= 0:
             self._block(f"equity geçersiz ({current_equity!r})")
+            self._record_bad_equity()
             return False
+        self._bad_equity_streak = 0
         self.current_equity = eq
         if eq > self.peak_equity:
             self.peak_equity = eq
@@ -721,3 +765,79 @@ class RiskEngine:
         log.info(f"🌅 Günlük sayaçlar sıfırlandı ({self.last_reset_date}) "
                  f"halted={self.is_halted} streak={self.consecutive_losses}")
         return ok
+
+
+# ---------------------------------------------------------- F25 açılış öz-testi
+# F25: halt_reason "Drawdown %100.0", 418 BAN penceresinde gelen 0.0 SENTINEL'inin
+# guard'sız kodda ürettiği gerçek hesaplamaydı (02:35:02Z, üç birimde 04:39→05:35
+# +03 aralığında). Bu kapıya güven, kapının kendi doğruluğunu her açılışta
+# kanıtlamasına bağlıdır. Öz-test: ATILABİLİR DB'de üretimle AYNI hesaplama
+# fonksiyonunu (update_equity) çağırır, BAĞIMSIZ sabitlerle karşılaştırır;
+# üretim DB'sine ve risk geçmişine DOKUNMAZ, is_halted ile etkileşmez.
+_DD_SELFTEST_SERIES = (100.0, 120.0, 90.0, 96.0)
+# Bağımsız elle-türetilmiş beklenenler (testte monkeypatch ile bozulabilir —
+# öz-testin gerçekten doğruladığını kanıtlamak için):
+#   trough 90: (120−90)/120 = 0.25 · final: (120−96)/120 = 0.20
+#   daily (day_start=100): (100−96)/100 = 0.04
+_DD_SELFTEST_EXPECTED = {"dd_at_trough": 0.25, "dd_final": 0.20,
+                         "daily_dd_final": 0.04}
+
+
+_DD_SELFTEST_BOOTSTRAP_DDL = """
+CREATE TABLE risk_state (
+    id INTEGER PRIMARY KEY, peak_equity REAL, consecutive_losses INTEGER,
+    daily_trades INTEGER, daily_pnl REAL, last_reset_date TEXT,
+    is_halted INTEGER, halt_reason TEXT, updated_at TEXT
+);
+CREATE TABLE trade_ledger (
+    executor_id TEXT PRIMARY KEY, trading_pair TEXT, net_pnl_quote REAL,
+    closed_at TEXT, recorded_at TEXT, source TEXT
+);
+INSERT INTO risk_state (id, peak_equity, consecutive_losses, daily_trades,
+                        daily_pnl, is_halted)
+VALUES (1, 0, 0, 0, 0, 0);
+"""
+
+
+def _bootstrap_scratch_db(db_file):
+    """AÇIK bootstrap (FAZ16 sözleşmesi: startup'ta DDL YOK): tablo DDL +
+    risk_migration.apply ile FAZ16 kolonları. Yalnız atılabilir DB'lerde."""
+    import risk_migration
+    with sqlite3.connect(str(db_file)) as conn:
+        conn.executescript(_DD_SELFTEST_BOOTSTRAP_DDL)
+    risk_migration.apply(db_file, do_backup=False)
+
+
+def dd_selftest():
+    """(ok: bool, detail: str) — açılış DD-hesaplayıcı öz-testi.
+
+    Beklenen sabitlerden herhangi bir sapma → (False, neden). Çağıran taraf
+    False gördüğünde YENİ GİRİŞ KAPISINI kapatmalı ve alarm loglamalıdır;
+    is_halted veya kalıcı risk kayıtları DEĞİŞTİRİLMEZ (M-2)."""
+    import tempfile
+    scratch = Path(tempfile.mkdtemp(prefix="f25_dd_selftest_")) / "risk_selftest.db"
+    _bootstrap_scratch_db(scratch)
+    cfg = {"db_file": str(scratch),
+           "db_create": True, "max_drawdown_pct": 0.20}
+    try:
+        eng = RiskEngine(cfg)
+        dds = []
+        for e in _DD_SELFTEST_SERIES:
+            if not eng.update_equity(e):
+                return False, f"update_equity({e}) reddetti (beklenen: kabul)"
+            dds.append(eng.dd_ratio)
+        got = {"dd_at_trough": dds[2], "dd_final": dds[3],
+               "daily_dd_final": eng.daily_dd_ratio}
+        for k, want in _DD_SELFTEST_EXPECTED.items():
+            if abs(got[k] - want) > 1e-12:
+                return False, f"{k}: beklenen {want!r}, bulunan {got[k]!r}"
+        # Sentinel disiplini: 0.0 (API hata değeri) reddedilmeli, DD'yi BOZMALI;
+        # F25'in kendisi buydu — %100'luk halt tam olarak sentinelin DD'ye sızmasıydı.
+        dd_before = eng.dd_ratio
+        if eng.update_equity(0.0):
+            return False, "0.0 sentineli kabul edildi (reddedilmeliydi)"
+        if eng.dd_ratio != dd_before:
+            return False, "sentinel dd_ratio'yı değiştirdi"
+        return True, "DD hesaplayıcı öz-testi GEÇTİ (seri+sentinel+daily)"
+    except Exception as e:
+        return False, f"öz-test istisnası: {type(e).__name__}: {e}"
