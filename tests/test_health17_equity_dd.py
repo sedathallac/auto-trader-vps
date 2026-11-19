@@ -94,10 +94,15 @@ class TestInvalidEquityNoFalseHalt(Base):
         self.assertEqual(row, (3500.0, 0, 3500.0), "DB sahte değerle ezildi")
 
     def test_invalid_variants_all_blocked_no_halt(self):
-        r = self.engine()
-        r.update_equity(3500.0)
+        # F25 sözleşme güncellemesi: TEK geçersiz okuma asla halt değildir ve
+        # SAHTE halt (Drawdown hükmü) üretemez — bu değişmez. F25 fail-safe
+        # (BLOK2 İŞ0.6) ARDIŞIK 3 okunamayan equity'de EQUITY_UNAVAILABLE ile
+        # halt verir; bu ayrı bir sözleşmedir (test_faz18_f25_dd_gate.py).
+        # Varant-başına taze motor: "tek tetik halt üretmez" anlamı korunur.
         for bad in (None, " ", "abc", float("nan"), float("inf"), float("-inf"), -10.0):
             with self.subTest(bad=bad):
+                r = self.engine()
+                r.update_equity(3500.0)
                 self.assertFalse(r.update_equity(bad))
                 self.assertFalse(r.is_halted)
                 self.assertEqual(r.current_drawdown, 0.0)

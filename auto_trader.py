@@ -132,6 +132,7 @@ def _blocked_symbols():
 
 LIVE_BLOCKED_SYMBOLS = _blocked_symbols()
 _HB_AUTH_BROKEN = False  # FAZ14f: Hummingbot kimlik hatasi sonrasi surecte yeni emir denenmez
+_DD_SELFTEST_FAILED = False  # F25: DD hesaplayıcı öz-testi başarısızsa yeni giriş RED
 
 
 def _norm_symbol(s):
@@ -5211,6 +5212,17 @@ def run_once(dry_run=False):
     if not getattr(risk, "health_ok", True):
         log.critical(f"🚨 risk store sağlıksız ({risk.health_reason}) — yeni giriş kapalı, "
                      f"açık pozisyon yönetimi sürer")
+    # F25 açılış öz-testi: DD kapısı kendi doğruluğunu HER açılışta bilinen seride
+    # kanıtlamadan o kapıya güvenilmez. Atılabilir DB'de koşar; is_halted ve kalıcı
+    # risk kayıtlarına dokunmaz. Başarısızlık → yeni giriş kapısı kapalı + alarm.
+    _dd_ok, _dd_detail = risk_engine_mod.dd_selftest()
+    global _DD_SELFTEST_FAILED
+    _DD_SELFTEST_FAILED = not _dd_ok
+    if _dd_ok:
+        log.info("[RISK] F25 öz-testi: " + _dd_detail)
+    else:
+        log.critical(f"🚨 ALARM F25: DD hesaplayıcı öz-testi BAŞARISIZ — {_dd_detail} "
+                     f"| yeni girişler bu süreçte REDDEDİLECEK (fail-closed)")
     log.info(f"[RISK] db={risk.db_file} halted={getattr(risk, 'is_halted', None)} "
              f"streak={getattr(risk, 'consecutive_losses', None)} "
              f"daily_pnl={getattr(risk, 'daily_pnl', None)} "
@@ -5331,6 +5343,10 @@ def run_once(dry_run=False):
                      "(açık pozisyonların borsa SL koruma denetimi çalıştı)")
         return
 
+    if _DD_SELFTEST_FAILED:
+        # F25: kapının doğruluğu kanıtsızsa giriş yok (0.5). Alarm açılışta atıldı.
+        log.critical("🚨 F25: DD öz-testi başarısız — yeni giriş reddedildi")
+        return
     if _HB_AUTH_BROKEN:
         log.warning("Hummingbot kimlik doğrulaması bozuk — bu süreçte yeni emir denenmiyor "
                     "(live.env HB_USERNAME/HB_PASSWORD düzeltilip servis yeniden başlatılmalı)")
@@ -5360,7 +5376,13 @@ def run_once(dry_run=False):
             risk.update_exposure(eq, positions_for_exposure)
 
         if risk.is_halted:
-            log.critical(f"🚨 Sistem DURDU: {risk.halt_reason}")
+            # F25: dondurulmuş halt_reason her tick'te CANLI bağlamla yazılır —
+            # "Drawdown %100" ile "DD=%1.0" yan yana görünce kimse hangisinin
+            # şimdi-gerçeği olduğunu bilemiyordu.
+            log.critical(f"🚨 Sistem DURDU: {risk.halt_reason} | canlı: eq="
+                         f"{risk.current_equity:.2f} dd_pct={risk.dd_pct:.2f} "
+                         f"daily_dd_ratio={risk.daily_dd_ratio:.4f} "
+                         f"peak={risk.peak_equity:.2f}")
             return
     except Exception as e:
         # FAZ14u: FAIL-CLOSED. Eski kod yalnız uyarı basıp devam ediyordu; equity/DD/halt
