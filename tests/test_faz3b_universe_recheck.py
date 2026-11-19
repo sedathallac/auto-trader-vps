@@ -19,6 +19,25 @@ def _bars(prices, t0=T0):
     return ts, [p for p in prices], [p * 1.005 for p in prices]  # close=open*1.005
 
 
+class TestPartOrdering:
+    def test_part10_not_before_part2(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(RB, "KL1", str(tmp_path))
+        d = tmp_path / "SUSDT" / "1m"
+        d.mkdir(parents=True)
+        hdr = "open_time,open,high,low,close,volume,close_time,x,x,x,x,x"
+
+        def page(name, t_sec, px):
+            rows = [hdr]
+            for k in range(3):
+                ot = int((t_sec + k * BAR) * 1000)
+                rows.append(f"{ot},{px+k},1,1,{px+k},1,{ot},0,1,0,0,0")
+            (d / name).write_text("\n".join(rows) + "\n")
+        page("part2.csv", T0, 10.0)          # kronolojik olarak ÖNCE
+        page("part10.csv", T0 + 300, 20.0)   # sözlüksel olarak önce → OLMAZ
+        ts, o, c = RB.load_bars_1m("SUSDT")
+        assert ts == sorted(ts) and o[0] == 10.0 and o[3] == 20.0
+
+
 class TestWindowAndSignConvention:
     def test_long_uyen_r_pozitif(self):
         bars = _bars([100.0, 101.0, 102.0, 103.0])

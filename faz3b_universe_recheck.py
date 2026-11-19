@@ -65,16 +65,24 @@ BOOT_SEED = 20261120
 
 
 def load_bars_1m(sym):
-    ts, o, c = [], [], []
-    for f in sorted(glob.glob(f"{KL1}/{sym}/1m/part*.csv")):
+    """Sayısal sayfa sırası + savunmacı ts-sıralaması (part10≠part2 dersi)."""
+    import re
+    files = sorted(glob.glob(f"{KL1}/{sym}/1m/part*.csv"),
+                   key=lambda f: int(re.search(r"part(\d+)", f).group(1)))
+    trip = []
+    for f in files:
         for ln in open(f).read().splitlines()[1:]:
             p = ln.split(",")
             if len(p) < 6:
                 continue
-            ts.append(int(p[0]) / 1000.0)
-            o.append(float(p[1]))
-            c.append(float(p[4]))
-    return ts, o, c
+            trip.append((int(p[0]) / 1000.0, float(p[1]), float(p[4])))
+    trip.sort()
+    ded = []
+    for t, o, c in trip:
+        if ded and ded[-1][0] == t:
+            continue
+        ded.append((t, o, c))
+    return ([x[0] for x in ded], [x[1] for x in ded], [x[2] for x in ded])
 
 
 def window_edges(bars, t0, t1):
