@@ -62,7 +62,7 @@ class FakeBinance:
         return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
                                            can_trade=True, raw={})
 
-    def place_algo_sl(self, symbol, trig, qty, side):
+    def place_algo_sl(self, symbol, trig, qty, side, **_faz18kw):
         return self.sl_result            # -2021 -> algo_id None -> SL unverified
 
     def open_algo_orders_for(self, symbol):

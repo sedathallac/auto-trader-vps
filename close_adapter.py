@@ -27,7 +27,11 @@ SL_ABSENT = "ABSENT"     # successful, valid query: genuinely no SL for this pos
 SL_UNKNOWN = "UNKNOWN"   # timeout/exception/API error/malformed/wrong symbol -> HALT
 
 # Algo-order statuses that mean the SL is still live (protecting the position).
-_SL_LIVE = {"", "NEW", "WORKING", "ACTIVE", "LIVE"}
+# FAZ18 (1.8 partial-fill): PARTIALLY_FILLED hâlâ ÇALIŞAN bir stop'tur (kısmi
+# fill sonrası kalan miktar tetiklenmeyi bekler). Bu kümede eksikti → kısmen
+# dolmuş SL ABENT sayılıp İKİNCİ SL gönderilebilirdi (çift-SL riski);
+# verify_sl_ack (_SL_LIVE_STATUS) ile küme artık tutarlı.
+_SL_LIVE = {"", "NEW", "PARTIALLY_FILLED", "WORKING", "ACTIVE", "LIVE"}
 
 # Protective STOP side for a given position side (close direction).
 _PROTECTIVE_SIDE = {"LONG": "SELL", "SHORT": "BUY"}
