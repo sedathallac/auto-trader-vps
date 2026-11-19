@@ -154,8 +154,53 @@ class TestReconcileUnit(Base):
         c2.close()
         self.assertEqual(r1["backfilled"], 1)
         self.assertEqual(r2, {"backfilled": 0, "ambiguous": 0,
-                              "already_ok": 1, "invalid": 0},
+                              "already_ok": 1, "invalid": 0,
+                              "skipped_raced": 0},
                          "ikinci koşu no-op değil")
+
+    def test_dry_run_never_writes(self):
+        hb_ts = 1794971514.188374
+        naive = (datetime.fromtimestamp(hb_ts, timezone.utc)
+                 + timedelta(seconds=10800)).replace(tzinfo=None).isoformat()
+        self.seed("E1", naive)
+        conn = self.conn()
+        res = risk_engine.reconcile_naive_closed_at(
+            conn, {"E1": {"close_timestamp": hb_ts}}, dry_run=True)
+        conn.close()
+        self.assertEqual(res.get("would_backfill"), 1, res)
+        self.assertEqual(res["backfilled"], 0, "dry-run yazdı!")
+        self.assertIsNone(self.row("E1")[1], "dry-run epoch'u doldurdu")
+
+    def test_concurrent_epoch_fill_is_never_clobbered(self):
+        # SELECT ile UPDATE ARASINDA başka yazar epoch'u doldurduysa üç-koşullu
+        # UPDATE rowcount 0 verir → skipped_raced; mevcut epoch ASLA ezilmez.
+        hb_ts = 1794971514.188374
+        naive = (datetime.fromtimestamp(hb_ts, timezone.utc)
+                 + timedelta(seconds=10800)).replace(tzinfo=None).isoformat()
+        self.seed("E1", naive)
+        real = self.conn()
+
+        class _RacingConn:
+            def __init__(self):
+                self._armed = True
+
+            def execute(self, sql, params=()):
+                if (self._armed and sql.strip().upper().startswith("UPDATE")
+                        and "closed_at_epoch" in sql):
+                    self._armed = False
+                    # eşzamanlı yazarın COMMIT'ini taklit et (farklı değer)
+                    real.execute("UPDATE trade_ledger SET closed_at_epoch=999 "
+                                 "WHERE executor_id='E1'")
+                return real.execute(sql, params)
+
+            def close(self):
+                real.close()
+
+        res = risk_engine.reconcile_naive_closed_at(
+            _RacingConn(), {"E1": {"close_timestamp": hb_ts}})
+        self.assertEqual(res["skipped_raced"], 1, res)
+        self.assertEqual(res["backfilled"], 0)
+        self.assertEqual(self.row("E1")[1], 999, "eşzamanlı yazarın değeri ezildi")
 
     def test_old_schema_raises(self):
         conn = self.conn()
@@ -239,17 +284,33 @@ class TestSyncWiring(Base):
         at.sync_risk_engine(_FakeRisk(self.db), _HB(),
                             binance=_FakeBinance([]))
 
-    def test_complete_list_backfills(self):
+    def _enable_apply(self):
+        # Operatör-opt-in: canlı yazım yalnız env bayrağıyla (offline reconciliation
+        # modu varsayılan; kod incelemesi 2026-11-19).
+        os.environ["FAZ17_CLOSED_AT_BACKFILL"] = "1"
+        self.addCleanup(os.environ.pop, "FAZ17_CLOSED_AT_BACKFILL", None)
+
+    def test_apply_flag_backfills_on_complete_list(self):
+        self._enable_apply()
         rows = self._terminated()
         self._run_sync({"data": rows, "pagination": {
             "limit": 200, "has_more": False, "next_cursor": None,
             "total_count": len(rows)}})
         iso, epoch = self.row("E_NAIVE")
         self.assertAlmostEqual(epoch, self.hb_ts, 6,
-                               msg="tam listeda backfill çalışmadı")
+                               msg="APPLY modunda tam listeda backfill çalışmadı")
         self.assertEqual(iso, self.naive, "raw bozuldu")
 
+    def test_default_dry_run_writes_nothing(self):
+        rows = self._terminated()
+        self._run_sync({"data": rows, "pagination": {
+            "limit": 200, "has_more": False, "next_cursor": None,
+            "total_count": len(rows)}})
+        self.assertIsNone(self.row("E_NAIVE")[1],
+                          "varsayılan modda canlı ledger'a yazıldı (onaysız!)")
+
     def test_incomplete_list_never_touches(self):
+        self._enable_apply()  # APPLY açık olsa bile PARTIAL'da YAZILMAZ
         rows = self._terminated()
         self._run_sync({"data": rows})  # pagination yok → PARTIAL
         self.assertIsNone(self.row("E_NAIVE")[1],

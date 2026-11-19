@@ -210,5 +210,55 @@ class TestConcurrentBaseline(Base):
         self.assertIsNotNone(r2.day_start_equity_at)
 
 
+def _mp_worker(db, q):
+    """Gerçek AYRI SÜREÇ: kendi SQLite bağlantısı + RiskEngine'i."""
+    try:
+        import risk_engine as _re
+        cfg = dict(CFG, db_file=db)
+        r = _re.RiskEngine(cfg)
+        ok = r.update_equity(3400.0)
+        q.put(("ok" if ok else "false", None))
+    except Exception as e:  # noqa: BLE001 — test teşhisi
+        q.put(("error", f"{type(e).__name__}: {e}"))
+
+
+class TestMultiprocessBaseline(Base):
+    """§12.2 (gerçek çoklu-süreç): 4 AYRI process aynı DB'ye eşzamanlı
+    update_equity — tek tutarlı UTC baseline, hiç hata/yarış yok."""
+
+    def test_four_processes_one_baseline(self):
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        procs = [ctx.Process(target=_mp_worker, args=(self.db, q))
+                 for _ in range(4)]
+        # Ayrı proses'lerin SQLite write-lock kuyruğu timeout=30s içinde çözülür.
+        for p in procs:
+            p.start()
+        results = []
+        import time as _t
+        t0 = _t.time()
+        while len(results) < 4 and _t.time() - t0 < 60:
+            try:
+                results.append(q.get(timeout=2))
+            except Exception:
+                pass
+        for p in procs:
+            p.join(timeout=15)
+        self.assertEqual(len(results), 4, f"proses sonuçları eksik: {results}")
+        errs = [r for r in results if r[0] == "error"]
+        self.assertEqual(errs, [], f"proses hataları: {errs}")
+        self.assertTrue(all(r[0] == "ok" for r in results),
+                        f"update_equity False üreten proses: {results}")
+        row = self.raw("SELECT day_start_equity, peak_equity, is_halted "
+                       "FROM risk_state")
+        self.assertEqual(row[0], 3400.0, "baseline kayboldu/ezildi")
+        self.assertEqual(row[1], 3400.0)
+        self.assertFalse(row[2])
+        r2 = self.engine()
+        self.assertEqual(r2.day_start_equity, 3400.0)
+        self.assertIsNotNone(r2.day_start_equity_at)
+
+
 if __name__ == "__main__":
     unittest.main()

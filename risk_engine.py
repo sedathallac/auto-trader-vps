@@ -87,7 +87,8 @@ def parse_close_epoch(closed_at_epoch, closed_at):
 HB_NAIVE_TZ_OFFSET_SECONDS = 10800.0  # eski yazar UTC+03:00, yermesiz (F4: 27/27)
 
 
-def reconcile_naive_closed_at(conn, hb_rows_by_eid, tolerance=0.001):
+def reconcile_naive_closed_at(conn, hb_rows_by_eid, tolerance=0.001,
+                              dry_run=False):
     """FAZ17 §12.5 — naive `closed_at` satırlarına YALNIZ HB tam eşleşmesiyle
     `closed_at_epoch` backfill eder. Saat UYDURULMAZ.
 
@@ -104,18 +105,27 @@ def reconcile_naive_closed_at(conn, hb_rows_by_eid, tolerance=0.001):
         birebir kanıtlı, tam olmayan eşleşme tahmine çevrilmez).
     closed_at ORİJİNAL metni korunur (raw preserved); geçerli epoch'u olan
     satıra asla dokunulmaz → ikinci koşu no-op (idempotent). Çağıran YALNIZ
-    tamamlanma-kanıtlı (cursor/total_count) HB listesiyle çağırmalıdır.
-    Dönüş: {"backfilled", "ambiguous", "already_ok", "invalid"} sayaçları.
+    tamamlanma-kanıtlı (cursor/total_count) HB listesiyle çağırmalıdır
+    (PARTIAL listeyle çağrılırsa yanlış "ambiguous" üretir — sözleşme).
+
+    YARIŞ DİSİPLİNİ (kod incelemesi 2026-11-19): tek BEGIN IMMEDIATE
+    SELECT'TAN ÖNCE açılır (okunan durum ile yazım aynı yazma-uyumlu
+    kritik bölgede); her UPDATE ÜÇ koşulludur (executor_id + closed_at
+    orijinal metni + closed_at_epoch IS NULL) ve rowcount==1 doğrulanır —
+    eşzamanlı yazar epoch'u doldurduysa/satır değiştiyse rowcount 0 →
+    skipped_raced; mevcut epoch ASLA ezilmez.
+    Dönüş: {"backfilled","ambiguous","already_ok","invalid","skipped_raced"}.
     """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_ledger)")}
     if not {"executor_id", "closed_at", "closed_at_epoch"} <= cols:
         raise ValueError("trade_ledger şeması eski: closed_at/closed_at_epoch "
                          "kolonları yok — migration olmadan backfill yapılmaz")
-    res = {"backfilled": 0, "ambiguous": 0, "already_ok": 0, "invalid": 0}
-    rows = conn.execute("SELECT executor_id, closed_at, closed_at_epoch "
-                        "FROM trade_ledger").fetchall()
-    conn.execute("BEGIN IMMEDIATE")
+    res = {"backfilled": 0, "ambiguous": 0, "already_ok": 0, "invalid": 0,
+           "skipped_raced": 0}
+    conn.execute("BEGIN IMMEDIATE")  # TX SELECT'TEN ÖNCE (yarış incelemesi)
     try:
+        rows = conn.execute("SELECT executor_id, closed_at, closed_at_epoch "
+                            "FROM trade_ledger").fetchall()
         for eid, iso, epoch in rows:
             if parse_close_epoch(epoch, iso) is not None:
                 res["already_ok"] += 1
@@ -145,9 +155,21 @@ def reconcile_naive_closed_at(conn, hb_rows_by_eid, tolerance=0.001):
                 continue
             naive_as_utc = dt.replace(tzinfo=timezone.utc).timestamp()
             if abs((naive_as_utc - HB_NAIVE_TZ_OFFSET_SECONDS) - hb_ts) <= tolerance:
-                conn.execute("UPDATE trade_ledger SET closed_at_epoch=? "
-                             "WHERE executor_id=?", (hb_ts, eid))
-                res["backfilled"] += 1
+                if dry_run:
+                    # Offline reconciliation (varsayılan operatör-onay öncesi
+                    # kuru-koşu): eşleşme SADECE raporlanır, DB'ye yazılmaz.
+                    res["would_backfill"] = res.get("would_backfill", 0) + 1
+                    continue
+                cur = conn.execute(
+                    "UPDATE trade_ledger SET closed_at_epoch=? WHERE "
+                    "executor_id=? AND closed_at=? AND closed_at_epoch IS NULL",
+                    (hb_ts, eid, iso))
+                if cur.rowcount == 1:
+                    res["backfilled"] += 1
+                else:
+                    # Eşzamanlı yazar epoch'u doldurdu ya da satır değişti:
+                    # ASLA ezme — raced say, dokunma.
+                    res["skipped_raced"] += 1
             else:
                 res["ambiguous"] += 1
         conn.execute("COMMIT")

@@ -1219,7 +1219,9 @@ def _hb_executors_all(hb, page_limit=200, max_pages=50):
                          "kanıtı üretilemez")
         has_more = pg.get("has_more")
         total = pg.get("total_count")
-        if not isinstance(has_more, bool) or not isinstance(total, int) or total < 0:
+        if (not isinstance(has_more, bool) or isinstance(total, bool)
+                or not isinstance(total, int) or total < 0):
+            # total=True SÖZLEŞME İHLALİDİR (bool⊂int tuzağı): int sayılmaz.
             return out, (f"incomplete: pagination bozuk (has_more={has_more!r}, "
                          f"total_count={total!r})")
         if not has_more:
@@ -1296,18 +1298,27 @@ def sync_risk_engine(risk, hb, binance=None):
     # YALNIZ HB tam eşleşmesiyle epoch'lanır (executor_id + naive−10800s ==
     # hb.close_timestamp ±1ms); saat uydurulmaz, raw korunur, idempotent.
     # Buraya geliş = tamamlanma KANITI (err None); PARTIAL yukarıda döndü.
-    # Backfill mutabakat-kolaylaştırıcısıdır: hata sync hattını KIRAMAZ
-    # (bugünkü UNRESOLVED zaten güvenli varsayılan).
+    # OFFLINE RECONCILIATION MODU (kod incelemesi 2026-11-19): canlı tarihsel
+    # ledger değişikliği OPERATÖR ONAYI gerektirir → otomatik backfill
+    # KAPALI; yalnız FAZ17_CLOSED_AT_BACKFILL=1 ile açılır (varsayılan:
+    # kuru-koşu DRY-RUN — sayaçlar loglanır, DB'ye YAZILMAZ).
     try:
         _hb_by_eid = {e["executor_id"]: e for e in terminated
                       if isinstance(e.get("executor_id"), str) and e["executor_id"]}
+        _apply = os.environ.get("FAZ17_CLOSED_AT_BACKFILL", "0") == "1"
         _rconn = risk_engine_mod.connect_rw(db_path)
         try:
-            _rec = risk_engine_mod.reconcile_naive_closed_at(_rconn, _hb_by_eid)
+            if _apply:
+                _rec = risk_engine_mod.reconcile_naive_closed_at(_rconn, _hb_by_eid)
+            else:
+                _rec = risk_engine_mod.reconcile_naive_closed_at(
+                    _rconn, _hb_by_eid, dry_run=True)
         finally:
             _rconn.close()
-        if _rec["backfilled"] or _rec["invalid"]:
-            log.info(f"  §12.5 closed_at mutabakatı: {_rec}")
+        if _rec.get("backfilled") or _rec.get("invalid") or (
+                not _apply and _rec.get("would_backfill")):
+            log.info(f"  §12.5 closed_at mutabakatı "
+                     f"({'APPLY' if _apply else 'DRY-RUN'}): {_rec}")
     except Exception as _re:
         log.warning(f"  §12.5 closed_at mutabakatı atlandı: "
                     f"{type(_re).__name__}: {_re}")
