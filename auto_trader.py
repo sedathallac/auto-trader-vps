@@ -3159,10 +3159,15 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
             log.info(f"  atlandı: strateji teyidi ({_v6.reason})")
             return False
     except Exception as _e:
+        # A-10(b): yutulan istisna SINIF ADI + sinyal-kaybı işaretiyle loglanır;
+        # sessiz yutma izlenebilir kayba dönüşür (geniş refactor bilinçli yok).
+        _et = type(_e).__name__
         if mode == "on":
-            log.warning(f"  Faz6 teyit hatası, fail-closed (giriş yok): {_e}")
+            log.warning(f"  SİNYAL-BARI-KAYBI Faz6 teyit hatası [{_et}], "
+                        f"fail-closed (giriş yok): {_e}")
             return False
-        log.warning(f"  Faz6 strategy_engine hatası (compare, karar etkilenmedi): {_e}")
+        log.warning(f"  SİNYAL-BARI-KAYBI Faz6 strategy_engine hatası [{_et}] "
+                    f"(compare, karar etkilenmedi): {_e}")
     return True
 
 
