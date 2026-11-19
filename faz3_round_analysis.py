@@ -227,6 +227,20 @@ def main(argv=None):
     print(f"{'tur medyanı':<34}"
           f"{median(g_r)*100:>+10.4f}{-median(f_r)*100:>+10.4f}"
           f"{median(u_r)*100:>+10.4f}{median(ratios_cap)*100:>+10.4f}")
+    # BLOK3 A.7 kalıcı mutabakat: ağırlıklı satır BİLEŞENLERİ toplam
+    # oranlarına birebir oturmak ZORUNDA (wls_mean(x,en) ≡ Σx/Σen).
+    # Sapma varsa tablo GEÇERSİZ — exit 1. Σentry de raporlanır.
+    print(f"ağırlıklı-satır mutabakatı (Σx/Σentry, Σentry={tot_en:.2f}):")
+    bad = 0
+    for nm, xs, tot in (("gross", g_r, G), ("fee", f_r, F), ("funding", u_r, U),
+                        ("net", ratios_cap, N)):
+        a, b = wls_mean(xs, w) * 100, (0.0 if not tot_en else tot / tot_en * 100)
+        d = abs(a - b)
+        bad += d > 1e-9
+        print(f"  {nm:<8} wls={a:+.4f}%  Σ/toplam={b:+.4f}%  Δ={d:.2e} "
+              f"{'MUTABIK' if d <= 1e-9 else 'SAPMA — TABLO GEÇERSİZ'}")
+    if bad:
+        print("HATA: bileşenler toplamlara oturmuyor"); return 1
     print("== turnover-bazlı (ikinci tablo) ==")
     f_t = [r["fee"] / r["turnover"] for r in rounds]
     u_t = [r["funding"] / r["turnover"] for r in rounds]
