@@ -171,5 +171,44 @@ class TestDailyBaselineDiscipline(Base):
         self.assertIsNone(row[0])
 
 
+class TestConcurrentBaseline(Base):
+    """§12.2 — çok-yazarlı aynı DB: baseline TEK ve tutarlı yazılmalı,
+    hiçbir yazar hata almamalı/torn state görmemeli (BEGIN IMMEDIATE seri)."""
+
+    def test_concurrent_update_equity_single_consistent_baseline(self):
+        import threading
+        barrier = threading.Barrier(8)
+        results, errors = [], []
+
+        def worker():
+            try:
+                r = self.engine()  # her thread KENDİ bağlantısı/memarisi
+                barrier.wait(timeout=15)
+                ok = r.update_equity(3400.0)
+                results.append(ok)
+            except Exception as e:  # noqa: BLE001 — test teşhisi
+                errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [], f"eşzamanlı yazarda hata: {errors}")
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(results), "eşzamanlı update_equity False döndü")
+        row = self.raw("SELECT day_start_equity, day_start_equity_date, "
+                       "peak_equity, is_halted FROM risk_state")
+        from risk_engine import utc_day
+        self.assertEqual(row[0], 3400.0, "baseline torn/kayıp")
+        self.assertEqual(row[1], utc_day())
+        self.assertEqual(row[2], 3400.0)
+        self.assertFalse(row[3])
+        # Reload: bütün yazarlar AYNI kalıcı durumu görür (idempotent konsensüs).
+        r2 = self.engine()
+        self.assertEqual(r2.day_start_equity, 3400.0)
+        self.assertIsNotNone(r2.day_start_equity_at)
+
+
 if __name__ == "__main__":
     unittest.main()
