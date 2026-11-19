@@ -124,3 +124,15 @@ her pozisyonun yaşam süresini garanti kapsar (giriş-çıkış ≤4h; 1 günl�
 embargo ile komşu fold-barları çakışmaz).
 *Sonuç:* purge+embargo koşulu FİİLEN daha güçlüdür (gözlenen hiçbir exit
 embargo sınırını aşmaz); metrik tanımı değişmedi.
+
+**§D-4 — Sıfır-ATR barı: bar-bazında fail-closed atlama (canlı eşdeğeri).**
+*Neden:* ilk tam grid koşusunda PUMPUSDT taraması `structure_readings`
+içinde SIFIRA BÖLÜNME ile patladı (düz arşiv segmentinde ATR=0; üretim
+kodunda kusur-adayı — birleşik rapora yazıldı). Koşum-takımı bu hatayı
+BÜTÜN sembolü düşürerek ele aldı: bu, canlı davranışla UYUŞSUZDU — canlıda
+`_faz6_confirm` geniş try/except içindedir ve barı sessizce atlar.
+*Sonuç:* taramada bar-bazında try/except + sayaç (hata-bar'ları JSON meta
+`skipped_error_bars_total`); ilk grid JSON'u (PUMPUSDT'siz) GEÇERSİZ sayılır
+ve kanonik sonuç için tam grid YENİDEN koşular. Protokole/metriğe dokunuş
+yok; yalnız HATAYLA-ATMA semantiği canlıyla eşitlendi. Bu sapma kanonik
+koşudan ÖNCE yazıldı.

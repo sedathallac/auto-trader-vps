@@ -20,9 +20,9 @@ def _scan_one(args):
     try:
         sd = FB.SymbolData(sym, root, ym_from, ym_to)
         dec = FB.scan_symbol_decisions(sd, {}, ym_from, ym_to)
-        return sym, dec
+        return sym, dec, FB.SCAN_STATS.get(sym, {}).get("error_bars", 0)
     except Exception as e:
-        return sym, {"error": repr(e)}
+        return sym, {"error": repr(e)}, -1
 
 
 def _month(ms):
@@ -81,13 +81,14 @@ def main(argv=None):
         keep = {s.strip().upper() for s in a.only.split(",")}
         syms = [s for s in syms if s in keep]
     print("tara: %d sembol" % len(syms), flush=True)
-    decisions = {}
+    decisions, scan_err_bars = {}, {}
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
-        for sym, dec in ex.map(_scan_one, [(s, a.root, a.ym_from, a.ym_to)
-                                           for s in syms]):
+        for sym, dec, ebar in ex.map(_scan_one, [(s, a.root, a.ym_from, a.ym_to)
+                                                 for s in syms]):
             decisions[sym] = dec
+            scan_err_bars[sym] = ebar
             n = len(dec) if isinstance(dec, list) else dec
-            print("  %s → %s" % (sym, n), flush=True)
+            print("  %s → %s (hata-bar:%d)" % (sym, n, ebar), flush=True)
     err = {s: d for s, d in decisions.items() if isinstance(d, dict)}
     if err:
         print("HATALI:", list(err)[:5], err[list(err)[0]] if err else "")
@@ -97,7 +98,10 @@ def main(argv=None):
 
     results = {"meta": {"universe": len(syms), "window": [a.ym_from, a.ym_to],
                         "prereg_commit": "93d58d7", "grid_n": len(FB.GRID),
-                        "errors": list(err)}}
+                        "errors": list(err),
+                        "skipped_error_bars_total": sum(
+                            v for v in scan_err_bars.values() if v > 0),
+                        "deviations": ["D-1", "D-2", "D-3", "D-4"]}}
     trades_by_cfg, cfg_summ = {}, []
     all_closed_by_cfg = {}
     for gi, cfg in enumerate(FB.GRID):

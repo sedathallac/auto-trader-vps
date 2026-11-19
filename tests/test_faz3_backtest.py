@@ -73,19 +73,36 @@ class TestWindow:
 
 
 class TestScanDecisions:
-    def test_scan_shape_and_no_lookahead(self):
-        d15 = _series(1200, T0, M15, growth=0.0)
-        d1h = _series(300, T0, H1)
-        d4h = _series(75, T0, H4)
+    # trend_reading HER TF'de ≥210 çubuk ister → 4h için 250 çubuk = 41 gün,
+    # 15m'de karşılığı ≈ 4000 bar (ısıtma + n4h>60 eşiği aşılır).
+    BIG15, BIG1H, BIG4H = 4000, 1000, 250
+
+    def _big(self, growth=0.0):
+        return (_series(self.BIG15, T0, M15, growth),
+                _series(self.BIG1H, T0, H1, growth),
+                _series(self.BIG4H, T0, H4, growth))
+
+    def test_scan_shape_and_no_lookahead(self, monkeypatch):
+        import strategy_engine as se
+        d15, d1h, d4h = self._big()
+        calls = {"n": 0}
+        real_eval = se.evaluate
+
+        def counting(side, *a, **k):
+            calls["n"] += 1
+            return real_eval(side, *a, **k)
+
+        monkeypatch.setattr(se, "evaluate", counting)
         sd = _symb(d15, d1h, d4h)
         dec = FB.scan_symbol_decisions(sd, {}, "2024-01", "2026-10")
         assert isinstance(dec, list)
+        assert calls["n"] >= 4 * 50          # kapı mantığı GERÇEKTEN işletildi
         for x in dec[:50]:
             assert x["t"] == d15[x["i"] + 1][0]       # giriş zamanı = sonraki bar AÇILIŞI
             assert x["side"] in (1, -1)
             assert 0 <= x["fams"] <= 4
             assert x["atr_pct"] > 0
-        # her bar hem long hem short kaydı üretir (karar-öncesi çift)
+        # her işlenen bar hem long hem short kaydı üretir (karar-öncesi çift)
         by_i = {}
         for x in dec:
             by_i.setdefault(x["i"], set()).add(x["side"])
@@ -95,6 +112,27 @@ class TestScanDecisions:
         d15 = _series(1200, T0, M15)
         sd = _symb(d15, _series(300, T0, H1), _series(75, T0, H4))
         assert FB.scan_symbol_decisions(sd, {}, "2030-01", "2030-12") == []
+
+    def test_bar_exception_skipped_not_crash(self, monkeypatch):
+        # PUMPUSDT kusuru: düz segmentte ATR=0 → structure_readings SIFIRA
+        # BÖLÜNME. Canlı _faz6_confirm geniş try/except ile BARı atlar.
+        # Guard'ın canlı-eşdeğeri burada patlatan okumayla doğrulanır.
+        import strategy_engine as se
+        calls = {"n": 0}
+        real = se.structure_readings
+
+        def boom(cd):
+            calls["n"] += 1
+            if calls["n"] % 7 == 0:            # her 7. bar'da patla
+                raise ZeroDivisionError("float division by zero")
+            return real(cd)
+
+        monkeypatch.setattr(se, "structure_readings", boom)
+        d15, d1h, d4h = self._big()
+        sd = _symb(d15, d1h, d4h, sym="FLATUSDT")
+        dec = FB.scan_symbol_decisions(sd, {}, "2024-01", "2026-10")
+        assert isinstance(dec, list)                   # sembol ölmedi
+        assert FB.SCAN_STATS["FLATUSDT"]["error_bars"] > 0
 
 
 class TestSimulateTrades:

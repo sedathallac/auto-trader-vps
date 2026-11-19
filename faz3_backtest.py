@@ -116,6 +116,7 @@ def scan_symbol_decisions(sd, cfg_base, ym_from, ym_to):
     (veto?, n_families) karar çiftleri (min_fam 1 ve 2 ayrılmış olarak).
     DÖNER: list[dict(i, t_open_next, atr_pct, side, veto, fams)]."""
     out = []
+    stats = {"error_bars": 0}
     if len(sd.r15) < 260:
         return out
     trend_cache = {}
@@ -143,13 +144,21 @@ def scan_symbol_decisions(sd, cfg_base, ym_from, ym_to):
         t1, t4, cd1, cd4 = trend_cache[key]
         if t1 is None or t4 is None:
             continue
-        readings = (se.exhaustion_readings(main) + se.structure_readings(main)
-                    + se.volume_readings(main))
-        atr_arr = se.atr_series(main.h, main.l, main.c, 14)
-        atr_pct = (atr_arr[-1] / main.c[-1]) if atr_arr and main.c[-1] else None
-        if atr_pct is None or atr_pct <= 0:
+        # CANLI EŞDEĞERİ fail-closed: _faz6_confirm geniş try/except içindedir;
+        # örn. PUMPUSDT'nin düz (ATR=0) barlarında structure_readings SIFIRA
+        # BÖLÜNME ile patlıyor → canlıda bar sessizce atlanır, burada da ATLANIR
+        # (sembolün tamamı değil). hata_bars sayacı DEVIATIONS §D-4'e rapor.
+        try:
+            readings = (se.exhaustion_readings(main) + se.structure_readings(main)
+                        + se.volume_readings(main))
+            atr_arr = se.atr_series(main.h, main.l, main.c, 14)
+            atr_pct = (atr_arr[-1] / main.c[-1]) if atr_arr and main.c[-1] else None
+            if atr_pct is None or atr_pct <= 0:
+                continue
+            regime_adx = se.adx_last(main.h, main.l, main.c)
+        except Exception:
+            stats["error_bars"] += 1
             continue
-        regime_adx = se.adx_last(main.h, main.l, main.c)
         regime = se.regime_from_adx(regime_adx, cfg_base)
         trends = [t1, t4]
         for side in (1, -1):
@@ -169,6 +178,7 @@ def scan_symbol_decisions(sd, cfg_base, ym_from, ym_to):
             out.append({"sym": sd.sym, "i": i, "t": t_open_next,
                         "side": side, "veto": veto, "fams": fams,
                         "atr_pct": atr_pct})
+    SCAN_STATS[sd.sym] = stats
     return out
 
 
@@ -253,3 +263,6 @@ def simulate_portfolio(all_trades, equity0=1000.0, max_conc=3):
 GRID = [{"atr_sl_multiplier": a, "atr_tp_multiplier": t,
          "confirm_min_families": f}
         for a in (1.0, 1.5, 2.0) for t in (2.0, 3.0, 4.0) for f in (1, 2)]
+
+# tarama-başı teşhis (process-lokal; _scan_one tarafından toplanır).
+SCAN_STATS = {}
