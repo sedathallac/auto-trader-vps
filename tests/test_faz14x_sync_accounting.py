@@ -99,14 +99,17 @@ class SyncHarness(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _post(self, url, json=None, **k):
-        # 79bed1d sayfalama sözleşmesi: tamamlanma yalnız geçerli BOŞ sayfa ile
-        # kanıtlanır; aynı sayfanın tekrarı KISMİ demektir (fail-closed). Fixture
-        # tek-sayfa gerçeğini temsil eder: offset>0 -> boş sayfa. (Aynı uyarlama
-        # 79bed1d'nin kendi test_inc6_k2.py'sinde de yapıldı; assert değişmez.)
-        off = int((json or {}).get("offset") or 0)
-        if off:
-            return _Resp({"data": []}, self.search_status)
-        return _Resp(self.search_payload, self.search_status)
+        # FAZ17 gerçek HB sözleşmesi (canlı probe 2026-11-19): offset YOK SAYILIR;
+        # tamamlanma yalnız pagination={has_more:False,total_count} ile kanıtlanır.
+        # Fixture tek-sayfa-tam gerçeğini temsil eder: her istekte aynı sayfa +
+        # dürüst pagination. Hata biçimleri (data liste değil / status≠200)
+        # istemcide pagination'dan ÖNCE yakalanır — assertler aynen korunur.
+        body = dict(self.search_payload)
+        data = body.get("data")
+        if isinstance(data, list):
+            body["pagination"] = {"limit": max(1, len(data)), "has_more": False,
+                                  "next_cursor": None, "total_count": len(data)}
+        return _Resp(body, self.search_status)
 
     def run_sync(self):
         # Fixture uyarlamasi: 120sn recovery-throttle testler arasinda sifirlanir

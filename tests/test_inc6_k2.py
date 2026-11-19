@@ -87,9 +87,12 @@ class TestSyncRiskEngineK2Gate(unittest.TestCase):
                           "trading_pair": "SOL-USDT"}]}
 
         def _post(url, json=None, **kw):
-            # FAZ9 post-audit: sayfalama offset'e uyar; offset>0 → boş sayfa.
-            off = int((json or {}).get("offset") or 0)
-            return _FakeResp({"data": [] if off else term["data"]})
+            # FAZ17 gerçek HB sözleşmesi (canlı probe 2026-11-19): offset YOK
+            # SAYILIR; tek-sayfa-tam fixture dürüst pagination taşır.
+            data = term["data"]
+            return _FakeResp({"data": data, "pagination": {
+                "limit": max(1, len(data)), "has_more": False,
+                "next_cursor": None, "total_count": len(data)}})
 
         at.requests.post = _post
 

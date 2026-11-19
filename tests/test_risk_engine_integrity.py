@@ -541,12 +541,17 @@ class TestExecutorPagination(unittest.TestCase):
         return _HB()
 
     @staticmethod
-    def _resp(data, status=200):
+    def _resp(data, status=200, pagination=None):
         class _R:
             status_code = status
 
             def json(self):
-                return {"data": data}
+                body = {"data": data}
+                if pagination is not None:
+                    # FAZ17 gerçek HB sözleşmesi: pagination meta'sız yanıt
+                    # KISMİ'dir; meta vermeyen eski çağrılar kasıtlı öyledir.
+                    body["pagination"] = pagination
+                return body
 
         return _R()
 
@@ -561,8 +566,20 @@ class TestExecutorPagination(unittest.TestCase):
         rows = [{"executor_id": f"E{i}", "status": "TERMINATED"} for i in range(4)]
 
         def _post(url, json=None, **k):
-            off = int((json or {}).get("offset") or 0)
-            return self._resp(rows[off:off + 2])
+            # FAZ17 gerçek HB (canlı probe): offset ignored, ilerleme keyset
+            # `cursor` ile. Fixture = 2 satırlık İKİ sayfa, dürüst cursor;
+            # tamamlanma kanıtı has_more=False + total_count mutabakatı.
+            payload = json or {}
+            size = 2  # sunucu-temelli kısa sayfa: istenen limit'ten bağımsız
+            cur = payload.get("cursor")
+            start = int(cur) if isinstance(cur, str) and cur.isdigit() else 0
+            page = rows[start:start + size]
+            nxt = start + len(page)
+            has_more = nxt < len(rows)
+            return self._resp(page, pagination={
+                "limit": size, "has_more": has_more,
+                "next_cursor": str(nxt) if has_more else None,
+                "total_count": len(rows)})
 
         auto_trader.requests.post = _post
         out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=10)

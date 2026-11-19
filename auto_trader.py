@@ -1160,24 +1160,33 @@ def _mark_sl_epoch_closed(symbol, max_gen=None):
 def _hb_executors_all(hb, page_limit=200, max_pages=50):
     """POST /executors/search — tüm sayfalar. Dönüş: (list|None, error|None).
 
-    FAZ9 post-audit: sayfalama SÖZLEŞMESİ doğrulanamıyor (authoritative total/cursor
-    yok). Bu yüzden tamamlanma yalnız GEÇERLİ BOŞ SAYFA ile kanıtlanır:
-      * HTTP status, JSON, gövde ve `data` listesi doğrulanır.
-      * Offset, istenen `limit` ile değil API'nin DÖNDÜRDÜĞÜ sayfa boyuyla ilerler
-        (API page size'ı kırpabilir).
-      * Kısa ama boş olmayan sayfa tamamlanma kanıtı SAYILMAZ; sonraki sayfa beklenir.
-      * Aynı sayfa tekrar dönerse / yeni executor ID gelmezse `incomplete` döner.
-      * Geçersiz/eksik executor_id "çözümlenmemiş veri"dir; sessizce atılmaz.
-      * Güvenlik sınırına ulaşılırken sonuç `incomplete` döner.
-    `error` "incomplete:" ile başlıyorsa liste KISMİdir; çağıran girişi kapatmalıdır.
+    FAZ17 SÖZLEŞME DÜZELTMESİ (canlı HB probe kanıtı 2026-11-19 07:35–07:40Z):
+    Eski "authoritative total/cursor yok" varsayımı YANLIŞTI. Gerçek HB sözleşmesi:
+      * `offset`/`page`/`is_active` istek parametreleri YOK SAYILIR (offset=0/55/200
+        aynı 55 kaydı döndürdü) — offset tabanlı tamamlanma bu HB'de HİÇ kanıtlanamaz.
+      * Yanıttaki `pagination` nesnesi otoriterdir:
+        {"limit", "has_more": bool, "next_cursor": "<created_at>:<executor_id>"|None,
+         "total_count": int}; ilerleme İSTEK parametresi `cursor` ile (keyset turu
+        kanıtlı: limit=10 → 6 sayfa → 55 tekil id, has_more=False, toplam==total_count).
+    Tamamlanma KANITI (fail-closed, hepsi birden):
+      1) HTTP/JSON/gövde/`data` listesi geçerli; `pagination` sözlüğü var ve
+         has_more bool + total_count ≥0 int.
+      2) Son sayfa has_more=False.
+      3) Toplanan tekil executor_id sayısı == total_count (mutabakat).
+      4) Cursor ilerler (boş/aynı next_cursor YOK); keyset'te beklenmeyen çift
+         executor_id sözleşme ihlalidir; geçersiz/eksik id ATILMAZ, liste KISMİ döner.
+    Kanıt zincirinden ANY halka kırıkysa `incomplete:` — çağıran PARTIAL sayar ve
+    yeni girişi kapatır (79bed1d doktrini korunur; yalnız kanıtlı tamamlanma OK).
     """
     out, seen = [], set()
-    offset = 0
+    cursor = None
     for _page in range(max_pages):
+        payload = {"limit": page_limit}
+        if cursor:
+            payload["cursor"] = cursor
         try:
             resp = requests.post(f"{HB_API}/executors/search",
-                                 json={"limit": page_limit, "offset": offset},
-                                 auth=hb.auth, timeout=15)
+                                 json=payload, auth=hb.auth, timeout=15)
         except Exception as e:
             return None, f"request: {type(e).__name__}: {e}"
         if getattr(resp, "status_code", 200) != 200:
@@ -1191,24 +1200,43 @@ def _hb_executors_all(hb, page_limit=200, max_pages=50):
         data = body.get("data")
         if not isinstance(data, list):
             return None, "data missing/not a list"
-        if not data:
-            return out, None
-        new = 0
         for e in data:
             eid = e.get("executor_id") if isinstance(e, dict) else None
             if not isinstance(eid, str) or not eid:
                 # Çözümlenmemiş kayıt: atılmaz, listeye eklenir ve sonuç KISMİ olur.
                 out.append(e)
                 return out, (f"incomplete: geçersiz/eksik executor_id "
-                             f"(offset={offset})")
-            if eid not in seen:
-                seen.add(eid)
-                out.append(e)
-                new += 1
-        if new == 0:
-            return out, (f"incomplete: offset ilerlemiyor / yeni kayıt yok "
-                         f"(offset={offset}, {len(data)} kayıt)")
-        offset += len(data)
+                             f"(cursor={str(cursor)[:32]!r})")
+            if eid in seen:
+                # Keyset sayfalamada çift kayıt beklenmez: sözleşme ihlali → KISMİ.
+                return out, (f"incomplete: yinelenen executor_id {eid[:12]} "
+                             f"(cursor={str(cursor)[:32]!r})")
+            seen.add(eid)
+            out.append(e)
+        pg = body.get("pagination")
+        if not isinstance(pg, dict):
+            return out, ("incomplete: pagination meta yok — tamamlanma "
+                         "kanıtı üretilemez")
+        has_more = pg.get("has_more")
+        total = pg.get("total_count")
+        if not isinstance(has_more, bool) or not isinstance(total, int) or total < 0:
+            return out, (f"incomplete: pagination bozuk (has_more={has_more!r}, "
+                         f"total_count={total!r})")
+        if not has_more:
+            if len(out) != total:
+                return out, (f"incomplete: total_count mutabakatı ({len(out)} "
+                             f"toplanan ≠ {total})")
+            return out, None
+        nxt = pg.get("next_cursor")
+        if not isinstance(nxt, str) or not nxt:
+            return out, "incomplete: has_more=True ama next_cursor yok/geçersiz"
+        if nxt == cursor:
+            return out, (f"incomplete: cursor ilerlemiyor "
+                         f"({nxt[:40]!r})")
+        if not data:
+            # İlerleme meta'sı var ama kayıt yok: döngü kanıtı olmadan devam edilmez.
+            return out, "incomplete: boş sayfa ama has_more=True"
+        cursor = nxt
     return out, f"incomplete: sayfalama güvenlik sınırı ({max_pages} sayfa) aşıldı"
 
 
