@@ -183,6 +183,9 @@ def main(argv=None):
         "dsr_best": dsr,
         "pbo_all_incl_null": pbo,
         "bootstrap_ci_mean_net_best": ci,
+        "null1": {"n_trades": len(null_closed),
+                  "mean_net": round(sum(t["net_ret"] for t in null_closed) /
+                                    len(null_closed), 6) if null_closed else None},
         "bootstrap_ci_mean_net_null1": ci_null,
         "wf_folds": wf_rows,
     })
