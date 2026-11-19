@@ -519,20 +519,24 @@ class BinanceAPI:
         return None
 
     def get_balance(self, asset="USDT"):
+        """C.2 (BLOK3): okunamayan bakiye 0.0 DEĞİL **None** — F25 kök nedeni
+        hata-sentinel'i kaynakta keser (0.0 "ölçüm" sanılıp DD kapısını %100'e
+        çekiyordu). F25 guard'ı update_equity'de derinlemesine savunma durur."""
         r = self._get("/fapi/v2/balance", signed=True)
         if isinstance(r, list):
             for a in r:
                 if a["asset"] == asset:
                     return float(a["balance"])
-        return 0.0
+        return None
 
     def get_available_balance(self, asset="USDT"):
+        """C.2: hata → None (0.0 değil) — bkz. get_balance."""
         r = self._get("/fapi/v2/balance", signed=True)
         if isinstance(r, list):
             for a in r:
                 if a["asset"] == asset:
                     return float(a["availableBalance"])
-        return 0.0
+        return None
 
     def set_leverage(self, symbol, lev):
         return self._post("/fapi/v1/leverage", {"symbol": symbol, "leverage": lev})
@@ -5367,7 +5371,13 @@ def run_once(dry_run=False):
             return
     try:
         eq = binance.get_balance("USDT")
-        risk.update_equity(eq)
+        # C.2: None artık saydam sentinel. update_equity'ye YİNE geçirilir —
+        # F25 streak'i (EQUITY_UNAVAILABLE) beslenmeye devam eder; okunamayan
+        # equity ile bu turun geri kalanı (giriş dâhil) İVMESİZ geçilmez.
+        if not risk.update_equity(eq):
+            log.warning(f"⚠️ C.2/F25: equity okunamadı (get_balance→{eq!r}) — "
+                        "bu turda yeni giriş YOK (fail-closed)")
+            return
         log.info(f"💰 Equity={eq:.2} | DD=%{risk.current_drawdown*100:.2} | Peak={risk.peak_equity:.2}")
 
         # Exposure cap kontrolü
