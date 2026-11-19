@@ -95,4 +95,32 @@ iddiası İÇERMEZ.
 
 ## DEVIATIONS
 
-(yok)
+**§D-1 — p_fake kalibrasyonu: store=None (nötr prior 0.5).**
+*Neden:* `signal_outcomes` kalibrasyon verisi yalnız 13–19 Kas 2026 canlı
+çalışmasını içerir; 2024-01→2026-10 replay'inde kullanmak GELECEĞİ GÖRME
+(lookahead) olurdu. Nötr prior tek dürüst seçim.
+*Sonuç:* `evaluate`'a `p_fake=(0.5, False)` verilir; `p_real` eşikleri
+(confirm_min_p_real=0.40) nötr prior ile karar-verici değil ONAYLAYICI rol
+oynar — aile-veto/trend-veto yapısı değişmez. Karar yönü ağırlıklı olarak
+aile-eşleşmesi + trend-veto ile belirlenir (canlıdaki gibi).
+
+**§D-2 — Grid küçültüldü: 37 → 19 deneme.**
+*Neden:* ön-kayıttaki `min_coin_quality {0.45,0.55}` ekseni tarihsel olarak
+TEKRARLANAMAZ: coin-quality live order-book/spread anlık görüntüsüdür ve
+2024–2026 order-book arşivi indirilemiyor (data.binance.vision'da futures
+orderbook monthly arşivi YOK — 404, FAZ3 indirme günlüğü). Uydurma bir
+proxies kullanmak ön-kayıt ihlali olurdu.
+*Sonuç:* uygulanabilir grid = 3×3×2 = **18 config + 1 null-1 = 19 deneme**;
+DSR cezası N=19 ile hesaplanır (37'ye göre DAHA AZ muhafazakâr — rapor
+dürüstlük payı olarak bunu ayrıca belirtir). min_coin_quality'nin canlıda
+eleme yaptığı işlem sayısı bilinmediğinden backtest işlemleri canlı
+işlemlerden FARKLI kümedir; karşılaştırma yapılmaz, yalnız BACKTEST etiketi.
+
+**§D-3 — WF embargosu: max-96h yerine fiili 16-bar (4h) vade + 1 gün.**
+*Neden:* ön-kayıt embargoyu "SL/TP vade tavanı max 96 saat" demişti; ancak
+KOD-OLDUĞU-SPEC'te (TIME_LIMIT_SEC=14400) vade tavanı FİİLEN 4 saattir —
+96 saat canlıda hiç oluşmayan bir üst sınırdı. Embargo = 4 saat + 1 gün >
+her pozisyonun yaşam süresini garanti kapsar (giriş-çıkış ≤4h; 1 günlük
+embargo ile komşu fold-barları çakışmaz).
+*Sonuç:* purge+embargo koşulu FİİLEN daha güçlüdür (gözlenen hiçbir exit
+embargo sınırını aşmaz); metrik tanımı değişmedi.
