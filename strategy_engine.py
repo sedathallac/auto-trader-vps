@@ -12,6 +12,7 @@ ROLLER
 Yalnız KAPANMIŞ mumlar kullanılır (look-ahead yok): fetch son (oluşmakta olan) mumu atar.
 p_fake: signal_outcomes.db'deki (ayrı SQLite) sinyal×rejim Beta posterior'u; veri yoksa nötr 0.5.
 """
+import logging
 import math
 import os
 import random
@@ -21,6 +22,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+_LOG = logging.getLogger(__name__)
+# A-10 sayacı: ATR=0 nedeniyle atlanan bar sayısı (WARN logunda taşınır).
+_ATR_ZERO_BARS = 0
 
 CONFIRM_DEFAULTS = {
     "confirm_min_families": int(os.getenv("CONFIRM_MIN_FAMILIES", "1")),  # FAZ14j: 2 -> 1; 368 çağrının yalnız %2.4'ü 2+ aile üretiyordu, kapı yapısal olarak kilitliydi
@@ -373,7 +378,16 @@ def exhaustion_readings(cd: Candles):
 def structure_readings(cd: Candles):
     out = []
     atr = atr_series(cd.h, cd.l, cd.c, 14)
-    if atr:
+    if atr and atr[-1] <= 0:
+        # A-10: düz segmentte ATR=0 → tol=0 pivot kümelemesi px'e eşit seviye
+        # üretir ve `d / a` = 0.0/0.0 patlardı (PUMPUSDT arşiv replay kanıtı;
+        # canlıda _faz6_confirm yutuyordu → görünmez sinyal kaybı). TANIMLI
+        # davranış: yakınlık okuması YOK; WARN ile izlenebilir sinyal kaybı.
+        global _ATR_ZERO_BARS
+        _ATR_ZERO_BARS += 1
+        _LOG.warning("SİNYAL-BARI-KAYBI structure_readings: ATR=0 (bar #%d, "
+                     "px=%s) — sr_proximity atlandı", _ATR_ZERO_BARS, cd.c[-1])
+    elif atr:
         a = atr[-1]
         lv = swing_levels(cd.h[-120:], cd.l[-120:], 3, 3, tol=0.5 * a)
         px = cd.c[-1]
