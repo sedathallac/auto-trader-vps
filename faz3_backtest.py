@@ -50,6 +50,20 @@ def _ym(ms):
                                            datetime.timezone.utc).strftime("%Y-%m")
 
 
+class DataIntegrityError(ValueError):
+    """BLOK4 İŞ4: ts sıkı-artan/teksiz değil — sessiz düzeltme YASAK, koşu durur."""
+
+
+def assert_monotonic_unique(ts, src):
+    prev = None
+    for i, t in enumerate(ts):
+        if prev is not None and t <= prev:
+            raise DataIntegrityError(
+                f"İŞ4 ihlal {src}: ts[{i}]={t} <= ts[{i-1}]={prev} "
+                f"(sıkı-artan/teksizlik bozuk — sıralama/duplika sessiz düzeltilmez)")
+        prev = t
+
+
 def load_csv(path, ym_from, ym_to):
     """Binance arşiv CSV'si → klines-row listesi [t_ms,o,h,l,c,v,...].
     Header'lı/docsız iki biçimi de kabul eder; ay-penceresi süzülür (kapsam
@@ -89,6 +103,9 @@ class SymbolData:
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".csv"):
                 out.extend(load_csv(os.path.join(d, fn), "0000", "9999"))
+        # BLOK4 İŞ4: aylar birleşik seri sıkı-artan ve teksiz olmalı — ihlal
+        # sessiz sıralanmaz/dedup'lanmaz; DataIntegrityError ile koşu durur.
+        assert_monotonic_unique([r[0] for r in out], f"{sym}/{tf}")
         return out
 
     @staticmethod

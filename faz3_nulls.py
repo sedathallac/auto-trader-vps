@@ -38,6 +38,8 @@ def _null3_scan(args):
             e["side"] = rng.choice((1, -1))   # tek fark: yön yazı-tura
             flip.append(e)
         return sym, FB.simulate_trades(sd, flip, FB.GRID[3], rng_seed=7)
+    except FB.DataIntegrityError:
+        raise                       # İŞ4: veri bütünlüğü yutulmaz (exit≠0)
     except Exception as ex:
         return sym, {"error": repr(ex)}
 

@@ -21,6 +21,8 @@ def _scan_one(args):
         sd = FB.SymbolData(sym, root, ym_from, ym_to)
         dec = FB.scan_symbol_decisions(sd, {}, ym_from, ym_to)
         return sym, dec, FB.SCAN_STATS.get(sym, {}).get("error_bars", 0)
+    except FB.DataIntegrityError:
+        raise                       # İŞ4: veri bütünlüğü yutulmaz — koşu durur (exit≠0)
     except Exception as e:
         return sym, {"error": repr(e)}, -1
 
