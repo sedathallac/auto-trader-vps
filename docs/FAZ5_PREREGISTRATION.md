@@ -78,3 +78,49 @@ zararı kesin" dayanağı düştü; hükmün (d). H5'in yön-temeli artık NİTE
 (TERM2 negatifi + WF 18/18 negatifi), nicel-kanıtlı değil. Bu, H5'i yasaklamaz
 ama ön-kayıttaki tek gerekçe buysa **kapıya girmeden operatör "değer mi?"
 sorusunu tartışmalıdır** — kayıt gereği dürüstçe buraya yazılmıştır.
+
+## B.8 KAPSAM NOTU (BLOK6 İŞ5, 2026-11-20) — SONUÇ ÜRETİLMEDİ; kapı değişmez
+Kaynaklar: /fapi/v1/exchangeInfo TEK çağrı (X-MBX-USED-WEIGHT-1M=1 loglandı) +
+data.binance.vision S3-liste-claim'leri (statik; ağırlık yok; 2 sayfa
+pivot, 1080 sembol). Yalnız envanter sayılarıdır; hiçbir getiri/koşu sayısı
+yoktur.
+
+### 5.1 2020–2023 evren envanteri
+- Ay-bazında MEVCUT USDT-M sembolü (yalnız bugün-listedekilerin
+  onboardDate'inden — ALT SINIR): 2020: 10→70, 2021: 74→116,
+  2022: 117→135, 2023: 140→230.
+- DELİSTED: vision-tarihçi 1080 UM (923 USDT) − bugünkü exchangeInfo (953)
+  = **137 UM / 29 USDT tarihsel delist**. Delist'lerin AY aralıkları
+  çıkarılmadı (sembol-başı arşiv yoklaması gerekir) → yukarıdaki sayılar
+  alt sınır, üst-bracket = +29 (USDT). Survivorship yanlılığı B.2 kuralının
+  kendisi gibi aleyhe yorumlanır.
+- 42'lik KEŞİF evreninden 2024-01-01'den ÖNCE listelenmiş: **18/42**
+  (BTC/ETH/ADA/LINK/XRP/ZEC/BNB 2019-20; DOGE/KAVA 2020-07; AVAX/SOL/UNI
+  2020-09; NEAR/FIL 2020-10; AAVE 2020-10; ICP 2021-07; INJ 2022-08;
+  WLD 2023-07). 24/42 sembol 2020–23'te YOK (2025-26 listelenen türev/
+  hisse-simge dalgası). 42'nin hiçbiri delist değil (hepsi TRADING).
+- SONUÇ: B.2'nin birincil OOS'u fiilen **≤18-sembollük büyük-cap evreni**dir.
+
+### 5.2 Sembol-bölmeli holdout TASLAK (dondurulmuş kural; koşulsuz)
+- HAVUZ: TRADING + USDT-M + onboardDate ≤ 2024-01-01 + 42-dışı = **153
+  sembol** (2024-01→2026-10 boyunca kesintisiz-arşiv koşulu fetch anında
+  vision ay-listesiyle doğrulanır; eksik-aylı elenir).
+- SEÇİM (sonuç-okumadan ÖNCE dondu): 2024 medyan günlük alıntı-notional ile
+  ALT-ONDA BİRLİK (fake-likidite kuyruğu) elenir; kalanlardan medyan
+  alıntı-notional EN KÜÇÜK N=30 sembol (bağ: notional artan, sonra sembol
+  artan). KURAL DEĞİŞMEZ; N ve dilim sonradan ayarlanmaz.
+- BÖLME: zaman 2024-01→2026-10 (42-ler için KEŞİF dönemi; bu 30 sembol
+  KEŞİFTE HİÇ KULLANILMADI). BOOTSTRAP: gün-kümeli (BLOK4 İŞ2 tarifi,
+  B=10000, seed=20261120) + sembol-kümeli eş-rapor.
+
+### 5.3 Hangi H5 sorusuna hangi holdout
+- **2020–23 zaman-holdout'u (B.2/B.5):** "Ters kural, keşif-görmemiş BÜYÜK-
+  CAP zaman-serilerinde (≤18/42) kötümser maliyetle net>0 üretir mi?" —
+  BİRİNCİL karar verici; B.5 kapısının dörtlüsü yalnız buna uygulanır.
+- **2024–26 küçük-cap sembol-holdout'u (153→30):** "Hüküm likidite/cap
+  kesitine genelleniyor mu?" — ikincil/teyit katmanı: B.5 KABUL üretse bile
+  bu holdout tersine dönerse rapor "sadece büyük-cap'a genellenir" diye
+  DARALIR (tek-yönlü mandal: holdout kabuli asla kurtaramaz, yalnız
+  daraltır). Yeni kapı DEĞİLDİR; B.5'e ek karar hakkı yoktur.
+- Ön-kayıt kapısı değişmez; insan onayı ("H5 koş") olmadan hiçbir şey
+  koşmaz. Bu B.8 yalnız KAPSAM envanteridir.
