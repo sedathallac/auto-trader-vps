@@ -141,6 +141,13 @@ def sync_trades(binance, conn):
             else:
                 _since = int((time.time() - 24 * 3600) * 1000)
             since = _since
+            # BLOK10 (F-G): watermark YALNIZ güvenilir+tam senkronizasyonda
+            # ilerler. Eski kod: istisnada bile ilerletiyordu (183-192),
+            # error-dict "boş" sayılıyordu (error ≠ empty ihlali) ve 100×500
+            # sayfa limiti dolduğunda (backlog bitmemiş) yine ilerlerdi —
+            # kanıt DB'sinde TELAFİSİZ boşluk. Yeniden tarama güvenlidir
+            # (trade_id UNIQUE + INSERT OR IGNORE), boşluk değildir.
+            sync_ok = True
             try:
                 all_trades = []
                 from_id = None
@@ -149,16 +156,23 @@ def sync_trades(binance, conn):
                     if from_id is not None:
                         _params = {"symbol": sym, "limit": 500, "fromId": from_id}
                     _page_data = binance._get("/fapi/v1/userTrades", _params, signed=True)
-                    if not isinstance(_page_data, list) or not _page_data:
+                    if not isinstance(_page_data, list):
+                        sync_ok = False
+                        log.warning(f"{sym} userTrades güvensiz yanıt "
+                                    f"(error ≠ empty): {str(_page_data)[:120]}")
+                        break
+                    if not _page_data:
                         break
                     all_trades.extend(_page_data)
                     if len(_page_data) < 500:
                         break
                     from_id = int(_page_data[-1].get("id", 0)) + 1
-                trades = all_trades
-                if not isinstance(trades, list):
-                    continue
-                for t in trades:
+                else:
+                    # 100 sayfanın tamamı dolu geldi → backlog bitmedi.
+                    sync_ok = False
+                    log.warning(f"{sym}: sayfa limiti (100×500) doldu — "
+                                f"watermark TUTULDU, kalan sonraki turdan")
+                for t in all_trades:
                     try:
                         c.execute("""INSERT OR IGNORE INTO trades
                             (trade_id, symbol, order_id, side, price, qty, quote_qty,
@@ -181,7 +195,11 @@ def sync_trades(binance, conn):
                     except Exception as e:
                         log.warning(f"Trade insert hatası: {e}")
             except Exception as e:
+                sync_ok = False
                 log.warning(f"{sym} userTrades: {e}")
+            if not sync_ok:
+                log.warning(f"{sym}: trades sync EKSİK — watermark KORUNDU")
+                continue
             # P1-1: update per-symbol watermark after processing
             try:
                 from datetime import datetime as _dt, timezone as _tz
@@ -220,6 +238,8 @@ def sync_orders(binance, conn):
             else:
                 _since = int((time.time() - 24 * 3600) * 1000)
             since = _since
+            # BLOK10 (F-G): sync_trades ile aynı watermark doktrini.
+            sync_ok = True
             try:
                 all_orders = []
                 order_from_id = None
@@ -228,16 +248,22 @@ def sync_orders(binance, conn):
                     if order_from_id is not None:
                         _params = {"symbol": sym, "limit": 500, "orderId": order_from_id}
                     _page_data = binance._get("/fapi/v1/allOrders", _params, signed=True)
-                    if not isinstance(_page_data, list) or not _page_data:
+                    if not isinstance(_page_data, list):
+                        sync_ok = False
+                        log.warning(f"{sym} allOrders güvensiz yanıt "
+                                    f"(error ≠ empty): {str(_page_data)[:120]}")
+                        break
+                    if not _page_data:
                         break
                     all_orders.extend(_page_data)
                     if len(_page_data) < 500:
                         break
                     order_from_id = int(_page_data[-1].get("orderId", 0)) + 1
-                orders = all_orders
-                if not isinstance(orders, list):
-                    continue
-                for o in orders:
+                else:
+                    sync_ok = False
+                    log.warning(f"{sym}: sayfa limiti (100×500) doldu — "
+                                f"watermark TUTULDU, kalan sonraki turdan")
+                for o in all_orders:
                     try:
                         _pre_exists = c.execute(
                             "SELECT 1 FROM orders WHERE order_id=?", (o.get("orderId"),)
@@ -267,7 +293,11 @@ def sync_orders(binance, conn):
                     except Exception as e:
                         log.warning(f"Order insert hatası: {e}")
             except Exception as e:
+                sync_ok = False
                 log.warning(f"{sym} allOrders: {e}")
+            if not sync_ok:
+                log.warning(f"{sym}: orders sync EKSİK — watermark KORUNDU")
+                continue
             # P1-1: update per-symbol watermark after processing
             try:
                 from datetime import datetime as _dt, timezone as _tz
