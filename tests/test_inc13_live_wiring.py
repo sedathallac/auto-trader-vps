@@ -68,6 +68,19 @@ class FakeBinance:
     def open_algo_orders_for(self, symbol):
         return []
 
+    def _get(self, path, params=None, signed=False):
+        # BLOK10 (F-C) harness onarımı: calculate_atr klines için _get
+        # çağırır; fake'de _get YOKTU → AttributeError calculate_atr'ın
+        # geniş except'inde yutuluyor ve test yeşilleri GİZLİCE uydurma
+        # 0.02 fallback'ine yaslanıyordu (BLOK10 F-C bulgusunun ta kendisi).
+        # Bu seri tam %2 ATR üretir (TR=1.6 / close=80): geometri sonuçları
+        # eski fallback ile SAYISAL AYNI — davranış kayması yok, harness
+        # artık veri veriyor.
+        if path == "/fapi/v1/klines":
+            return [[1_700_000_000_000 + i * 900_000, "80", "80.8", "79.2",
+                     "80", "100"] for i in range(15)]
+        return []
+
     def order_book(self, symbol, limit=20):
         # FAZ11 kalite kapısı için gerçekçi defter: 2.5 bps spread, ~800k USDT derinlik.
         return {"bids": [["79.99", "5000"]], "asks": [["80.01", "5000"]]}

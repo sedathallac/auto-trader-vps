@@ -3462,6 +3462,14 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # ATR-bazlı dinamik SL/TP — FAZ11 Katman 3: sizing_policy.suggest_sl_tp
     atr_pct = calculate_atr(binance, symbol, interval="15m", period=14)
     if atr_pct is None:
+        if not dry_run:
+            # BLOK10 (F-C): canlı emir UYDURMA geometriyle açılamaz — ATR,
+            # SL/TP mesafesinin ve pozisyon boyutunun girdisidir; veri akışı
+            # yokken %2 varsayımıyla risk almak fail-open'dı → fail-closed.
+            log.warning("  atlandı: ATR alınamadı — canlı giriş yok (uydurma "
+                        "geometriyle pozisyon açılmaz); dry_run/compare devam")
+            return False
+        # dry_run/compare: veri toplama hattı DEĞİŞMEZ (BLOK2-9 doktrini).
         atr_pct = 0.02
         log.warning("  ATR alınamadı, fallback %2.0 kullanılıyor")
 
