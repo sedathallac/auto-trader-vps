@@ -2,6 +2,10 @@
 
 Kilit sözleşmeler: (1) YALNIZ GET; (2) SL-yokluk hükmü yalnız algo service
 girdisinden (A-1); (3) hiçbir düzeltme/eylem yok; (4) deterministik birleştirme.
+
+FAZ18-B5 güncellemesi: E1 sembolsüz tarama (openAlgoOrders+openOrders tek
+çağrı), D1 canlı-pid-env okuma yolu kaldırıldı (--pid yok; BINANCE_KEY/
+BINANCE_SECRET + EnvironmentFile), verdict final satırı OK/FINDINGS/INCOMPLETE.
 """
 import ast
 import pathlib
@@ -34,7 +38,8 @@ class TestReadOnlyGuarantee:
         for banned in ("_post", "requests.post", "'POST", '"POST',
                        "DELETE", "PUT", "place_algo_sl", "cancel",
                        "algoOrder/place", "algoOrder/update",
-                       "algoOrder/cancel"):
+                       "algoOrder/cancel",
+                       "/proc", "_env_from_proc"):   # D1: pid-environ yolu ölü
             assert banned not in code, f"kodda yasak çağrı izi: {banned!r}"
 
     def test_no_request_method_override(self):
@@ -49,6 +54,8 @@ class TestReadOnlyGuarantee:
                     "Request(..., method=...) bulundu — GET garantisi bozulur"
 
     def test_collect_uses_only_get_contract(self):
+        # E1: sembolsüz tekil çağrılar — positionRisk + openAlgoOrders +
+        # openOrders; sembol parametresi YOK (drill-down ayrı yol).
         calls = []
 
         def fake_get(path, params=None):
@@ -56,10 +63,12 @@ class TestReadOnlyGuarantee:
             if path.endswith("positionRisk"):
                 return [{"symbol": "BTCUSDT", "positionAmt": "0.1"}]
             return []
-        pos, algos = OR.collect(fake_get, [], sleep=lambda s: None)
+        pos, algos, orders = OR.collect(fake_get, [], sleep=lambda s: None)
         assert all(c[0] == "GET" for c in calls)
         assert {c[1] for c in calls} == {"/fapi/v2/positionRisk",
-                                         "/fapi/v1/openAlgoOrders"}
+                                         "/fapi/v1/openAlgoOrders",
+                                         "/fapi/v1/openOrders"}
+        assert all(not c[2] for c in calls), "sembolsüz taramada parametre yok"
 
 
 class TestAnalyze:
@@ -99,7 +108,8 @@ class TestAnalyze:
         led = [{"symbol": "BTCUSDT", "token": "t", "state": "PLACED",
                 "algo_id": "9", "client_algo_id": "c", "gen": 1}]
         out = OR.analyze(self.POS, algos, led)
-        assert out["verdict"].startswith("VERDICT: TEMİZ")
+        # E3: final verdict sınıfı OK (final satır sözleşmesi).
+        assert out["verdict"].startswith("VERDICT: OK")
 
     def test_zero_amt_not_position(self):
         out = OR.analyze(self.POS, {"BTCUSDT": [
@@ -118,5 +128,11 @@ class TestAnalyze:
 
 
 class TestCliSafety:
-    def test_main_requires_pid(self, capsys):
-        assert OR.main(["--db", "/nonexistent"]) == 2   # pid yok → erken çıkış
+    def test_main_requires_keys_not_pid(self, monkeypatch, capsys):
+        # D1: --pid/pid-environ yolu öldü; anahtarlar BINANCE_KEY/BINANCE_SECRET.
+        monkeypatch.delenv("BINANCE_KEY", raising=False)
+        monkeypatch.delenv("BINANCE_SECRET", raising=False)
+        assert OR.main(["--db", "/nonexistent"]) == 2   # anahtar yok → erken çıkış
+        out = capsys.readouterr()
+        assert "BINANCE_KEY" in (out.err + out.out)
+        assert "--pid" not in (out.err + out.out)

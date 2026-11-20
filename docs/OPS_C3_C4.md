@@ -49,3 +49,34 @@ insana aittir; bu belge yalnız hazırlıktır.
   listesinde TÜMÜYLE yazılı teslim edilir — burada UYGULAMA yok).
 Rollback tetikleyicileri: öz-test FAIL, is_halted değişimi, 418, yeni equity
 sentinel'i. Rollback sonrası HALTED korunduğu için pazarlık gerekmez.
+
+## E5 — FAZ18-B5 notu: tools/orphan_report.py sertleştirme (UYGULANDI — kod, deploy DEĞİL)
+C.3/2'deki "**/proc/<pid>/environ anahtar okuma yolu kaldırılsın** (öneri;
+UYGULANMADI)" maddesi BU blokta UYGULANDI: pid-environ okuma yolu tamamen
+silindi; anahtar artık YALNIZ `--env-file` (systemd EnvironmentFile) ya da
+süreç ortamından alınır — botun gerçek adları `BINANCE_KEY`/`BINANCE_SECRET`
+(kanıt: auto_trader.py:5240), anahtar argv'de/yazdırmada asla görünmez.
+Aynı blokta araç sözleşmesi: **E1** sembolsüz tekil tarama (GET
+openAlgoOrders W=40 + GET openOrders W=40 + positionRisk W=5; sembol
+parametresi yalnız `--symbol` derinleşmesinde); **E2** GET
+/sapi/v1/account/apiRestrictions ön-kontrolü — `enableWithdrawals=true` ya
+da `ipRestrict=false` ise Araç DURUR (exit 4; `--skip-preflight` yalnız mock
+test); **E3** final satır `VERDICT: OK|FINDINGS|INCOMPLETE` → exit 0/1/2,
+exit 3 = 418/429 (Retry-After loglanır, retry YOK), "N/N sorgu başarılı" +
+ sorgu başına `X-MBX-USED-WEIGHT-1M` logu, `--max-weight` (varsayılan 300)
+bütçe aşımında kalan sorgular koşmaz → INCOMPLETE; **D2/D5** TP≠SL ve
+SL-geçerlilik denetimi (algoStatus NEW/PARTIALLY_FILLED dışı canlı sayılmaz
+— F20 muhasebe körlüğü kapandı). Salt-GET garantisi ve ledger mode=ro +
+PRAGMA şema doğrulaması testlerle kilitli (tests/test_faz18_orphan_report*.py).
+C.4 "Her adım öncesi" maddesindeki tek-canlı-okuma komutu yeni bayraklarla
+koşulur: `python3 -m tools.orphan_report --env-file /etc/audit_api_key`.
+
+E5 NOTU (olduğu gibi eklendi): Binance FUTURES tarafında salt-okunur API
+izin ayrımı sınırlıdır — futures anahtarında "yalnız-oku" izni fiilen
+çalışmayabilir (trade izinleri kaldırılsa bile uç nokta erişimi aynıdır;
+para çekme zaten futures anahtarında yoktur). Bu durumda araç, anahtarı
+kendi taşımadan salt-GET sözleşmesiyle sınırlı kalmalıdır; alternatif:
+BOT'UN KENDİ watchdog çıktısını (pozisyon↔algo-SL eşleme durumu) periyodik
+olarak DOSYAYA YAZMASI ve denetimin o dosyayı okuması — canlı hesaba hiçbir
+istek atılmadan aynı hüküm üretilir. (Not eklenir; araç bu amaçla
+DEĞİŞTİRİLMEDİ.)
