@@ -7,7 +7,29 @@ KULLANIM (VPS, FAZ18-B5):
 
 ÇIKIŞ PROTOKOLÜ (E3): final satır "VERDICT: OK|FINDINGS|INCOMPLETE" →
   exit 0/1/2;  exit 3 = 418/429 (Retry-After loglanır, ANINDA dur, retry YOK);
-  exit 4 = anahtar politikası salt-okur değil (E2 ön-kontrolü: RET).
+  exit 4 = anahtar politikası KURAL TABLOSUNDA KIRMIZI satır (E2-B6 ön-
+  kontrolü: RET; tablo aşağıda ve PREFLIGHT_RULES'ta).
+
+E2-B6 PREFLIGHT KURAL TABLOSU (BLOK6 İŞ2) — /sapi/v1/account/apiRestrictions
+satırları artık tek bir bildirimsel tabloda (flag, tetik, aksiyon, mesaj):
+
+  enableWithdrawals=True          → RED    RET, exit 4 (davranış aynı)
+  ipRestrict != True              → RED    RET, exit 4; fail-closed: alan
+                                           yoksa/Doğru değilse de KIRMIZI
+  enableInternalTransfer=True     → UYARI  bayrak İSİMLİ WARNING loglanır,
+                                           araç koşmaya devam eder (exit 4 YOK)
+  enableMargin=True               → UYARI  aynı
+  enableSpotAndMarginTrading=True → UYARI  aynı
+  enableFutures=True              → KABUL  SESSİZ: ne uyarı ne RET.
+       GEREKÇE: futures API erişimi (positionRisk/openAlgoOrders) anahtarın
+       enableFutures=True olmasını ZORUNLU kılar — KABUL edilmezse araç hiç
+       koşamaz. KALAN RİSK (kabul edilmiştir): anahtar emir yerleştirme
+       gücü taşır; bu araç salt-GET olmakla birlikte anahtarın kendisi
+       yazma kapasitelidir. Azaltımlar: ipRestrict KIRMIZI satırı (IP
+       beyaz-listesi zorunlu) + anahtarın yalnız bu aracın env-file'ında
+       durması.
+
+Tablonun tek gerçeği kodda: PREFLIGHT_RULES + preflight_verdict().
 
 ANAHTARLAR (D1): botun GERÇEK env adları BINANCE_KEY/BINANCE_SECRET — kanıt:
   auto_trader.py:5240  `bk = os.environ.get("BINANCE_KEY")`.  Anahtar
@@ -60,6 +82,51 @@ LIVE_ORDER_STATUS = ("NEW", "PARTIALLY_FILLED", "WORKING")
 LEDGER_TABLE = "sl_placements"
 # _read_ledger'in SELECT ettiği kolonlar (D4 PRAGMA doğrulaması bunları ister).
 LEDGER_COLS = ("symbol", "token", "state", "algo_id", "client_algo_id", "gen")
+
+# --------------------------------------------------------- E2-B6 kural tablosu
+# Modül docstring'indeki tablonun kod karşılığı (tek gerçek, satır satır
+# incelenabilir). Satır sözleşmesi: (flag, tetik, aksiyon, mesaj)
+#   tetik "_TRUE"     → bayrak is True iken ateşler (açık yetki = risk),
+#   tetik "_NOT_TRUE" → bayrak is True OLMAYINCA ateşler (fail-closed:
+#                       alan yoksa/bozuksa da ateşler — ipRestrict),
+#   aksiyon RED → RET + exit 4; UYARI → stderr UYARI satırı, koşulur;
+#                 KABUL → hiçbir şey üretmez (sessiz kabul).
+RED, UYARI, KABUL = "RED", "UYARI", "KABUL"
+_TRUE, _NOT_TRUE = "true", "not_true"
+
+PREFLIGHT_RULES = [
+    ("enableWithdrawals", _TRUE, RED,
+     "para çekme açık — anahtar salt-okur sayılmaz"),
+    ("ipRestrict", _NOT_TRUE, RED,
+     "IP beyaz-listesi kapalı ya da doğrulanamadı — C.3 şartı"),
+    ("enableInternalTransfer", _TRUE, UYARI,
+     "internal transfer açık — bulgu DEĞİL, uyarı; koşulur"),
+    ("enableMargin", _TRUE, UYARI,
+     "margin transfer açık — bulgu DEĞİL, uyarı; koşulur"),
+    ("enableSpotAndMarginTrading", _TRUE, UYARI,
+     "spot+margin trading açık — bulgu DEĞİL, uyarı; koşulur"),
+    ("enableFutures", _TRUE, KABUL,
+     "futures erişimi aracın çalışması için zorunlu — KABUL "
+     "(kalan risk docstring'de belgelidir)"),
+]
+
+
+def preflight_verdict(ar):
+    """E2-B6: apiRestrictions sözlüğünü PREFLIGHT_RULES'tan geçir.
+    Saf fonksiyon (I/O yok): (red_lines, warning_lines) döner.
+    red_lines DOLUYSa çağıran RET verip exit 4 vermeli; warning_lines
+    stderr'e UYARI olarak yazılır ve koşulur. KABUL satırı (enableFutures)
+    hiçbir satır ÜRETMEZ — ne uyarı ne RET."""
+    red_lines, warning_lines = [], []
+    for flag, when, action, msg in PREFLIGHT_RULES:
+        if action == KABUL:
+            continue                          # sessiz kabul: asla uyarma/RET
+        v = ar.get(flag)
+        fires = (v is True) if when == _TRUE else (v is not True)
+        if fires:
+            line = f"{flag}={v!r}: {msg}"
+            (red_lines if action == RED else warning_lines).append(line)
+    return red_lines, warning_lines
 
 
 class QueryError(RuntimeError):
@@ -472,13 +539,17 @@ def main(argv=None, transport=None):
                 run.incomplete.setdefault(
                     "apiRestrictions", "salt-okur anahtar politikası "
                                        "doğrulanamadı")
-            elif (ar.get("enableWithdrawals") is True
-                  or ar.get("ipRestrict") is not True):
-                print("RET: anahtar politikası salt-okur DEĞİL "
-                      f"(enableWithdrawals={ar.get('enableWithdrawals')} "
-                      f"ipRestrict={ar.get('ipRestrict')}) — C.3 şartı; "
-                      "DURUYORUM.", file=sys.stderr)
-                return 4
+            else:
+                # E2-B6: RET/UYARI kararı artık YALNIZ kural tablosundan.
+                red_lines, warning_lines = preflight_verdict(ar)
+                for w in warning_lines:
+                    print(f"UYARI: E2 politika bayrağı — {w}",
+                          file=sys.stderr)
+                if red_lines:
+                    print("RET: anahtar politikası salt-okur DEĞİL — "
+                          "KIRMIZI satır(lar): " + "; ".join(red_lines)
+                          + " — C.3 şartı; DURUYORUM.", file=sys.stderr)
+                    return 4
         led, err = _read_ledger(a.db)              # D4: hata → INCOMPLETE
         if err:
             run.incomplete["ledger"] = err
