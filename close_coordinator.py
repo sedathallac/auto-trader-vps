@@ -163,6 +163,22 @@ class CloseCoordinator:
         amt = Decimal(amt)
         self._state[symbol] = CloseState.EXCHANGE_STATE_VERIFIED
         if amt == 0:
+            # BLOK10 (F-B): exchange-flat, close_intent.reconcile()'ın
+            # şart koştuğu TEK güvenilir kanıttır ("caller passes
+            # exchange_flat only when positionRisk reliably confirmed
+            # amt == 0"). reconcile() üretimde başka hiç çağrılmıyordu;
+            # sahibi çökmüş ACTIVE (PENDING/SENT) intent burada CLOSED
+            # terminal yapılmazsa aynı sembolün YENİ dönemi acquire()'de
+            # sonsuza dek STALE -> FAILED_SAFE kalır ve kapatma yolu
+            # kalıcı kilitlenirdi. DB hatası -> fail-closed (kapanış yok).
+            if self.intent is not None:
+                try:
+                    self.intent.reconcile(symbol, exchange_flat=True)
+                except Exception as e:
+                    self._state[symbol] = CloseState.FAILED_SAFE
+                    return CloseResult(False, CloseState.FAILED_SAFE,
+                                       "INTENT_RECONCILE_FAILED",
+                                       reason=str(e), critical=True)
             # Already flat -> nothing to close; hand over cleanly.
             self._closed.add(symbol)
             return CloseResult(True, CloseState.CLOSED, "ALREADY_FLAT",
