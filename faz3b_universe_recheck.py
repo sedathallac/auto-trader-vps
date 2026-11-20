@@ -76,13 +76,15 @@ def load_bars_1m(sym):
             if len(p) < 6:
                 continue
             trip.append((int(p[0]) / 1000.0, float(p[1]), float(p[4])))
-    trip.sort()
-    ded = []
-    for t, o, c in trip:
-        if ded and ded[-1][0] == t:
-            continue
-        ded.append((t, o, c))
-    return ([x[0] for x in ded], [x[1] for x in ded], [x[2] for x in ded])
+    # BLOK4 İŞ4: SESSİZ sort+dedup KALDIRILDI — part sayısal sırası bozuksa
+    # veya duplika ts varsa İHLAL patlar (exit≠0); kısmi onarım yanıltıcıdır.
+    # (part10≠part2 dersi artık dosya-sırası ihlali olarak görünür.)
+    for i in range(1, len(trip)):
+        if trip[i][0] <= trip[i - 1][0]:
+            raise SystemExit(
+                f"İŞ4 ihlal {sym}: 1m seri sıkı-artan/teksiz değil "
+                f"(idx {i}: {trip[i][0]} <= {trip[i - 1][0]}) — dosya sırası/duplika")
+    return ([x[0] for x in trip], [x[1] for x in trip], [x[2] for x in trip])
 
 
 def window_edges(bars, t0, t1):
