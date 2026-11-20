@@ -15,14 +15,14 @@ n_trades'i JSON'a hiç yazılmadığı için doğrulanamazdı — eksiklik bildi
 ÜRETİM-KAPISI: signal GRID[0] ve null-3 n_trades eski JSON'larla birebir
 olmalı; değilse exit 1.
 
-ÜRETİM-DURUMU GERİ YÜKLEME (bu koşuda bulundu): orijinal 22:04 koşusundan
-SONRA (01:29, parite için) 28 sembole 15m/2026-11.csv EKLENDİ;
-SymbolData._load_tf ay penceresine bakmadan tüm CSV'leri aldığı için
-Ekim-sonu barlarında t_open_next doğdu ve portföy 56340 verdi (yayın 56334;
-fark 6 işlem, concat sırasından BAĞIMSIZ — üç sırala varyantı da 56340).
-Kapı yayındaki TAKIMLA aynı popülasyonu ölçsün diye seriler
-2026-11-01T00Z'de kırpılır (= 22:04 veri durumu; eski dosyalarda Kasım
-yoktu).
+VERİ-DURUMU TUZAĞI (kök-neden KAPANDI, BLOK6 İŞ1): orijinal 22:04 koşusundan
+SONRA (01:29, parite için) 28 sembole 15m/2026-11.csv eklenmişti; eski
+_load_tf pencere süzmediği için Ekim-sonu t_open_next doğuyor ve portföy
+56340 oluyordu (yayın 56334; fark concat sırasından bağımsızdı). Artık
+SymbolData._load_tf [from, to_excl) süzer (test_faz3_loader_window.py) —
+bu betikteki manuel 2026-11 kırpımı (_repub_state) KALDIRILDI; 2026-11
+dosyaları dizinde DURURKEN kapılar değişmeden geçmeli.
+(Önbellek notu: pkl, eşdeğer filtreli veriyle üretildiği için geçerlidir.)
 """
 import datetime as dt
 import json
@@ -45,28 +45,11 @@ B, SEED = 10000, 20261120
 BEST_GI, NULL_GI = 0, 3
 
 
-CUT_NOV = int(dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
-
-
-def _repub_state(sd):
-    """Veriyi 22:04 üretim koşusu durumuna kırp: 2026-11+ barları yoktu
-    (Kasım CSV'leri parite için sonradan eklendi, _load_tf pencere süzmüyor)."""
-    sd.r15 = [r for r in sd.r15 if r[0] < CUT_NOV]
-    r1h = [r for r in sd.r1h if r[0] < CUT_NOV]
-    r4h = [r for r in sd.r4h if r[0] < CUT_NOV]
-    if len(r1h) != len(sd.r1h):
-        sd.r1h = r1h
-        sd.ct1h = [r[6] for r in r1h]
-    if len(r4h) != len(sd.r4h):
-        sd.r4h = r4h
-        sd.ct4h = [r[6] for r in r4h]
-
-
 def _work(sym):
-    """Tek sembol: scan → 4 üretim → işlem listeleri (küçük) döner."""
+    """Tek sembol: scan → 4 üretim → işlem listeleri (küçük) döner.
+    BLOK6 İŞ1: pencere süzgeci artık SymbolData._load_tf'de — manuel kırpım yok."""
     try:
         sd = FB.SymbolData(sym, ROOT, "2024-01", "2026-10")
-        _repub_state(sd)
         dec = FB.scan_symbol_decisions(sd, {}, "2024-01", "2026-10")
         slim = [{"sym": t["sym"], "t_entry": t["t_entry"], "t_exit": t["t_exit"],
                  "sl_pct": t["sl_pct"], "net_ret": t["net_ret"]}
