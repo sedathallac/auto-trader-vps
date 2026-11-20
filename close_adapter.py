@@ -12,6 +12,7 @@ CloseCoordinator tests inject a mock, and these adapter tests inject fakes. In
 production the adapter would send a single reduce-only / positionSide close, but
 that only runs after the separate live-rollout gate + user approval.
 """
+import time
 from decimal import Decimal
 
 from close_coordinator import ONEWAY, HEDGE
@@ -338,13 +339,23 @@ class BinanceHBCloseAdapter:
             if amt == 0:
                 return Decimal("0")
             side = "SELL" if amt > 0 else "BUY"
+        # BLOK11 §6.2: her kapanış POST'u deterministik client-order-id taşır —
+        # ACK kaybı/gecikme sonrası emir exchange'te DOĞRULANABİLİR kimlikle
+        # aranabilir (query/cancel zaten orig_client_order_id destekliyordu;
+        # SL algo yolu FAZ18'den beri clientAlgoId taşıyor). ms-bazlı: aynı
+        # sembolün retry'ları çarpışmaz; çarpışsa Binance reddeder →
+        # CloseAdapterError → FAILED_SAFE (bilinçli güvenli taraf).
+        _cid = f"fz9c{symbol}{int(time.time() * 1000)}"[-36:]
         params = {"symbol": symbol, "side": side, "type": "MARKET",
-                  "quantity": f"{Decimal(str(qty)):f}"}
+                  "quantity": f"{Decimal(str(qty)):f}",
+                  "newClientOrderId": _cid}
         if position_side:          # HEDGE: positionSide, reduceOnly is rejected
             params["positionSide"] = position_side
         else:                      # ONEWAY: reduceOnly can never cross zero (-2022)
             params["reduceOnly"] = "true"
         resp = self.binance._post("/fapi/v1/order", params)
-        if not isinstance(resp, dict) or ("orderId" not in resp and resp.get("status") is None):
-            raise CloseAdapterError(f"close order failed/rejected: {resp}")
+        if (not isinstance(resp, dict)
+                or ("orderId" not in resp and resp.get("status") is None)):
+            raise CloseAdapterError(f"close order failed/rejected: {resp} "
+                                    f"(cid={_cid})")
         return Decimal(str(qty))
