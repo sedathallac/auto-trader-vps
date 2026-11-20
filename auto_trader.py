@@ -2242,8 +2242,27 @@ def ensure_sl_coverage(binance):
                 # concurrent ensure_sl_coverage (orphan_killer) sees BUSY and skips.
                 _tok = ("LONG" if is_long else "SHORT") + ":" + str(p.get("entryPrice"))
                 if _sl_store is not None and _sl_store.acquire(sym, _tok) != _SL_ACQ:
-                    log.info(f"  ⏸️ {sym} SL yerleştirme başka process'te (BUSY) — atlandı")
-                    continue
+                    # BLOK10 (F-F): BUSY iki anlama gelebilir — (a) PENDING:
+                    # gerçekten uçuşta yerleştirme (KORUNUR, çift-SL muhafası),
+                    # (b) PLACED: yerleştirme TAMAMLANMIŞ ama emir exchange'ten
+                    # düşmüş (elle iptal / ack-sonrası red). Bu sembol `missing`
+                    # listesinde, yani sl_status bu turda GÜVENİLİR ABSENT dedi
+                    # ve tur başındaki re-map canlı kimlik BULAMADI. (b) bayat
+                    # kilit demektir: release et ve bu turda yeniden dene.
+                    _k3row = _sl_store.get(sym)
+                    if (_k3row and _k3row.get("state") == "PLACED"
+                            and _k3row.get("token") == _tok):
+                        _sl_store.release(sym, _tok)
+                        log.warning(f"  ♻️ {sym}: PLACED satırı exchange'te "
+                                    f"doğrulanamadı (sl_status ABSENT, re-map "
+                                    f"boş) — bayat epoch bırakıldı, yeniden "
+                                    f"yerleştiriliyor")
+                        if _sl_store.acquire(sym, _tok) != _SL_ACQ:
+                            continue
+                    else:
+                        log.info(f"  ⏸️ {sym} SL yerleştirme başka process'te "
+                                 f"(BUSY) — atlandı")
+                        continue
                 # FAZ18 (1.1/1.2/1.3): closePosition=true + MARK_PRICE +
                 # newClientAlgoId; ack tek başına kanıt DEĞİL — verify_sl_ack
                 # OK olmadan PLACED yazılmaz; KESİN MISSING fail-closed kapatır.
