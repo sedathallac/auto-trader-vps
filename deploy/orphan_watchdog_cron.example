@@ -1,0 +1,6 @@
+# BLOK11 §8.3 — CRON alternatifi (systemd istemeyen makine; YALNIZ ÖRNEK).
+# crontab -e İÇİNE KURULMADI — kopyalamak operatör kararıdır.
+# flock -n: çakışma sessiz atlanır; wrapper kendi flock'unu ayrıca tutar.
+# PATH/APP/venv yolları hedef makineye göre düzenlenir.
+
+* * * * * /usr/bin/flock -n /run/lock/orphan_watchdog_faz9.cron.lock /opt/auto_trader_faz9/venv/bin/python -I /opt/auto_trader_faz9/app/tools/orphan_watchdog.py --once --lock /run/lock/orphan_watchdog_faz9.cron.lock >> /var/log/orphan_watchdog_faz9.cron.log 2>&1

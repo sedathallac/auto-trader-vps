@@ -1,0 +1,13 @@
+# BLOK11 §8.3 — watchdog timer ÖRNEĞİ (kurulum OPERATÖR kararı; bkz. .service.example).
+# Eski orphan_killer.main() döngüsü 60 sn idi — timer aynı ritmi korur.
+
+[Unit]
+Description=FAZ9 live yetim-SL watchdog — 1 dk
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,31 @@
+# BLOK11 §8.3 (N1) — YETİM-SL watchdog birimi ÖRNEĞİ.
+# !!! KURULUM OPERATÖR KARARIDIR — bu görevde hiçbir yere KURULMADI !!!
+#   Doğrulanan kök neden: crontab boş, unit yok, üretim kodu orphan_killer'ı
+#   çağırmıyor → SL backstop'u fiilen hiç koşmuyordu (P1).
+#
+# Kurulum (operatör, VPS):
+#   sudo cp deploy/orphan_watchdog_faz9_live.{service,timer}.example \
+#        /etc/systemd/system/orphan_watchdog_faz9_live.{service,timer}
+#   sudo systemctl daemon-reload && sudo systemctl enable --now orphan_watchdog_faz9_live.timer
+#   Doğrulama: systemctl list-timers | grep orphan && journalctl -u orphan_watchdog_faz9_live -n 20
+#
+# Model: Type=oneshot + 1 dk timer (cron yerine native flock logları).
+# Çıkış kodları: 0=tur tamam; 1=scan istisnası (NextElapse korunur); 2=kilit
+# meşgul/anahtar yok (istek YOK). Anahtarlar canlı servisle AYNI EnvironmentFile.
+# NOT: Home/home izolasyonu için HOME, live servisle birebir aynı olmalıdır —
+# orphan_killer TRACKED/HEARTBEAT dosyalarını $HOME altında arar; farklı HOME =
+# farklı tracked kümesi = sessiz körlük.
+
+[Unit]
+Description=FAZ9 live — yetim SL avcısı tek tur (flock, exit-code'lu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/auto_trader_faz9/app
+Environment=HOME=/var/lib/auto_trader_faz9_live
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/auto_trader/live.env
+ExecStart=/opt/auto_trader_faz9/venv/bin/python -I /opt/auto_trader_faz9/app/tools/orphan_watchdog.py --once --lock /run/lock/orphan_watchdog_faz9_live.lock
