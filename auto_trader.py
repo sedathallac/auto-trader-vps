@@ -20,6 +20,8 @@ _session.mount("http://", HTTPAdapter(max_retries=_retry))
 from risk_engine import RiskEngine
 import risk_engine as risk_engine_mod
 from position_reservation import PositionReserver
+import uuid
+import validation_budget as validation_budget_mod
 import coin_quality
 import leverage_policy
 import sizing_policy
@@ -3283,6 +3285,80 @@ def _account_snapshot(binance):
                       "doğrulanamıyor; cüzdan bakiyesi equity yerine kullanılmaz"})
 
 
+# === BLOK10 §3: kontrollü canlı doğrulama bütçesi (BAĞIMSIZ kalıcı tavanlar) ==
+# ≤2 işlem / ≤50 USDT işlem başına / ≤100 USDT toplam — RiskEngine limitlerinden
+# ayrı, SQLite üzerinde kalıcı ve BEGIN IMMEDIATE ile atomik. Bayrak KAPALI
+# (CONTROLLED_LIVE_VALIDATION=false, varsayılan) iken bu yol hiç açılmaz, normal
+# akış birebir değişmez. Bayrak açık + limit geçersiz VEYA depo hatası → GİRİŞ
+# YOK (fail-closed). Bağlantı noktası create_executor POST'unun hemen öncesi:
+# teyitli başarısızlıkta hak iade, UNKNOWN sonuçta hak KORUNUR (iade yok).
+_VB_CFG = None
+_VB_BUDGET = None
+_VB_LOCK = threading.Lock()
+
+
+def _validation_control():
+    """(enabled, valid, budget|None, why) — tembel başlatma; kilitli, thread-safe."""
+    global _VB_CFG, _VB_BUDGET
+    with _VB_LOCK:
+        if _VB_CFG is None:
+            _VB_CFG = validation_budget_mod.Config.from_env()
+        cfg = _VB_CFG
+        if not cfg.enabled:
+            return False, True, None, "DISABLED"
+        if not cfg.valid:
+            return True, False, None, f"yapılandırma geçersiz: {cfg.error}"
+        if _VB_BUDGET is None:
+            try:
+                _VB_BUDGET = validation_budget_mod.ValidationBudget(
+                    str(STATE_DIR / "validation_budget.db"), cfg.limits)
+            except Exception as e:
+                return True, True, None, f"bütçe deposu açılamadı: {e}"
+        return True, True, _VB_BUDGET, "OK"
+
+
+def _validation_reserve(symbol, notional):
+    """(ok, rid, why). MOD KAPALI → (True, None, 'DISABLED'), yan etki YOK."""
+    enabled, valid, budget, why = _validation_control()
+    if not enabled:
+        return True, None, "DISABLED"
+    if not valid or budget is None:
+        return False, None, why
+    try:
+        r = budget.reserve(symbol, float(notional),
+                           idem_key=f"val:{symbol}:{uuid.uuid4().hex}")
+    except validation_budget_mod.BudgetError as e:
+        return False, None, f"bütçe deposu hatası (fail-closed): {e}"
+    if not r.ok:
+        return False, None, (f"{r.reason} — kullanım {r.trades_used} işlem / "
+                             f"{r.notional_used:.2f} USDT")
+    return True, r.rid, r.reason
+
+
+def _validation_confirm(rid):
+    """POST başarılı → CONSUMED. Hata olursa rezervasyon KALIR (güvenli taraf)."""
+    if rid is None:
+        return
+    try:
+        if _VB_BUDGET is not None:
+            _VB_BUDGET.confirm(rid)
+    except Exception as e:
+        log.critical(f"🚨 doğrulama bütçe teyidi başarısız (rid={rid}): {e} — "
+                     f"rezervasyon KORUNUYOR (konservatif)")
+
+
+def _validation_release(rid):
+    """Yalnız teyitli başarısızlıkta çağrılır. İade hatası → hak YANAR (emniyetli)."""
+    if rid is None:
+        return
+    try:
+        if _VB_BUDGET is not None:
+            _VB_BUDGET.release(rid, reason="executor_not_created")
+    except Exception as e:
+        log.critical(f"🚨 doğrulama bütçe iadesi başarısız (rid={rid}): {e} — "
+                     f"hak İADE EDİLMEDİ (eksik hak, fazlası değil)")
+
+
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None,
               occupied_slots=None):
     # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
@@ -3701,15 +3777,32 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             reserver.release(_res_id, reason="no_risk_engine")
         return False
 
+    # BLOK10 §3: doğrulama modu AÇIK ise bağımsız bütçe hakkı POST'TAN ÖNCE
+    # ayrılır (SQLite, atomik). Ret/depo-hatası → emir YOK. UNKNOWN → hak kalır;
+    # teyitli başarısızlık → iade; executor oluştu → CONSUMED (aşağıda).
+    _vb_ok, _vb_rid, _vb_why = _validation_reserve(symbol, final_notional)
+    if not _vb_ok:
+        log.warning(f"  atlandı: doğrulama bütçesi ({_vb_why})")
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="validation_budget")
+        return False
+
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
+        # Kader tek yerde belirlenir: KEEP (var olabilir) / RELEASE (teyitli yok).
+        _keep = _reservation_should_keep(er)
         if reserver is not None and _res_id is not None:
-            if _reservation_should_keep(er):
+            if _keep:
                 log.warning(f"  🔒 rezervasyon KORUNUYOR (id={_res_id}): UNKNOWN sonuç, reconcile çözecek")
             else:
                 reserver.release(_res_id, reason="executor_not_created")
                 log.info(f"  🔓 rezervasyon serbest (id={_res_id}): executor oluşmadı")
+        # Bütçe kaderi reserver'dan BAĞIMSIZDIR (konservatif: UNKNOWN→koru, teyitli→iade).
+        if _keep:
+            log.warning(f"  🔒 doğrulama bütçe hakkı da KORUNUYOR (rid={_vb_rid})")
+        else:
+            _validation_release(_vb_rid)
         # FAZ14f: kimlik/konfig hatası sembolün suçu değil — karalisteye YAZMA.
         if _is_hb_auth_error(er):
             global _HB_AUTH_BROKEN
@@ -3721,6 +3814,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.error(f"  executor açılamadı: {er}")
         return False
     log.info(f"  executor={eid}")
+    _validation_confirm(_vb_rid)  # BLOK10 §3: hak tüketildi (CONSUMED, kalıcı)
 
     # FAZ14p: dolum beklemesi artık TICK'LER ARASINDA ilerler. Eski hâli ana thread'i
     # FILL_WAIT_S (300s) boyunca time.sleep ile kilitliyordu: tarama, SL denetimi ve
