@@ -14,6 +14,15 @@ kullanır; burada sembol-bazlı çekiliş — AYNI TARİF, farklı RNG çekiliş
 n_trades'i JSON'a hiç yazılmadığı için doğrulanamazdı — eksiklik bildirildi).
 ÜRETİM-KAPISI: signal GRID[0] ve null-3 n_trades eski JSON'larla birebir
 olmalı; değilse exit 1.
+
+ÜRETİM-DURUMU GERİ YÜKLEME (bu koşuda bulundu): orijinal 22:04 koşusundan
+SONRA (01:29, parite için) 28 sembole 15m/2026-11.csv EKLENDİ;
+SymbolData._load_tf ay penceresine bakmadan tüm CSV'leri aldığı için
+Ekim-sonu barlarında t_open_next doğdu ve portföy 56340 verdi (yayın 56334;
+fark 6 işlem, concat sırasından BAĞIMSIZ — üç sırala varyantı da 56340).
+Kapı yayındaki TAKIMLA aynı popülasyonu ölçsün diye seriler
+2026-11-01T00Z'de kırpılır (= 22:04 veri durumu; eski dosyalarda Kasım
+yoktu).
 """
 import datetime as dt
 import json
@@ -36,10 +45,28 @@ B, SEED = 10000, 20261120
 BEST_GI, NULL_GI = 0, 3
 
 
+CUT_NOV = int(dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc).timestamp() * 1000)
+
+
+def _repub_state(sd):
+    """Veriyi 22:04 üretim koşusu durumuna kırp: 2026-11+ barları yoktu
+    (Kasım CSV'leri parite için sonradan eklendi, _load_tf pencere süzmüyor)."""
+    sd.r15 = [r for r in sd.r15 if r[0] < CUT_NOV]
+    r1h = [r for r in sd.r1h if r[0] < CUT_NOV]
+    r4h = [r for r in sd.r4h if r[0] < CUT_NOV]
+    if len(r1h) != len(sd.r1h):
+        sd.r1h = r1h
+        sd.ct1h = [r[6] for r in r1h]
+    if len(r4h) != len(sd.r4h):
+        sd.r4h = r4h
+        sd.ct4h = [r[6] for r in r4h]
+
+
 def _work(sym):
     """Tek sembol: scan → 4 üretim → işlem listeleri (küçük) döner."""
     try:
         sd = FB.SymbolData(sym, ROOT, "2024-01", "2026-10")
+        _repub_state(sd)
         dec = FB.scan_symbol_decisions(sd, {}, "2024-01", "2026-10")
         slim = [{"sym": t["sym"], "t_entry": t["t_entry"], "t_exit": t["t_exit"],
                  "sl_pct": t["sl_pct"], "net_ret": t["net_ret"]}
@@ -111,15 +138,34 @@ def main():
           flush=True)
     allt = {k: [] for k in ("best", "null1", "null3", "null3b")}
     errs = []
-    with ProcessPoolExecutor(max_workers=3) as ex:
-        for n, (sym, res, ndec) in enumerate(ex.map(_work, syms), 1):
-            if isinstance(res, dict):
-                errs.append((sym, res["error"]))
-            else:
-                for k, v in zip(("best", "null1", "null3", "null3b"), res):
-                    allt[k] += v
-            print(f"  [{n}/{len(syms)}] {sym} dec={ndec} "
-                  f"best={len(res[0]) if not isinstance(res, dict) else '-'}", flush=True)
+    import os
+    import pickle
+    cache = AUD + "ci_refresh_percache.pkl"
+    per_sym = {}
+    if os.path.exists(cache):
+        per_sym = pickle.load(open(cache, "rb"))
+        print(f"önbellek yüklendi: {len(per_sym)} sembol", flush=True)
+    todo = [s for s in syms if s not in per_sym]
+    if todo:
+        with ProcessPoolExecutor(max_workers=3) as ex:
+            for n, (sym, res, ndec) in enumerate(ex.map(_work, todo), 1):
+                if isinstance(res, dict):
+                    errs.append((sym, res["error"]))
+                else:
+                    per_sym[sym] = res
+                    pickle.dump(per_sym, open(cache + ".tmp", "wb"))
+                    os.replace(cache + ".tmp", cache)
+                print(f"  [{n}/{len(todo)}] {sym} dec={ndec} "
+                      f"best={len(res[0]) if not isinstance(res, dict) else '-'}",
+                      flush=True)
+    # EŞLEŞME-DÜZENİ: orijinal faz3_run `for s in syms` sembol-sıralı birleştirme
+    # yaptı; sorted girdi sırası + paralel tamamlanma aynı SETİ üretir ama
+    # sorted()'in kararlılığı farklı kalır (6/56334 uç vakası) — burada eski
+    # düzen birebir yeniden kurulur.
+    for s in syms:
+        if s in per_sym:
+            for k, v in zip(("best", "null1", "null3", "null3b"), per_sym[s]):
+                allt[k] += v
     if errs:
         print("HATALAR:", errs[:5])
         return 1
