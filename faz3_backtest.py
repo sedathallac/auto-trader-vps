@@ -85,17 +85,25 @@ def load_csv(path, ym_from, ym_to):
     return rows
 
 
+def _ym_next(ym):
+    y, m = int(ym[:4]), int(ym[5:7])
+    m += 1
+    if m == 13:
+        y, m = y + 1, 1
+    return "%04d-%02d" % (y, m)
+
+
 class SymbolData:
     def __init__(self, sym, root, ym_from, ym_to):
         self.sym = sym
-        self.r15 = self._load_tf(root, sym, "15m")
-        self.r1h = self._load_tf(root, sym, "1h")
-        self.r4h = self._load_tf(root, sym, "4h")
+        self.r15 = self._load_tf(root, sym, "15m", ym_from, ym_to)
+        self.r1h = self._load_tf(root, sym, "1h", ym_from, ym_to)
+        self.r4h = self._load_tf(root, sym, "4h", ym_from, ym_to)
         self.ct1h = [r[6] for r in self.r1h]
         self.ct4h = [r[6] for r in self.r4h]
 
     @staticmethod
-    def _load_tf(root, sym, tf):
+    def _load_tf(root, sym, tf, ym_from, ym_to):
         d = os.path.join(root, sym, tf)
         out = []
         if not os.path.isdir(d):
@@ -103,6 +111,16 @@ class SymbolData:
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".csv"):
                 out.extend(load_csv(os.path.join(d, fn), "0000", "9999"))
+        # BLOK6 İŞ1: ÜST sınır ym_to (kapsayıcı) dışı filtrelenir — to_excl =
+        # ym_to+1ay. Kök-neden: yayın koşusundan sonra dize eklenen
+        # 15m/2026-11.csv FAZ3 tekrarını bozdu (56340≠56334); artık pencere
+        # dışı üst ay ne karar ne ısıtma üretir.
+        # BİLİNÇLİ SAPMA: ALT sınır (ym_from) TRİMLENMEZ — ısıtma önceki
+        # aylardan gelir (yükleyici tasarım sözleşmesi) ve 8 majörde 2022-23
+        # geçmişi YAYIN KOŞUSUNDA da yüklenmişti; alt-trim yayın popülasyonunu
+        # değiştirip kabul kriterini (56334 değişmemeli) kendisi kırardı.
+        to_excl = _ym_next(ym_to)
+        out = [r for r in out if _ym(r[0]) < to_excl]
         # BLOK4 İŞ4: aylar birleşik seri sıkı-artan ve teksiz olmalı — ihlal
         # sessiz sıralanmaz/dedup'lanmaz; DataIntegrityError ile koşu durur.
         assert_monotonic_unique([r[0] for r in out], f"{sym}/{tf}")
