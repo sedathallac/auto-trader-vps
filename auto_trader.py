@@ -3058,6 +3058,13 @@ def _log_calibration_status():
 def _faz6_confirm(binance, symbol, side, sl_pct, mode):
     """Faz 6 teyit. compare: logla + signal_outcomes'a yaz, ASLA reddetmez. on: reddedebilir / hata → fail-closed.
     Döner: True = devam, False = reddet (yalnız mode=='on')."""
+    # BLOK10 (F-A): KOŞULSUZ giriş temizliği. Eski kod clear()'ı yalnız
+    # confirm() başarısından sonra yapıyordu; compare modunda teyit-öncesi
+    # istisna return True ile çıkıp ÖNCEKİ SEMBOLÜN effective_side'ını
+    # bırakıyordu → open_coin:3480 bayat değerle canlı yön çevirme riski.
+    # Teyit yenilenmezse global BOŞ kalır; tüketiciler boşta fail-closed:
+    # effective_side yoksa yön çevrilmez, families boşsa canlı gate reddeder.
+    _LAST_CONFIRM.clear()
     try:
         import strategy_engine as _se
         _sd6 = 1 if side == 1 else -1
@@ -3075,7 +3082,7 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG, policy=_policy6)
         # FAZ9 live: the family gate needs to know which families actually confirmed for THIS side. Kept module-level so
         # _faz6_confirm keeps its bool signature and every existing caller is untouched.
-        _LAST_CONFIRM.clear()
+        # (BLOK10 F-A: clear() artık fonksiyon GİRİŞİNDE — burada yalnız taze yazım.)
         _LAST_CONFIRM.update({"families": dict(_v6.families or {}), "regime": _v6.regime,
                               "p_real": _v6.p_real, "allow": bool(_v6.allow),
                               "effective_side": _v6.effective_side,
