@@ -56,7 +56,18 @@ def check_heartbeat():
 
 
 def scan_and_kill(binance=None):
-    check_heartbeat()
+    # BLOK10 (F-D): Eski kod bekçinin dönüş DEĞERİNİ ÇÖPE atıyordu (dekoratif
+    # guard). Bilinçli karar: iptal fazı bayat heartbeat'te ÇALIŞMAYA DEVAM
+    # eder — tüm yıkıcı kararlar bu turun taze exchange okumalarına dayanır
+    # (güvenilmez positionRisk zaten 71-74'te fail-closed çıkar; yalnız
+    # FLAT+tracked semboller iptal edilir) ve ana bot çöktüğünde heartbeat
+    # tam da bayattır: yetim SL temizliğinin EN gerektiği an (SOLUSDT ailesi).
+    # Guard artık SESSİZ değil: sonucu CRITICAL kanıt bırakarak sürer.
+    hb_ok = check_heartbeat()
+    if not hb_ok:
+        log.critical("🚨 Kalp atışı doğrulanamadı — yetim temizliği TAZE "
+                     "exchange okumalarına dayanarak SÜRÜYOR (bkz. docstring; "
+                     "koruyucu fazlar zaten bağımsız)")
     from auto_trader import BinanceAPI
     if binance is None:
         bk = os.environ.get("BINANCE_KEY")
@@ -114,20 +125,34 @@ def scan_and_kill(binance=None):
     log.info(f"🔍 Açık: {len(open_syms)} | Kontrol: {len(to_check)} ({to_check})")
 
     orphans = []
+    # BLOK10 (F-D) error ≠ empty: sorgusu DOĞRULANAMAYAN sembol "yetim yok"
+    # sayılmaz. Eski kod istisnayı yalnız log.debug yutuyor ve sembol
+    # "Yetim yok" yolunda tracked'den düşüyordu — yetim SL bir daha ASLA
+    # taranmazdı (kalıcı kör nokta). Doğrulanamayan tracked'de KALIR.
+    errored = set()
     for sym in to_check:
         try:
             orders = b.open_algo_orders_for(sym)
+            if not isinstance(orders, list):
+                raise ValueError(f"güvenilmez yanıt: {str(orders)[:80]!r}")
             for o in orders:
                 orphans.append((sym, o["algoId"], o.get("triggerPrice")))
         except Exception as e:
-            log.debug(f"  {sym}: {e}")
+            errored.add(sym)
+            log.warning(f"  ⚠️ {sym}: algo sorgusu BAŞARISIZ ({e}) — "
+                        f"tracked KORUNDU, sonraki tur tekrar dener")
         time.sleep(0.2)
 
     if not orphans:
-        log.info(f"✅ Yetim yok")
-        # Kontrol edilenleri tracked'den çıkar (temizse)
+        if errored:
+            log.warning(f"⚠️ Tarama EKSİK: {sorted(errored)} doğrulanamadı — "
+                        f"tracked'de kaldı (error ≠ empty)")
+        else:
+            log.info("✅ Yetim yok")
+        # Temiz DOĞRULANANLARı tracked'den çıkar; hatalılar kalır.
         for sym in to_check:
-            tracked.discard(sym)
+            if sym not in errored:
+                tracked.discard(sym)
         save_tracked(tracked)
         return
 
@@ -135,7 +160,11 @@ def scan_and_kill(binance=None):
     for sym, aid, trig in orphans:
         try:
             r = b.cancel_algo_order(aid)
-            if r.get("code") == "200":
+            # BLOK10: şeffaf normalizasyon — some Binance boundaries return
+            # code as int, some as string; str() karşılaştırması success'i
+            # int-response durumunda yanlışlıkla "fail" saymaz (retry zararsız
+            # ama tracked boşuna canlı kalırdı). Negatif/eksik code yine fail.
+            if str(r.get("code")) == "200":
                 log.info(f"  ✅ {sym} iptal (algoId={aid}, trigger={trig})")
                 tracked.discard(sym)
             else:
