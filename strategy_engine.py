@@ -585,6 +585,17 @@ def confirm(side_dir, main: Candles, trend_cds: dict, store=None, symbol="", cfg
         trends.append(t)
     regime_adx = adx_last(main.h, main.l, main.c)
     regime = regime_from_adx(regime_adx, cfg)
+    atr_now = atr_series(main.h, main.l, main.c, 14)
+    if atr_now and atr_now[-1] <= 0:
+        # BLOK 4 İŞ 3.2 (A-10 sertleştirme): ATR≤0 barında MUTLAK giriş vetosu.
+        # f7c99d4 yalnız structure ailesini susturuyordu; confirm_min_families=1
+        # iken DİĞER aileler kapıyı tek başına geçebiliyordu (kırmızı test
+        # kanıtı: p_real=0.500 ≥ 0.40 allow). Backtest D-4 (@dcc23cb sıfır-ATR
+        # barını atlama) ile canlı-hiza; fail-closed; WARN görünür.
+        _LOG.warning("A-10 VETO: ATR≤0 bar (px=%s) — giriş reddedildi "
+                     "(fail-closed)", main.c[-1])
+        return Verdict(False, "A-10 veto: ATR≤0 bar — giriş reddedildi",
+                       regime=regime, veto=True, regime_adx=regime_adx)
     readings = exhaustion_readings(main) + structure_readings(main) + volume_readings(main)
     p_fake_fn = (lambda name, reg: store.p_fake(name, reg, cfg)) if store is not None \
         else (lambda name, reg: (0.5, False))
