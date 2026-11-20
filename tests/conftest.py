@@ -24,6 +24,26 @@ import auto_trader
 
 
 @pytest.fixture(autouse=True)
+def _isolate_validation_budget(tmp_path, monkeypatch):
+    """BLOK11 §10.3: giriş artık bütçe KAPALI iken de fail-closed RED. Canlı
+    open_coin yollarının testleri bundan böyle bütçe AÇIK + geçerli varsayılan
+    limitlerle (2/50/100) ve HER TESTE TAZE bir SQLite deposuyla koşar.
+    Modül-seviyesi tembel önbellek (_VB_CFG/_VB_BUDGET) testler arası sızmasın
+    diye hem önce hem sonra sıfırlanır. Kapının kendisini test eden dosyalar
+    monkeypatch ile kendi env'lerini kurar (test_blok11_budget_failclosed)."""
+    monkeypatch.setenv("CONTROLLED_LIVE_VALIDATION", "true")
+    monkeypatch.setenv("VALIDATION_BUDGET_DB",
+                       str(tmp_path / "validation_budget.db"))
+    auto_trader._VB_CFG = None
+    auto_trader._VB_BUDGET = None
+    try:
+        yield
+    finally:
+        auto_trader._VB_CFG = None
+        auto_trader._VB_BUDGET = None
+
+
+@pytest.fixture(autouse=True)
 def _isolate_sl_ledger(tmp_path):
     _orig = auto_trader.SL_LEDGER_DB
     auto_trader.SL_LEDGER_DB = str(tmp_path / "risk_ledger.db")

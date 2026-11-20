@@ -94,18 +94,20 @@ class TestControlledBudgetIntegration(LiveWiringBase):
             self.assertEqual(len(hb.created), 2)
             self.assertEqual(auto_trader._VB_BUDGET.status()["trades_used"], 2)
 
-    # §3 — bayrak KAPALI: tavanlar uygulanmaz, normal akış birebir devam eder;
-    #      bütçe deposu HİÇ oluşturulmaz.
-    def test_mode_off_does_not_alter_flow(self):
+    # §3 (BLOK10) → BLOK11 §10.3 ÇEVRİMİ: ESKİ varsayım ("bayrak KAPALI iken
+    # normal akış birebir devam eder") misyonla GEÇERSİZ kılındı: "bütçe kontrolü
+    # kapalıysa hiçbir işlem açılmasın". Kapalı artık canlı giriş için RED'dir;
+    # bütçe deposu yine HİÇ oluşturulmaz (red DB yazmaz). dry_run/compare bundan
+    # etkilenmez — open_coin "[DRY] emir yok" noktasında bu kapıya varmadan döner.
+    def test_mode_off_denies_live_entry(self):
         with self._vb(enabled=False):
             import validation_budget as vb
             self.assertFalse(vb.Config.from_env().enabled)
             binance, hb = FakeBinance(), FakeHB()
             cc, _ = _coordinator(binance, hb, self.db)
-            for _ in range(3):
-                self.assertIs(self._open(binance, hb, cc), True)
-            self.assertEqual(len(hb.created), 3)
-            self.assertIsNone(auto_trader._VB_BUDGET)   # depo hiç kurulmadı
+            self.assertIs(self._open(binance, hb, cc), False)
+            self.assertEqual(hb.created, [])           # create_executor hiç
+            self.assertIsNone(auto_trader._VB_BUDGET)  # depo hiç kurulmadı
             self.assertFalse((Path(self.tmp) / "validation_budget.db").exists())
 
     # §12 — HALTED: merkezi risk kapısı bütçeden ÖNCE bloklar; sayaç dokunmaz.

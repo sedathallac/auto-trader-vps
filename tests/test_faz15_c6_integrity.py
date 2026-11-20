@@ -767,13 +767,23 @@ class TestPendingEntryLifecycle(Base):
         self._orig_max = auto_trader.MAX_OPEN_POSITIONS
         auto_trader.MAX_OPEN_POSITIONS = 2
         names = ("check_liquidity", "check_correlation_limit", "decide_side",
-                 "calculate_atr", "calculate_position_size", "_live_cfg")
+                 "calculate_atr", "calculate_position_size", "_live_cfg",
+                 "_validation_reserve")
         self._orig = {n: getattr(auto_trader, n) for n in names}
         auto_trader.check_liquidity = lambda b, s: (True, "ok")
         auto_trader.check_correlation_limit = lambda s, b: True
         auto_trader.decide_side = lambda coin: (1, "LONG")
         auto_trader.calculate_atr = lambda b, s, interval="15m", period=14: 0.02
         auto_trader.calculate_position_size = lambda bal, coin: (200.0, 1.0)
+        # BLOK11 §10.3 belgelenmiş bypass: gerçek bütçe kapısı ≤50 USDT/emir
+        # tavanıyla bu harness'in 200 USDT'lik simüle notionalunu MEŞRU olarak
+        # RED ederdi. Bu sınıf FAZ15b pending-store yaşam döngüsünü hedefler;
+        # bütçe kapısının kendisi test_blok11_budget_failclosed +
+        # test_blok10_open_coin_integration'de (200 USDT RED dahil ayrı testler)
+        # doğrulanır (per-trade tavan RED testi dahil). rid="test-rid":
+        # _VB_BUDGET None iken confirm/release no-op.
+        auto_trader._validation_reserve = lambda s, n: (True, "test-rid",
+                                                        "test-bypass")
         auto_trader._live_cfg = lambda: SimpleNamespace(
             is_live=False, max_position_pct=None, max_notional=0, max_leverage=20)
 

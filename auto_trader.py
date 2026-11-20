@@ -3313,11 +3313,12 @@ def _account_snapshot(binance):
 
 # === BLOK10 §3: kontrollü canlı doğrulama bütçesi (BAĞIMSIZ kalıcı tavanlar) ==
 # ≤2 işlem / ≤50 USDT işlem başına / ≤100 USDT toplam — RiskEngine limitlerinden
-# ayrı, SQLite üzerinde kalıcı ve BEGIN IMMEDIATE ile atomik. Bayrak KAPALI
-# (CONTROLLED_LIVE_VALIDATION=false, varsayılan) iken bu yol hiç açılmaz, normal
-# akış birebir değişmez. Bayrak açık + limit geçersiz VEYA depo hatası → GİRİŞ
-# YOK (fail-closed). Bağlantı noktası create_executor POST'unun hemen öncesi:
-# teyitli başarısızlıkta hak iade, UNKNOWN sonuçta hak KORUNUR (iade yok).
+# ayrı, SQLite üzerinde kalıcı ve BEGIN IMMEDIATE ile atomik. BLOK11 §10.3:
+# bayrak KAPALI iken de GİRİŞ YOK (fail-closed çevrim; eskiden pas-through idi).
+# Bayrak açık + limit geçersiz VEYA depo hatası → GİRİŞ YOK. DB yolu env
+# VALIDATION_BUDGET_DB ile izole edilebilir (canlı test: üretim DB'si kullanılmaz).
+# Bağlantı noktası create_executor POST'unun hemen öncesi: teyitli başarısızlıkta
+# hak iade, UNKNOWN sonuçta hak KORUNUR (iade yok). dry_run bu kapıya ulaşmaz.
 _VB_CFG = None
 _VB_BUDGET = None
 _VB_LOCK = threading.Lock()
@@ -3335,19 +3336,30 @@ def _validation_control():
         if not cfg.valid:
             return True, False, None, f"yapılandırma geçersiz: {cfg.error}"
         if _VB_BUDGET is None:
+            # BLOK11 §9/§10: canlı test penceresi ÜRETİM bütçe DB'sini kullanma-
+            # maktadır; operatör VALIDATION_BUDGET_DB ile taze/izole bir dosyaya
+            # işaret eder. Tanımsız → STATE_DIR varsayılanı (geriye dönük uyum).
+            _vb_db = (os.getenv("VALIDATION_BUDGET_DB")
+                      or str(STATE_DIR / "validation_budget.db"))
             try:
                 _VB_BUDGET = validation_budget_mod.ValidationBudget(
-                    str(STATE_DIR / "validation_budget.db"), cfg.limits)
+                    _vb_db, cfg.limits)
             except Exception as e:
                 return True, True, None, f"bütçe deposu açılamadı: {e}"
         return True, True, _VB_BUDGET, "OK"
 
 
 def _validation_reserve(symbol, notional):
-    """(ok, rid, why). MOD KAPALI → (True, None, 'DISABLED'), yan etki YOK."""
+    """(ok, rid, why). BLOK11 §10.3 FAIL-CLOSED ÇEVRİM: bayrak KAPALI iken de
+    RED — "bütçe kontrolü kapalıysa hiçbir işlem açılmasın". Eski davranış
+    (kapalı → pas-through) yalnız dry_run/compare yollarında anlamlıydı ve
+    orada kalır: dry_run open_coin'i ([DRY] emir yok) bu kapıya ulaşmadan
+    döner, hak tüketmez. Yan etki YOK (red DB dosyası bile yaratmaz)."""
     enabled, valid, budget, why = _validation_control()
     if not enabled:
-        return True, None, "DISABLED"
+        return False, None, ("BÜTÇE-KAPALI: CONTROLLED_LIVE_VALIDATION doğru "
+                             "değerli değil — bütçe devre dışıyken canlı giriş "
+                             "YOK (BLOK11 §10.3)")
     if not valid or budget is None:
         return False, None, why
     try:
