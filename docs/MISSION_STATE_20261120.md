@@ -612,3 +612,64 @@ Eski semantiğe dayanan iki test bilinçli olarak yeni sözleşmeye güncellendi
 3. watchdog kurulumu (unit örnekleri hazır); 4. testnet anahtarları verilirse smoke;
 5. push/deploy/HALTED — BLOK10 kapıları AYNEN duruyor.
 Hüküm: **READY FOR OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.**
+
+---
+
+# BLOK 12 DEVİR (2026-11-21) — operasyonel engellerin kapatılması + canlı test kapıları
+
+Dal: `fix/deploy-candidate-security-20261120` (üretim `108002c` KORUNDU, dokunulmadı).
+Tabandaki 9 commit (eski→yeni): 96e6406(§5) → 4808854(§2) → b07cf40(§1) →
+c6e97c2(§4) → 15f678f(§3) → e7df422(§6) → 752e61e(§7) → bf2001c(§8) →
+87007cf(§9). Her commit mesajı kök-neden + kırmızı→yeşil kanıtını taşır.
+
+## 1) Onarım tablosu (kök neden → kanıt → commit)
+
+| § | Kök neden (özet) | Ana dosyalar | Kanıt | Commit |
+|---|---|---|---|---|
+| 1 | İkinci canlı işlem onayı süreç-içi/bulaşık; restart'ta kayboluyordu | operator_approval.py (YENİ), auto_trader entegrasyonu | 24 test; üçüncü işlem HER ZAMAN RED; restart-safe | b07cf40 |
+| 2 | Aynı intent yeniden POST edilebiliyordu; fill tavanı AŞILINCA raporlanıyordu (yetersiz) | auto_trader (intent/payload bağı, worst-fill ÖN gard) | test_blok12_budget_intent.py; UNKNOWN korunur | 4808854 |
+| 3 | 8 kök test kırmızısı fixture çürümesiydi; preflight eski ignore listesiyle SAHTE YEŞİL üretti | 7 test fixture + tools/secret_scan.py + deploy/faz9_preflight.sh (YENİ) | bare tam pytest exit 0; ignore YOK | 15f678f |
+| 4 | 429/418 umursanmıyordu; açık mum ATR/hacme girebiliyordu | api_guard.py, auto_trader (_api_response, closed_bars, kapılar) | 30 test (test_blok12_api_guard.py); POST kör retry YOK makine değişmezi | c6e97c2 |
+| 5 | Heartbeat yönetici kimliği kill_spot_grid.py/.sh içinde GÖMÜLÜYDÜ | kill_spot_grid.py/.sh, tools/secret_scan.py, docs rotasyon planı | dış config + fail-closed; GEÇMİŞTE ESKİ KİMLİK VAR (bkz. §5 notu) | 96e6406 |
+| 6 | Watchdog kurulumu sessiz-körlük sınıfıyla (HOME/STATE_DIR farkı) denetlenmiyordu | tools/verify_watchdog.py (YENİ), docs/OPS_WATCHDOG_20261121.md | 8 test + hash-kanıtlı yalnız-okunurluk; gerçek ağaç 17 OK/1 WARN | e7df422 |
+| 7 | --place-order ile salt-okunur aynı kapıdaydı; ayrı kalıcı onay yoktu | tools/testnet_smoke.py (order_approval) | 8+8 test; üretim-anahtarı sırası ÖNCE; banner "ÜRETİM KANITI DEĞİLDİR" | 752e61e |
+| 8 | Tek-süreç kilidi YOKTU (çift süreç = çift giriş riski); SIGTERM'siz döngü | auto_trader (acquire_process_lock, _shutdown_handler, interruptible_sleep) | RED 15→GREEN 15 + gerçek SIGTERM alt-süreç; main exit 3 | bf2001c |
+| 9 | ETHUSDT 2025 sayılarının alıntı yasağı bağlayıcı değildi | docs (yalnız belge) | H5 YENİDEN KOŞULMADI | 87007cf |
+
+Test toplamı (BLOK12 sonu): `tests/` tam koşum **1294 passed + 9 subtests,
+exit 0** (bf2001c üzerinde; §9 belge-only). Deploy preflight (worktree@HEAD,
+bare pytest + secret scan) §10'da ayrıca doğrulandı.
+
+## 2) YAPILMADI (dürüstlük listesi — BLOK12)
+
+Production merge YOK · deploy/restart YOK · HALTED KORUNDU · canlı Binance
+isteği YOK · canlı emir YOK · watchdog birimi KURULMADI/timer enable
+EDİLMEDİ · testnet gerçek turu KOŞMADI (TESTNET_* anahtarı makinede yok —
+blokaj) · H5 yeniden KOŞULMADI · heartbeat kimliği ROTASYON YAPMADI (yalnız
+plan) · force push YOK. §5 DÜRÜST NOTU: eski heartbeat kimlik DEĞERLERİ git
+geçmişinde yaşamaya devam ediyor (silinmek geçersiz kılmaz); yalnız sha256
+digest'ler secret_scan KNOWN_CRED_DIGESTS'te; değerler hiçbir çıktıya
+yazılmadı.
+
+## 3) OPERATÖR ONAYI BEKLEYEN KAPILAR (hiçbiri bu görevde açılmadı)
+
+1. Watchdog: `deploy/orphan_watchdog_faz9_live.{service,timer}.example`
+   kurulumu + `enable --now` + (ayrı onay) gerçek API'li `--once` denemesi —
+   docs/OPS_WATCHDOG_20261121.md.
+2. §1 onay token'ının ÜRETİLMESİ ve kullanımı (ikinci canlı işlem).
+3. Testnet: TESTNET_* anahtarlarının korumalı env/secret store ile verilmesi
+   (SOHBETTE İSTENMEZ) + emir adımı için 0600 işaret dosyası
+   (TESTNET_ORDER_APPROVAL_FILE).
+4. Heartbeat kimlik rotasyonu (plan: BLOK12 §5 commit mesajı + docs).
+5. BCH/GALA indirme + 2020-23 birincil OOS (BLOK11 kapısı AYNEN duruyor).
+6. Push sonrası deploy/HALTED — BLOK10 runbook'u AYNEN geçerli.
+
+## 4) §8 DAVRANIŞ DEĞİŞİKLİĞİ UYARISI (operatör)
+
+Servis ayaktayken elle tek-tur `python auto_trader.py …` artık **exit 3**
+verir (tek-süreç kilidi; bilinçli fail-closed). SIGTERM en geç ~1s içinde
+döngüden çıkarır; in-flight emir sorgulanmadan iptal EDİLMEZ, pending/bütçe/
+onay diskte korunur. systemd `TimeoutStopSec` verili değilse varsayılan
+90s >> 1s — risk yok.
+
+Hüküm: **READY FOR FINAL OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.**

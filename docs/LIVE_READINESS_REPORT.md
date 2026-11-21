@@ -220,3 +220,33 @@ takılı; üretim `108002c` HALTED ve dokunulmamış; canlı hesapla tek etkile�
 HALTED kaldırma, H5 ve ikinci-işlem geçişi dahil her canlı adım AYRI operatör onayına
 muhtaçtır. `Düzeltildi/geçti/güvenli` yükümlülüklerinin tümü yukarıdaki dosya:satır ve
 log kanıtlarına bağlıdır.
+
+## 10. BLOK12 ekleri (2026-11-21) — son operasyonel engeller + canlı test kapıları
+
+Dal `fix/deploy-candidate-security-20261120`; 9 commit (tablo + kanıt zinciri
+MISSION_STATE "BLOK 12 DEVİR"). Bu belgedeki BLOK10/11 yükümlülüklerine EK:
+
+- **Giriş zincirine eklenen yeni fail-closed kapılar:** §1 tek-kullanımlık
+  kalıcı onay (üçüncü işlem daima RED), §2 intent-idempotency + worst-fill
+  ÖN gardı, §4 api_guard (429/418'de yeni giriş yok; POST kör retry yok;
+  yalnız KAPALI mumlar karara girer), §8 tek-süreç kilidi (exit 3) + SIGTERM
+  ~1s'de yeni girişi keser — in-flight emir iptal EDİLMEZ.
+- **Operatör davranış değişikliği:** servis ayaktayken elle tek-tur koşu
+  artık exit 3 (BİLEREK; çift giriş koruması).
+- **Araçlar:** deploy/faz9_preflight.sh (bare tam pytest + secret scan,
+  ignore YOK), tools/verify_watchdog.py (yalnız-okunur parite denetimi),
+  testnet_smoke ayrı emir-onayı (0600 işaret dosyası) + "ÜRETİM KANITI
+  DEĞİLDİR" banner'ı.
+- **Etiket hükmü (§9):** ETHUSDT 2025 H5 sayıları yalnız OOS-olmayan
+  ön-gözlemdir; B.5 kapısı/kârlılık kanıtı yerine geçmez; H5 yeniden
+  koşulmaz.
+
+## HÜKÜM — BLOK12
+
+**READY FOR FINAL OPERATOR REVIEW — NOT DEPLOYED.** Üretim `108002c` HALTED
+ve dokunulmamış; bu görevde canlı Binance isteği/emir, deploy, merge,
+restart ve HALTED kaldırma YOK. Testler: tam `tests/` 1294 passed + 9
+subtests exit 0; preflight (worktree@HEAD, secret scan + bare pytest) exit
+0. Her canlı adım (watchdog kurulumu, onay token'ı, testnet anahtarları,
+rotasyon, BCH/GALA OOS, deploy/HALTED) AYRI operatör onayına muhtaçtır;
+kimlikler sohbet yerine korumalı env/secret store ile verilir.
