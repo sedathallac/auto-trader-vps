@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """BLOK12 §4 — Binance rate-limit gardı (429/418 cooldown/backoff).
 
-Durum makinesi (process-içi, restart'ta sıfırlanır — muhasebe değil, AKIŞ
-gardıdır):
+Durum makinesi (bellek ∨ STATE_DIR/api_guard.json — muhasebe değil, AKIŞ
+gardıdır; devam-F §3: dosya katmanı restart ve watchdog süreçlerinin ban
+sırasında istek göndermesini engeller):
   * 429 → Retry-After başlığı varsa O, yoksa DEFAULT_429_S; artan grevlerle
     üstel backoff (tavan MAX_COOLDOWN_S).
   * 418 (IP ban) → DEFAULT_418_S (uzun) cooldown — asla kör deneme yok.
@@ -15,6 +16,9 @@ gardıdır):
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import threading
 import time
 
@@ -24,6 +28,59 @@ MAX_COOLDOWN_S = 3600.0
 
 _LOCK = threading.Lock()
 _STATE = {"cooldown_until": 0.0, "reason": None, "strikes": 0}
+
+# BLOK12 devam-F §3 (E2): cooldown'un SÜREÇ-DESTİ kanıtı — yalnız bitiş
+# zamanı + neden YAZILIR (sır taşımaz). Amaç: (a) restart'ın ban'ı
+# sıfırlamasını, (b) ayrı süreçteki watchdog'un ban sırasında istek
+# göndermesini engellemek. Akış gardıdır, muhasebe DEĞİL: bozuk/eksik dosya
+# bloklama üretmez (fail-open), bellek-içi ban ise dosyadan bağımsız sürer.
+_STATE_FILE = None
+
+
+def set_state_file(path) -> None:
+    """Cool down dosyası yolu (None → dosya katmanı kapalı, eski davranış)."""
+    global _STATE_FILE
+    with _LOCK:
+        _STATE_FILE = str(path) if path else None
+
+
+def file_blocked(path, now=None):
+    """Dosyada aktif cooldown varsa nedeni döner; yok/bozuk/süresi geçmiş →
+    None. Salt-okunur, istisna fırlatmaz."""
+    now = time.time() if now is None else float(now)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        until = float(data.get("cooldown_until") or 0.0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if until > now:
+        return (f"{data.get('reason') or 'rate-limit-cooldown'}"
+                f"(dosya:{until - now:.0f}s kaldı)")
+    return None
+
+
+def _persist_locked(now) -> None:
+    """_LOCK altında çağrılır; best-effort atomik yazım (tmp+rename)."""
+    if not _STATE_FILE:
+        return
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".api_guard_", dir=os.path.dirname(
+            _STATE_FILE) or ".")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"cooldown_until": _STATE["cooldown_until"],
+                       "reason": _STATE["reason"]}, fh)
+        os.replace(tmp, _STATE_FILE)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _retry_after(headers) -> float | None:
@@ -64,16 +121,24 @@ def note_http_status(status_code, headers=None, now=None) -> float:
         # grevler birikerek süreyi sonsuza uzatamaz (yalnız uzatır, çakmaz).
         _STATE["cooldown_until"] = max(_STATE["cooldown_until"], now + delay)
         _STATE["reason"] = reason
+        _persist_locked(now)
         return delay
 
 
 def blocked(now=None):
-    """Cooldown sürüyorsa nedeni, değilse None."""
+    """Cooldown sürüyorsa nedeni, değilse None.
+
+    BLOK12 devam-F §3: bellek ∨ dosya — yeniden başlayan süreç (bellek boş)
+    ve dosya yolunu bilen ayrı süreçler ban'ı GÖRÜR. Dosya okuma kilidi
+    dışarıda tutuldu (kısa, atomik rename ile tutarlı)."""
     now = time.time() if now is None else float(now)
     with _LOCK:
         if _STATE["cooldown_until"] > now:
             return _STATE["reason"] or "rate-limit-cooldown"
-        return None
+        fpath = _STATE_FILE
+    if fpath:
+        return file_blocked(fpath, now)
+    return None
 
 
 def cooldown_remaining(now=None) -> float:

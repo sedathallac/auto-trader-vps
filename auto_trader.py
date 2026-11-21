@@ -98,6 +98,13 @@ STALE_PENDING_GRACE_S = float(os.getenv("LIVE_STALE_PENDING_GRACE_S", "3600") or
 # canlı durum dosyalarına YAZAMAZ (kanıt: VPS'te pytest çalıştırmak
 # /root/.pending_fills.json içine test artığı E1/SOLUSDT yazıyordu).
 STATE_DIR = Path(os.getenv("FAZ9_STATE_DIR") or Path.home())
+# BLOK12 devam-F §3 (E2): rate-limit gardının süreç-desti kanıtı bu dosyada
+# tutulur (yalnız bitiş zamanı + neden; sır YOK). auto_trader yazar ve
+# blocked() bellek ∨ dosya okur; orphan_watchdog aynı yolu API_GUARD_STATE_FILE
+# env'iyle (veya STATE_DIR çözümlemesiyle) turdan ÖNCE denetler — 418 ban
+# sürerken hiçbir süreç Binance isteği GÖNDERMEZ.
+API_GUARD_STATE_FILE = STATE_DIR / "api_guard.json"
+api_guard.set_state_file(str(API_GUARD_STATE_FILE))
 # FAZ16: TEK risk DB yolu. RiskEngine, sync_risk_engine, PositionReserver,
 # CloseIntentStore ve SlPlacementStore aynı çözülmüş mutlak yolu kullanır.
 RISK_DB_FILE = STATE_DIR / "risk_ledger.db"

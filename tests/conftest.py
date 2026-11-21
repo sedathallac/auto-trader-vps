@@ -68,12 +68,27 @@ def _isolate_api_guard():
     geri yükle."""
     import api_guard
     saved = dict(api_guard._STATE)
+    saved_file = api_guard._STATE_FILE
     api_guard.reset()
+    _wipe_guard_file()               # süreç-desti kanıt dosyası da izole
     try:
         yield
     finally:
         api_guard.reset()
         api_guard._STATE.update(saved)
+        api_guard.set_state_file(saved_file)
+        _wipe_guard_file()
+
+
+def _wipe_guard_file():
+    """devam-F §3: api_guard cooldown dosyası oturum-GENİŞİ tmp STATE_DIR'de
+    yaşar; bir testin bıraktığı 418 kaydı SONRAKİ testlerin sahte transport'unu
+    susturmasın diye önce/sonra silinir (bellek izolasyonunun dosya versiyonu).
+    """
+    try:
+        os.unlink(auto_trader.API_GUARD_STATE_FILE)
+    except OSError:
+        pass
 
 
 @pytest.fixture(autouse=True)

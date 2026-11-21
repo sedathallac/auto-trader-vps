@@ -85,6 +85,13 @@ class _HBFake:
 class CooldownBase(unittest.TestCase):
     def setUp(self):
         api_guard.reset()
+        # Bu suite KONU bellek gardıdır; süreç-desti dosya katmanı kendi
+        # dosyasında testli (test_blok12_guard_file_crossproc). Kurulumdaki
+        # 429'un dosyaya yazılması "gard yok" pozitif kontrolünü yanlış
+        # bloklamasın → dosya bağlantısını bu suite için kapat.
+        api_guard.set_state_file(None)
+        self.addCleanup(api_guard.set_state_file,
+                        str(auto_trader.API_GUARD_STATE_FILE))
         self.sentry = _Sentry()
         p = mock.patch.object(auto_trader, "_session", self.sentry)
         p.start()

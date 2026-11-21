@@ -26,6 +26,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import api_guard
+
 EXIT_OK = 0
 EXIT_SCAN_ERROR = 1
 EXIT_CONFIG = 2
@@ -33,11 +35,31 @@ EXIT_CONFIG = 2
 log = logging.getLogger("orphan_watchdog")
 
 
-def run_once(scanner, lock_path, keys_present):
-    """Bir tur. Dönüş: EXIT_* kodu. scanner() inject edilir (test + üretim)."""
+def default_guard_file():
+    """auto_trader ile AYNI dosyayı çözer: API_GUARD_STATE_FILE env'i,
+    olmazsa FAZ9_STATE_DIR (veya ~) / api_guard.json."""
+    env = os.environ.get("API_GUARD_STATE_FILE")
+    if env:
+        return env
+    base = os.environ.get("FAZ9_STATE_DIR") or os.path.expanduser("~")
+    return os.path.join(base, "api_guard.json")
+
+
+def run_once(scanner, lock_path, keys_present, guard_file=None):
+    """Bir tur. Dönüş: EXIT_* kodu. scanner() inject edilir (test + üretim).
+
+    BLOK12 devam-F §3: turdan ÖNCE süreç-desti cooldown dosyası denetlenir —
+    418/429 ban sürerken turlama Binance isteği GÖNDERİRSE ban uzardı;
+    aktif cooldown → exit 2, tek istek bile YOK."""
     if not keys_present:
         log.error("BINANCE_KEY/BINANCE_SECRET yok — turlama REDDEDİLDİ "
                   "(exit 2); hiçbir borsa isteği yapılmadı")
+        return EXIT_CONFIG
+    gf = guard_file if guard_file is not None else default_guard_file()
+    _ban = api_guard.file_blocked(gf)
+    if _ban:
+        log.error(f"🚫 rate-limit/IP-ban cooldown AKTİF ({_ban}) — tur "
+                  "ATLANDI (exit 2); hiçbir borsa isteği yapılmadı")
         return EXIT_CONFIG
     lock_fh = open(lock_path, "w")
     try:
