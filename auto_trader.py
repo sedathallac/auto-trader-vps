@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 import fcntl
+import signal
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -3609,8 +3610,86 @@ def _validation_release(rid):
                      f"hak İADE EDİLMEDİ (eksik hak, fazlası değil)")
 
 
+# ---- BLOK12 §8: TEK-SÜREÇ KORUMASI + SIGTERM/SIGINT KAPANIŞI ----
+# (1) Aynı STATE_DIR üzerinde ikinci bot süreci KİLİT yüzünden giremez (main
+#     exit 3): iki süreç aynı pending/bütçe/onay durumunu görüp ÇİFT GİRİŞ
+#     üretebilirdi — SQLite kilitleri işlem düzeyini korur, süreç kimliğini
+#     korumaz. flock fd'si süreç boyunca açık tutulur; süreç ölünce OS bırakır
+#     (crash'te kilit yetimi kalmaz).
+# (2) SIGTERM/SIGINT YALNIZ bayrak koyar. Bilerek İPTAL YOK: in-flight emrin
+#     akıbeti sorgulanmadan gönderilen cancel UNKNOWN akıbeti bozar ve çift
+#     kapanış riski üretir; pending kayıt silinmez; bütçe/emir/onay depoları
+#     zaten diskte (SQLite/JSON) — restart'ta korunur.
+# (3) Uykular ≤1s dilimlerle bölünür: systemd TimeoutStopSec içinde çıkarız.
+PROCESS_LOCK_PATH = STATE_DIR / ".auto_trader.process.lock"
+_SHUTTING_DOWN = [False]
+_PROCESS_LOCK_FD = [None]
+
+
+def acquire_process_lock(path=None):
+    """Tek-süreç kilidi. Alınamazsa None (çağıran exit 3 vermeli); alınırsa
+    fd süreç boyunca açık kalır — kasıtlı RELEASE YOK (ölümde OS bırakır)."""
+    p = str(path or PROCESS_LOCK_PATH)
+    fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, ("%d\n" % os.getpid()).encode())
+    except OSError:
+        pass                                   # pid notu kozmetik — kilit geçerli
+    _PROCESS_LOCK_FD[0] = fd
+    return fd
+
+
+def shutdown_requested():
+    return _SHUTTING_DOWN[0]
+
+
+def _shutdown_handler(signum, _frame):
+    # Yalnız bayrak + log. BURADA hiçbir iptal/API/dosya çağrısı YOK;
+    # test_blok12_single_instance_sigterm bunu makine değişmezi olarak kilitler.
+    if not _SHUTTING_DOWN[0]:
+        _SHUTTING_DOWN[0] = True
+        try:
+            _nm = signal.Signals(signum).name
+        except ValueError:
+            _nm = str(signum)
+        log.critical(f"🛑 {_nm} — kapanış: yeni girişler DURDURULDU; in-flight "
+                     f"emir olduğu gibi bırakılır, pending kayıt silinmez")
+
+
+def install_shutdown_handlers():
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _shutdown_handler)
+        except (ValueError, OSError):
+            pass          # main thread dışı (test/iş parçacığı) — sessiz geç
+
+
+def interruptible_sleep(seconds):
+    """≤1s dilimlerle uyur. Dönüş: True = kapanışla BÖLÜNDÜ, False = doldu."""
+    end = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if _SHUTTING_DOWN[0]:
+            return True
+        _rem = end - time.monotonic()
+        if _rem <= 0:
+            return False
+        time.sleep(min(1.0, _rem))
+
+
 def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordinator=None,
               occupied_slots=None):
+    # BLOK12 §8: SIGTERM/SIGINT sonrası YENİ GİRİŞ YOK — dry-run/compare da
+    # durur (kapanan süreçte karar üretmenin anlamı yok; kapı ilk API
+    # kullanımından ÖNCE).
+    if _SHUTTING_DOWN[0]:
+        log.critical("  atlandı: kapanış sürüyor (shutdown) — yeni giriş yok")
+        return False
     # HB_OFFLINE: gerçek emir YOK — dry-run'a zorla (create_executor asla çalışmaz).
     # Böylece 🔬 Faz3[compare] logu üretilir ama borsaya/HB'ye emir gönderilmez.
     if HB_OFFLINE:
@@ -5827,7 +5906,7 @@ def process_candidates(binance, hb, picks, active, bl, dry_run, risk, reserver, 
     return ok, len(candidates), n_probe
 
 
-def main():
+def main(argv=None):
     log_file = STATE_DIR / "auto_trader.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -5838,10 +5917,20 @@ def main():
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--dry", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    # BLOK12 §8: tek-süreç kilidi — HER giriş yolunda (döngü ve tek-tur).
+    # systemd `Restart=` döngüsüyle yarışı olabilecek tek-turluk elle koşular
+    # de tam olarak bu çift-giriş sınıfıdır; fail-closed.
+    if acquire_process_lock() is None:
+        log.critical("🚨 tek-süreç kilidi başka bir süreçte tutuluyor — bu bot "
+                     "GİRMEZ (BLOK12 §8; kilit: %s). Çift süreç = çift giriş "
+                     "riski; eski süreç durdurulmadan yeniden başlatmayın."
+                     % PROCESS_LOCK_PATH)
+        return 3
+    install_shutdown_handlers()
     if a.loop:
         log.info(f"Döngü, {a.interval}s (heartbeat her 60s)")
-        while True:
+        while not shutdown_requested():
             try:
                 run_once(a.dry)
             except Exception as e:
@@ -5849,15 +5938,24 @@ def main():
             # FAZ14p: uyku toplamda a.interval saniye olmalı. Eski `max(1, interval//60)`
             # 30s için 1 tur = 60s uyuyordu (istenen aralığın iki katı). Artık kalan süre
             # 60s'lik dilimlere bölünür, son dilim artığı kadar uyunur.
+            # BLOK12 §8: dilimler ≤1s kontrol adımlarıyla bölünür — SIGTERM
+            # en geç ~1s içinde döngüden çıkarır.
             remaining = max(0.0, float(a.interval))
-            while remaining > 0:
+            while remaining > 0 and not shutdown_requested():
                 heartbeat_tick()
                 chunk = min(60.0, remaining)
-                time.sleep(chunk)
+                if interruptible_sleep(chunk):
+                    break
                 remaining -= chunk
+            if shutdown_requested():
+                log.info("🛑 döngü kapanıyor — in-flight emir olduğu gibi kalır "
+                         "(akıbet sorgulanmadan iptal YOK), pending/bütçe/onay "
+                         "durumu diskte korunur")
+                break
     else:
         run_once(a.dry)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

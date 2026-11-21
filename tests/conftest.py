@@ -61,6 +61,19 @@ def _isolate_entry_health():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_shutdown_flag():
+    """BLOK12 §8: _SHUTTING_DOWN süreç-içi bayraktır; bir §8 testi bayrağı
+    True bırakırsa SONRAKİ tüm canlı-yol testleri open_coin kapısından
+    geçemezdi (sıralamaya bağımlı toplu kırmızı). Temizle-koşut-geri yükle."""
+    saved = list(auto_trader._SHUTTING_DOWN)
+    auto_trader._SHUTTING_DOWN[0] = False
+    try:
+        yield
+    finally:
+        auto_trader._SHUTTING_DOWN[:] = saved
+
+
+@pytest.fixture(autouse=True)
 def _isolate_sl_ledger(tmp_path):
     _orig = auto_trader.SL_LEDGER_DB
     auto_trader.SL_LEDGER_DB = str(tmp_path / "risk_ledger.db")
