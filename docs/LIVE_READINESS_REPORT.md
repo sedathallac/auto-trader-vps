@@ -1,9 +1,13 @@
-# LIVE_READINESS_REPORT — BLOK10 (FAZ9 bot onarımı, canlı teste hazırlık, kanıtlı teslimat)
+# LIVE_READINESS_REPORT — FAZ9 aday zinciri (BLOK10→devam-F; kanıtlı teslimat)
 
-Tarih: 2026-11-20 · Dal: `fix/deploy-candidate-security-20261120` · Aday SHA: **b2911da**
+Tarih: 2026-11-21 (devam-F güncellemesi) · Dal: `fix/deploy-candidate-security-20261120`
+Aday SHA: **dal UCU = `git ls-remote origin fix/deploy-candidate-security-20261120`**
+(geçici raporlar b2911da/265d433/cf3c32d KAYITLARDIR, güncel aday değildir;
+nihai SHA ve itme doğrulaması FINAL_RELEASE_HANDOFF.md §0 + devir raporundadır.)
 Üretim referansı: `release/faz9-faz14-20261119` @ **108002c** (dokunulmadı; worktree temiz, 0 değişiklik)
-Aday = üretim + 16 commit (7 BLOK4/5/6 kapsam + 3 BLOK10 §3/§4/§6 + 6 BLOK10 §5 P1 onarımı)
-Durum: **READY FOR OPERATOR REVIEW — NOT DEPLOYED**
+Aday = üretim + BLOK4/5/6 + BLOK10 (16) + BLOK11 + BLOK12 (§1–§10) + devam A–E
++ **devam-F (E1 LIMIT pini, E2 süreç-desti gard, E3 crash-penceresi testi)**
+Durum: **BLOCKED — OPERATÖR KAPILARI AÇILMADAN BAŞLATILAMAZ** (bkz. FINAL_RELEASE_HANDOFF.md §8: heartbeat rotasyonu, watchdog kurulumu, testnet, BCH/GALA OOS)
 
 > §0 gözetildi (kanıtlar §7'de): HALTED üretim değişmedi · `is_halted` sıfırlanmadı ·
 > canlı hesaba tek API isteği/emir YOK · servis start/stop/restart YOK · üretime
@@ -109,8 +113,8 @@ Test bütçesi: **2 işlem, ≤50 USDT/işlem, ≤100 USDT toplam.** Herhangi bi
 beklenmedikse DUR; devam kararı yeni bir operatör onayıdır.
 
 1. **Hazırlık onayı**: bu rapor + §6 logları kabul; yedek teyidi (§8.3/2).
-2. **Dal/derleme kontrolü**: `git fetch && git rev-parse origin/fix/deploy-candidate-security-20261120` = b2911da beklenir.
-3. **Test kapısı (VPS, izole HOME)**: `HOME=$(mktemp -d) <venv>/python -I -m pytest tests/ -q -p no:cacheprovider` → **1131 passed exit 0** beklenir.
+2. **Dal/derleme kontrolü**: `git fetch && git rev-parse origin/fix/deploy-candidate-security-20261120` = devir raporundaki NİHAİ SHA beklenir (b2911da BAYAT — BLOK10 kayıt değeridir, aday değildir).
+3. **Test kapısı (VPS, izole HOME)**: `HOME=$(mktemp -d) <venv>/python -I -m pytest tests/ -q -p no:cacheprovider` → beklenen sayı FINAL_RELEASE_HANDOFF.md §0'daki NİHAİ tam-koşum sayısıdır (1131 BAYAT — BLOK10 kaydı).
    ⚠️ Deployment script kapısı (`deploy/faz9_gridc0_deploy.sh:100`) kök `pytest` çalıştırır ve 8 BAYAT testle kırılır (üretim 108002c'de de aynı 8 FAILED — worktree'de kanıtlı, BLOK10 §6); deploy'u script değil bu kapı + operatör yürütsün.
 4. **Env (test penceresi için)**: `CONTROLLED_LIVE_VALIDATION=true`;
    `MAX_VALIDATION_TRADES=2`, `MAX_VALIDATION_POSITION_NOTIONAL_USDT=50`,
@@ -290,5 +294,17 @@ MISSION_STATE "BLOK12 DEVAM E"):
   crash penceresinde token tüketilmeden kalabilir; sınırlar: §8 tek-süreç
   kilidi + 2 işlem hard-cap + pending slot işgali.
 
-Kanıt zinciri ve test adları MISSION_STATE'te; hüküm değişmedi: **READY FOR
-FINAL OPERATOR REVIEW — NOT DEPLOYED.**
+Kanıt zinciri ve test adları MISSION_STATE'te; güncel hüküm (devam-F sonrası):
+**BLOCKED — yalnız gerçek dışsal kapılar** (heartbeat rotasyonu, watchdog
+kurulumu, testnet anahtarları, BCH/GALA OOS) — FINAL_RELEASE_HANDOFF.md §8.
+DEPLOY EDİLMEDİ; üretim 108002c HALTED dokunulmadı.
+
+### 10.4 Devam F — E1 gerçekleşen-doluş tavanı, E2 süreç-desti gard, E3 crash testi (2026-11-21)
+
+| Madde | Uygulama | Kanıt |
+|---|---|---|
+| **E1** gerçekleşen quote ≤ 50 | `open_order_type 1` MARKET idi (canlı imaj kanıtı: OrderType MARKET=1/LIMIT=2/LIMIT_MAKER=3; LIMIT yolunda HB sabit `entry_price` kullanır — `position_executor.py`). Doğrulama girişleri artık **LIMIT pini**: `build_executor_config(entry_price=...)` → type 2 + top-level `entry_price`; `_validation_entry_cap` P_cap=floor_tick(price×(1+allow)), Decimal **A×P_cap ≤ 50 BİREBİR**; aşan plan sessiz kırpılmaz → RED. BUY limit kendi fiyatı üstünde dolmaz (borsa kuralı) → LONG için Σ gerçekleşen matematiksel sınırlı. **SHORT**: doluşu limit üstünde olabilir → realized quote hiçbir emir türüyle tavanlanamaz → doğrulama modunda varsayılan **RED**; `VALIDATION_ALLOW_SHORT_ENTRIES=true` yalnız operatörün drift-zarfı (garanti DEĞİL) iznidir, pin üretmez. Validation kapalı → eski MARKET yolu dokunulmaz; zaf `test_09` ile AÇIKÇA testli — sahte garanti yok. | `test_blok12_e1_limit_cap.py` 15 test (HEAD'de 13 RED → yeşil); yuvarlama birebir (0.497×100.50=49.9485); pending zarfı `worst=TAM A×P_cap, drift=0` |
+| **E2** 418 sürerken istek YOK | Bulunan GERÇEK kusur: api_guard bellek-içiydi → restart ban'ı sıfırlar, ayrı süreçteki orphan_watchdog ban'dan habersiz tur atardı (ban uzaması). `api_guard.json` (STATE_DIR; yalnız bitiş+zaman, sır YOK) → `blocked()=bellek∨dosya`; watchdog turdan ÖNCE gardı denetler, aktifse exit 2 İSTEKSİZ. Yetim SL: yalnız taze FLAT+tracked+algoId-belirli iptal; doğrulanamaz sorgu tracked'de kalır — belirsiz eşleşmede otomatik iptal YOK (mevcut, korundu). | `test_blok12_guard_file_crossproc.py` 7 test (7 RED→yeşil); cooldown/api_guard/watchdog suite'leri 86 passed |
+| **E3** POST↔consume crash | Üretim kodu YENİDEN YAZILMADI; restart simülasyonlu hedef test: POST gitmiş+consume'lanmamış durumdan restart → aynı intent POST ÜRETEMEZ, bütçe 2/2 sabit; kalıntı token tek başına yetki taşımaz. Kalıntı pencere belgelenmeye devam eder. | `test_blok12_approval_ordering.py::TestCrashWindowRestart` (8 passed) |
+
+Bilinen sıra-bağımlılığı (dürüst not): `test_faz12_layer_wiring::test_open_coin_calls_preflight_before_order` ve `test_faz13_calibration_regime_scan::test_order_path_reaches_create_executor_when_gate_passes` İZOLE dosya koşumunda HEAD'de de KIRMIZI (önceden-var olan; tam-süitte yeşil). Nihai tam-koşum sayısı ve preflight FINAL_RELEASE_HANDOFF.md §0'dadır.
