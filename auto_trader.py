@@ -22,6 +22,7 @@ from risk_engine import RiskEngine
 import risk_engine as risk_engine_mod
 from position_reservation import PositionReserver
 import uuid
+from decimal import Decimal, ROUND_FLOOR
 import validation_budget as validation_budget_mod
 import operator_approval as operator_approval_mod
 import api_guard
@@ -693,8 +694,16 @@ class BinanceAPI:
         return self.market_order(symbol, "BUY" if amt < 0 else "SELL", abs(amt), reduce_only=True)
 
 
-def build_executor_config(symbol, amount, lev, side):
+def build_executor_config(symbol, amount, lev, side, entry_price=None):
     """K1=B: a position_executor with NO autonomous close barriers.
+
+    BLOK12 devam-F §2 (E1): entry_price verildiğinde giriş emri SABİT
+    fiyatlı LIMIT olur (open_order_type 2 + top-level entry_price — alan,
+    canlı imajda PositionExecutorConfig'de doğrulandı; LIMIT yolunda HB
+    oracle'a başvurmaz, pinlenmiş fiyatı kullanır). BUY limit kendi
+    fiyatının üstünde dolmaz → LONG realized quote A×entry_price ile
+    MATEMATİKSEL sınırlı. entry_price=None → eski MARKET yolu (type 1,
+    gerçekleşen fiyata sınır YOK — belgelenmiş artan risk).
 
     stop_loss / take_profit / time_limit / trailing_stop are all disabled so
     Hummingbot never places its own close. In dev-2.18.0 every control_* barrier
@@ -720,7 +729,7 @@ def build_executor_config(symbol, amount, lev, side):
     # ±1 konvansiyonu sızarsa executor reddedilir; burada fail-closed durdurulur.
     if side not in (1, 2, 3):
         raise ValueError(f"invalid executor side={side!r}: Hummingbot expects 1, 2 or 3")
-    return {
+    cfg = {
         "type": "position_executor",
         "connector_name": "binance_perpetual",
         "trading_pair": symbol.replace("USDT", "-USDT"),
@@ -732,9 +741,14 @@ def build_executor_config(symbol, amount, lev, side):
             "take_profit": None,
             "time_limit": None,
             "trailing_stop": None,
-            "open_order_type": 1,
+            # OrderType (canlı imaj, hummingbot/core/data_type/common.py):
+            # MARKET=1, LIMIT=2, LIMIT_MAKER=3. E1 pini varsa LIMIT.
+            "open_order_type": 2 if entry_price is not None else 1,
         },
     }
+    if entry_price is not None:
+        cfg["entry_price"] = str(entry_price)
+    return cfg
 
 
 # FAZ15 Stage2b — C6 pagination contract, verified against the INSTALLED image
@@ -777,7 +791,8 @@ class HBAPI:
         return {e.get("executor_id") for e in self.active_executors()
                 if e.get("trading_pair") == pair}
 
-    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
+    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1,
+                        entry_price=None):
         """Single-shot create. On 5xx/timeout the outcome is UNKNOWN: never
         resend; resolve by diffing active executors for the pair.
 
@@ -793,7 +808,8 @@ class HBAPI:
         except Exception as e:
             return {"error": f"pre-create executor snapshot failed, refusing: {e}"}
         payload = {"account_name": HB_ACCOUNT,
-                   "executor_config": build_executor_config(symbol, amount, lev, side)}
+                   "executor_config": build_executor_config(
+                       symbol, amount, lev, side, entry_price=entry_price)}
         try:
             r = _session.post(f"{self.base}/executors/", json=payload,
                               auth=self.auth, timeout=30)
@@ -3497,6 +3513,101 @@ def entry_intent(symbol, side, notional, decision_price):
 # sıkılaştırabilir (min); 50'nin ÜSTÜNE hiçbir ayarla çıkarılamaz. Ön gard,
 # pending garanti zarfı ve dolum denetimi aynı min-tavanı taşır.
 ABS_ORDER_NOTIONAL_CAP_USDT = 50.0
+# BLOK12 devam-F §2 (E1): aynı tavanın Decimal karşılığı — yuvarlama
+# disiplini BİREBİR (float) kontrolü için; float tavanın ikili yaklaşıklığı
+# sınır davasında kanıt sayılmaz.
+ABS_ORDER_NOTIONAL_CAP_USDT_D = Decimal("50.00")
+
+
+def _env_true(name):
+    """Env bayrağı — yalnız açık '1/true/yes/on' (vaka-i hassas değil).
+    Tanımsız/boş → False (fail-closed)."""
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _validation_entry_cap(symbol, side, price, amount, filt, slippage_pct):
+    """(ok, why, p_cap|None, amount, max_quote|None) — BLOK12 devam-F §2 (E1).
+
+    SÖZLEŞME: doğrulama modunda bir giriş emrinin GERÇEKLEŞEN quote notional
+    değeri ABS_ORDER_NOTIONAL_CAP_USDT'yi AŞAMAMALI — "tahmini slippage"
+    raporuyla değil, emrin kendi fiyat sınırıyla. Kanıt canlı imajdan
+    (tahmin değil): OrderType MARKET=1/LIMIT=2/LIMIT_MAKER=3; LIMIT yolunda
+    emir SABİT entry_price'a konur (position_executor.py — oracle yalnız
+    entry_price=None iken); activation_bounds=None → anında gönderilir;
+    BUY limit kendi fiyatının ÜSTÜNDE asla dolmaz (borsa kuralı) →
+    LONG için Σ gerçekleşen ≤ A×P_cap MATEMATİKSEL.
+    SHORT doluşları limitin ÜSTÜNDE fiyatla gerçekleşir → realized quote
+    HİÇBİR emir türüyle yukarıdan sınırlandırILAMAZ → varsayılan RED
+    (fail-closed); VALIDATION_ALLOW_SHORT_ENTRIES=true ile operatör
+    drift-zarfını (worst=plan×(1+drift) — GARANTİ DEĞİL) bilinçli kabullenir.
+    Validation kapalı → (True, "N/A", None, miktar değişmez): eski MARKET
+    yolu dokunulmaz; gerçekleşen-fiyat zafı LIVE_READINESS §10.3'te
+    belgelenmiş artan risk olarak duruyor (sahte garanti iddia edilmez).
+
+    Yuvarlama disiplini (Decimal): P_cap = floor_to_tick(price×(1+allow));
+    A = min(plan, floor_to_step(cap ÷ P_cap)); A×P_cap ≤ 50 BİREBİR doğrulanır.
+    Kırpma minQty/min-notional altına düşüyorsa Sessiz küçültme YOK → RED."""
+    enabled, valid, _budget, why = _validation_control()
+    try:
+        amt_d = Decimal(str(amount))
+    except ArithmeticError:
+        amt_d = None
+    if not enabled:
+        return True, "N/A (validation kapalı — eski MARKET yolu)", None, amt_d, None
+    if not valid or _budget is None:
+        return False, f"doğrulama yapılandırması geçersiz ({why})", None, amt_d, None
+    if int(side) != 1:
+        if not _env_true("VALIDATION_ALLOW_SHORT_ENTRIES"):
+            return False, ("SHORT-GARANTİSİZ: SHORT doluşu limit fiyatının "
+                           "üstünde gerçekleşebilir — realized quote hiçbir "
+                           f"emir türüyle tavanlanamaz (tavan "
+                           f"{ABS_ORDER_NOTIONAL_CAP_USDT}); doğrulama girişi "
+                           "yalnız LONG. Operatör drift-zarfını (garanti "
+                           "değil) kabullenirse "
+                           "VALIDATION_ALLOW_SHORT_ENTRIES=true"), None, amt_d, None
+        return (True, "SHORT operatör izni — yalnız drift zarfı, garanti değil",
+                None, amt_d, None)
+    try:
+        tick = Decimal(str(filt["PRICE_FILTER"]["tickSize"]))
+        step = Decimal(str(filt["LOT_SIZE"]["stepSize"]))
+        min_q = Decimal(str(filt["LOT_SIZE"].get("minQty") or 0))
+        min_n = Decimal(str(filt.get("MIN_NOTIONAL", {}).get("notional") or 0))
+        p0 = Decimal(str(price))
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return False, "sembol filtreleri okunamadı (E1 fail-closed)", None, amt_d, None
+    if amt_d is None or p0 <= 0 or step <= 0 or tick < 0:
+        return False, "geçersiz fiyat/miktar/filter (E1 fail-closed)", None, amt_d, None
+    allow = max(Decimal(str(slippage_pct or 0.0)),
+                Decimal(str(_env_float("VALIDATION_LIMIT_PRICE_ALLOW_PCT",
+                                       "0.005"))))
+    p_raw = p0 * (Decimal(1) + allow)
+    p_cap = ((p_raw / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+             if tick > 0 else p_raw)
+    if p_cap <= 0:
+        return False, (f"P_cap ≤ 0 (tick floor fiyatı yuttu: {p_raw}@{tick})"), \
+        None, amt_d, None
+    a_cap = ((ABS_ORDER_NOTIONAL_CAP_USDT_D / p_cap) / step
+             ).to_integral_value(rounding=ROUND_FLOOR) * step
+    # Sessiz KIRPMA YOK: plan tavanı aşıyorsa emir RED (devam-C/D/E "ÖN gard,
+    # miktar/fiyat önden korunur" sözleşüsü — operatör onaylı boyut kendi
+    # rızası dışında küçültülmez; aşım POST'A GİTMEDEN durur).
+    if a_cap <= 0 or (min_q > 0 and a_cap < min_q):
+        return False, (f"tavanı karşılayan geçerli miktar yok: A_max={a_cap} "
+                       f"< minQty={min_q} — P_cap={p_cap} için tavan-altı "
+                       "giriş AÇILAMAZ"), None, amt_d, None
+    if amt_d > a_cap:
+        return False, (f"tavan aşımı: plan A={amt_d} × P_cap={p_cap} > "
+                       f"{ABS_ORDER_NOTIONAL_CAP_USDT_D} — izinli en büyük "
+                       f"A={a_cap}; miktar KIRPILMAZ, emir RED"), None, amt_d, None
+    max_quote = amt_d * p_cap
+    if max_quote > ABS_ORDER_NOTIONAL_CAP_USDT_D:
+        return False, (f"aritmetik değişmez ihlali: A×P_cap={max_quote} > "
+                       f"{ABS_ORDER_NOTIONAL_CAP_USDT_D}"), None, amt_d, None
+    if min_n > 0 and amt_d * p0 < min_n:
+        return False, (f"miktar min notional altı: {amt_d}×{p0}="
+                       f"{amt_d * p0} < {min_n} — RED"), None, amt_d, None
+    return True, (f"LIMIT tavanı: A={amt_d} × P_cap={p_cap} = {max_quote} ≤ "
+                  f"{ABS_ORDER_NOTIONAL_CAP_USDT_D}"), p_cap, amt_d, max_quote
 
 
 def _validation_fill_envelope(final_notional, slippage_pct):
@@ -4099,6 +4210,30 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info("  [DRY] emir yok")
         return True
 
+    # BLOK12 devam-F §2 (E1): doğrulama girişinde GERÇEKLEŞEN doluş için sert
+    # tavan — plan A×P_cap ≤ 50 DEĞİLSE emir RED (sessiz kırpma YOK) ve
+    # uygunsa SABİT fiyatlı LIMIT olarak gönderilir (BUY limit P_cap üstünde
+    # matematiksel olarak dolamaz; SHORT varsayılan fail-closed —
+    # bkz. _validation_entry_cap). dry_run/compare veri hattı yukarıda
+    # döndü; DEĞİŞMEZ.
+    e1_price = None
+    e1_max_quote = None
+    _e1_ok, _e1_why, e1_price, _e1_amt, e1_max_quote = _validation_entry_cap(
+        symbol, side, float(price), amount, filt, slippage_pct)
+    if not _e1_ok:
+        log.warning(f"  atlandı: E1 doluş tavanı ({_e1_why})")
+        return False
+    if e1_price is not None and _e1_amt != Decimal(str(amount)):
+        # Değişmez: E1 sessiz kırpma YAPMAZ (yardımcı RED verir). Beklenmedik
+        # bir sapma olursa emir GÖNDERİLMEZ (fail-closed).
+        log.critical(f"  🚨 E1 değişmez ihlali: yardımcı miktarı değiştirdi "
+                     f"({amount} → {_e1_amt}) — POST YOK")
+        return False
+    if e1_price is not None:
+        log.info(f"  🔒 E1 LIMIT pini: {symbol} entry_price={e1_price} "
+                 f"max_realized_quote={e1_max_quote}")
+
+
     # Dinamik kaldıraç (flag açıksa ATR-bazlı, kapalıysa sabit 3x)
     _dd_now = float(getattr(risk, "current_drawdown", 0.0) or 0.0)
     # FAZ14: kademe tavanı sabit LIVE_LEVERAGE değil, LIVE_MAX_LEVERAGE'dir. compute_leverage
@@ -4245,6 +4380,11 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # GERÇEK notional'ı bu zarfla kıyaslar (None: bütçe kapalı/depo hatası —
     # denetim tavan-okunabilirliğine düşer).
     _fg_env = _validation_fill_envelope(final_notional, slippage_pct)
+    if _fg_env is not None and e1_price is not None:
+        # E1: pinli LIMIT için en-kötü TAHMİN değil TAM A×P_cap'tir
+        # (borsa kuralı: BUY limit kendi fiyatı üstünde dolmaz). drift=0.0
+        # buradan gelir — garanti zarfı, tahmini slippage DEĞİL.
+        _fg_env = (_fg_env[0], 0.0, float(e1_max_quote))
 
     # BLOK10 §3: doğrulama modu AÇIK ise bağımsız bütçe hakkı POST'TAN ÖNCE
     # ayrılır (SQLite, atomik). Ret/depo-hatası → emir YOK. UNKNOWN → hak kalır;
@@ -4297,7 +4437,13 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             reserver.release(_res_id, reason="rate_limit_pre_order")
         return False
 
-    er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
+    er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct,
+                            TIME_LIMIT_SEC, side=side,
+                            # E1: pin varsa yalnız kwargs olarak eklenir —
+                            # entry_price tanımayan eski HB sahteleri/çağrıları
+                            # MARKET yolunda hiçbir zaman bu kwarg'ı almaz.
+                            **({"entry_price": e1_price}
+                               if e1_price is not None else {}))
     eid = er.get("executor_id")
     if not eid:
         # Kader tek yerde belirlenir: KEEP (var olabilir) / RELEASE (teyitli yok).
@@ -4365,6 +4511,11 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         # da diskten okunur; denetim bunu kullanır.
         "cap_per_trade_usdt": (_fg_env[0] if _fg_env else None),
         "worst_fill_usdt": (_fg_env[2] if _fg_env else None),
+        # BLOK12 devam-F §2 (E1): LIMIT pini ve matematiksel üst sınır —
+        # pin yoksa (validation kapalı eski MARKET yolu) None'lar dürüst "yok".
+        "entry_price_cap": (float(e1_price) if e1_price is not None else None),
+        "max_realized_quote": (float(e1_max_quote)
+                               if e1_max_quote is not None else None),
     })
     log.info(f"  ⏳ dolum bekleniyor (tick'ler arası, {FILL_WAIT_S:.0f}s): executor={eid}")
     return True

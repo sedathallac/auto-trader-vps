@@ -69,7 +69,8 @@ class FakeHB:
             [{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "EX1",
               "custom_info": {"order_ids": []}}]
 
-    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
+    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1,
+                        entry_price=None):
         self.created.append(symbol)
         return {"executor_id": "EX1"}
 

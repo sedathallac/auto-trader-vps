@@ -142,7 +142,8 @@ class FakeEntryHB:
     def active_executors(self):
         return []
 
-    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1):
+    def create_executor(self, symbol, amount, lev, sl, tp, tl, side=1,
+                        entry_price=None):
         # CreateExecutorResponse: emir kimliği YOK — yalnız executor kimliği.
         return {"executor_id": "E1"}
 
@@ -769,7 +770,8 @@ class TestPendingEntryLifecycle(Base):
         names = ("check_liquidity", "check_correlation_limit", "decide_side",
                  "calculate_atr", "calculate_position_size", "_live_cfg",
                  "_validation_reserve", "_validation_fill_guard",
-                 "_validation_fill_exceeded", "_operator_gate_check")
+                 "_validation_fill_exceeded", "_operator_gate_check",
+                 "_validation_entry_cap")
         self._orig = {n: getattr(auto_trader, n) for n in names}
         auto_trader.check_liquidity = lambda b, s: (True, "ok")
         auto_trader.check_correlation_limit = lambda s, b: True
@@ -791,6 +793,12 @@ class TestPendingEntryLifecycle(Base):
         auto_trader._validation_fill_guard = lambda n, s: (True, "test-bypass")
         auto_trader._validation_fill_exceeded = lambda s, f: None
         auto_trader._operator_gate_check = lambda: (True, "test-bypass")
+        # BLOK12 devam-F §2 (E1) aynı gerekçeyle: LIMIT pini tavan hesabı
+        # harness'in 200 USDT'lik simülasyonunu meşru olarak RED ederdi;
+        # E1'in kendisi test_blok12_e1_limit_cap'de doğrulanır. Pin YOK
+        # (None) → harness eski MARKET yolunda kalır, miktar değişmez.
+        auto_trader._validation_entry_cap = lambda s, side, p, a, f, sl: (
+            True, "test-bypass", None, a, None)
         auto_trader._live_cfg = lambda: SimpleNamespace(
             is_live=False, max_position_pct=None, max_notional=0, max_leverage=20)
 
