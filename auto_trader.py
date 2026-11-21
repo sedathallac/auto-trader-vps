@@ -1021,12 +1021,168 @@ def is_flat_confirmed(positions, symbol):
     return amt == 0.0
 
 
+def _executor_created_ms(executor):
+    """BLOK16.3: executor'ın HB-created_at alanını (naive/aware ISO ya da epoch
+    saniye/ms) UTC ms'ye çevirir. Anchorsuz yedek yolun tarama penceresi buradan
+    başlar; okunamazsa raise — fail-closed, UNKNOWN korunur."""
+    import datetime as _dtm
+    raw = executor.get("created_at")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        val = float(raw)
+        if val <= 0:
+            raise ValueError(f"executor created_at invalid: {raw!r}")
+        return int(val * 1000 if val < 1e11 else val)
+    txt = str(raw or "").strip()
+    if not txt:
+        raise ValueError("executor created_at missing for SL-algo fallback")
+    try:
+        dtobj = _dtm.datetime.fromisoformat(txt.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"executor created_at unparseable: {raw!r}")
+    if dtobj.tzinfo is None:
+        dtobj = dtobj.replace(tzinfo=_dtm.timezone.utc)
+    return int(dtobj.timestamp() * 1000)
+
+
+def _resolve_closed_algo_exit(binance, symbol):
+    """BLOK16.3 — anchorsuz (benimsenmiş) executor için kapanış emri kimliği.
+
+    Pozisyonu GERÇEKTEN kapatan borsa algo emrinin id'si botun kendi SL
+    defterinden (sl_placements.algo_id — SL yerleştirme anında yazılır) alınır;
+    get_algo_order ile borsadan doğrulanır: FINISHED, sembol eşleşmesi ve dolu
+    actualOrderId; çocuğu olan düz emir FILLED ve açıkça reduceOnly olmalı.
+    Başka her durum raise'ler — kapanış UNKNOWN kalır, PnL UYDURULMAZ. Bu,
+    BLOK15'te elle yapılan ADA prosedürünün (algoId 2000001720858143) koda
+    geçirilmiş halidir.
+    """
+    from sl_placement import SlPlacementStore
+    try:
+        row = SlPlacementStore(SL_LEDGER_DB).get(symbol)
+    except Exception as _sle:
+        raise ValueError(
+            "no SL placement algo_id for SL-algo fallback "
+            f"(ledger unreadable: {type(_sle).__name__}: {_sle})")
+    if not row or not row.get("algo_id"):
+        raise ValueError("no SL placement algo_id for SL-algo fallback")
+    g = binance.get_algo_order(algo_id=row["algo_id"])
+    if not isinstance(g, dict) or g.get("code") is not None:
+        raise ValueError(f"algo order lookup failed: {g!r}")
+    if str(g.get("symbol") or "").upper() != symbol:
+        raise ValueError(f"algo order symbol mismatch: {g.get('symbol')!r}")
+    if str(g.get("algoStatus") or "").upper() != "FINISHED":
+        raise ValueError(f"algo order not FINISHED: {g.get('algoStatus')!r}")
+    try:
+        actual_oid = int(g.get("actualOrderId") or 0)
+    except (TypeError, ValueError):
+        actual_oid = 0
+    if actual_oid <= 0:
+        raise ValueError("FINISHED algo order lacks actualOrderId")
+    exit_order = binance.query_order(symbol, order_id=actual_oid)
+    if not isinstance(exit_order, dict) or exit_order.get("code") is not None:
+        raise ValueError(f"algo exit order lookup failed: {exit_order!r}")
+    if exit_order.get("status") != "FILLED":
+        raise ValueError(f"algo exit order not FILLED: {exit_order.get('status')!r}")
+    raw_ro = exit_order.get("reduceOnly")
+    if not (raw_ro is True or raw_ro == 1
+            or (isinstance(raw_ro, str)
+                and raw_ro.strip().lower() in ("true", "1"))):
+        raise ValueError(
+            f"algo exit order {actual_oid} is not explicitly reduceOnly")
+    if str(exit_order.get("side") or "").upper() not in ("BUY", "SELL"):
+        raise ValueError("algo exit order lacks valid side")
+    log.info(f"  BLOK16.3 PnL atıf yedeği ({symbol}): SL defteri algo "
+             f"{row['algo_id']} → kapanış emri {actual_oid}")
+    return exit_order
+
+
+def _match_closed_algo_fills(all_trades, exit_order, binance, symbol):
+    """BLOK16.3 anchorsuz atıf: kapanış = exit emrinin (algo actualOrderId) tüm
+    fill'leri; giriş = TERS tarafından, TAM ve tek bir emirden gelen, reduceOnly
+    OLMAYAN fill'ler. SL emri dışındaki aynı-yön fill'i, birden çok giriş emri,
+    miktar uyuşmazlığı → belirsiz → fail-closed. Giriş emri ayrıca query_order
+    ile doğrulanır (FILLED + reduceOnly değil + executedQty mutabakatı).
+
+    BİLİNEN MUHAFAZAKÂRLIK: pencere executor yaratımından başlayıp tarama
+    bitimine kadar HER aynı-sembol akışını okur; kapanıştan SONRA bile olsa
+    sızıntı/birden-çok-emir görülürse red verilir (eski durumdan kötü değil:
+    UNKNOWN korunur, yanlış atıf imkânsız)."""
+    from decimal import Decimal as _D
+    tol = _D("0.00000001")
+    exit_oid = int(exit_order.get("orderId") or 0)
+    exit_side = str(exit_order.get("side") or "").upper()
+    entry_side = "BUY" if exit_side == "SELL" else "SELL"
+    exit_rows, entry_rows = [], []
+    entry_oid = None
+    exit_qty = _D("0")
+    entry_qty = _D("0")
+    for row in all_trades:
+        try:
+            oid = int(row.get("orderId"))
+        except (TypeError, ValueError):
+            raise ValueError("userTrades row lacks valid orderId")
+        side = str(row.get("side") or "").upper()
+        qty = _D(str(row.get("qty") or "0"))
+        if oid == exit_oid:
+            if side != exit_side:
+                raise ValueError("exit order fill side disagrees with exit order")
+            exit_rows.append(row)
+            exit_qty += qty
+        elif side == exit_side:
+            raise ValueError(
+                "fill on exit side outside the SL algo order; attribution "
+                "is ambiguous")
+        elif side == entry_side:
+            if entry_oid is None:
+                entry_oid = oid
+            elif oid != entry_oid:
+                raise ValueError(
+                    "more than one entry-side order in window; attribution is "
+                    "ambiguous")
+            entry_rows.append(row)
+            entry_qty += qty
+    if not exit_rows or exit_qty <= 0:
+        raise ValueError("SL algo exit has no fills")
+    if entry_oid is None:
+        raise ValueError("no entry-side fill found in window")
+    if entry_oid == exit_oid:
+        raise ValueError("entry and exit order identity equal — impossible")
+    if abs(entry_qty - exit_qty) > tol:
+        raise ValueError(
+            f"entry/exit quantity mismatch: entry={entry_qty}, exit={exit_qty}")
+    entry = binance.query_order(symbol, order_id=entry_oid)
+    if not isinstance(entry, dict) or entry.get("code") is not None:
+        raise ValueError(f"entry order lookup failed: {entry!r}")
+    if entry.get("status") != "FILLED":
+        raise ValueError(f"entry order not FILLED: {entry.get('status')!r}")
+    raw_ro = entry.get("reduceOnly")
+    if raw_ro is True or raw_ro == 1 or (
+            isinstance(raw_ro, str) and raw_ro.strip().lower() in ("true", "1")):
+        raise ValueError("candidate entry order is marked reduceOnly — not an entry")
+    filled = _D(str(entry.get("executedQty") or "0"))
+    if abs(filled - entry_qty) > tol:
+        raise ValueError(
+            f"entry fill mismatch: order={filled}, userTrades={entry_qty}")
+    if str(entry.get("side") or "").upper() != entry_side:
+        raise ValueError("entry order side disagrees with fills")
+    entry_ms = int(entry.get("time") or 0)
+    close_ms = max(int(r.get("time", 0)) for r in exit_rows)
+    if not entry_ms or close_ms < entry_ms:
+        raise ValueError("closing timestamp precedes entry")
+    return (entry_oid, entry_ms, entry_side, entry_qty,
+            entry_rows, exit_rows, close_ms)
+
+
 def _recover_stale_executor_net_pnl(executor, binance):
     """Recover a stale RUNNING executor only from an exact Binance fill cycle.
 
-    Requires one x-nb entry client ID, a FILLED entry order, matching entry fills,
-    a complete opposite-side close quantity, quote-asset commissions and a
-    successful funding-fee query. Ambiguous cases fail closed.
+    Anchor path: one x-nb entry client ID, a FILLED entry order, matching entry
+    fills, a complete opposite-side close quantity, quote-asset commissions and
+    a successful funding-fee query.
+
+    BLOK16.3 fallback (custom_info boş — benimsenmiş executor): kapanış, SL
+    defterindeki algo kaydının actualOrderId'sinden; giriş, penceredeki tek
+    non-reduceOnly emirden kanıtlanır. Ambiguous cases fail closed in both
+    paths — UNKNOWN kalır, PnL asla uydurulmaz.
     """
     import json as _json
     from decimal import Decimal as _D
@@ -1053,8 +1209,6 @@ def _recover_stale_executor_net_pnl(executor, binance):
 
     client_ids = set()
     _client_ids(info, client_ids)
-    if len(client_ids) != 1:
-        raise ValueError(f"expected exactly one x-nb entry client ID, found {len(client_ids)}")
 
     pair = executor.get("trading_pair")
     if not pair:
@@ -1065,21 +1219,28 @@ def _recover_stale_executor_net_pnl(executor, binance):
         raise ValueError(f"unsupported quote asset for automatic net PnL: {pair}")
     quote_asset = "USDT"
 
-    entry = binance.query_order(
-        symbol, orig_client_order_id=next(iter(client_ids))
-    )
-    if not isinstance(entry, dict) or entry.get("code") is not None:
-        raise ValueError(f"Binance entry order lookup failed: {entry!r}")
-    if entry.get("status") != "FILLED":
-        raise ValueError(f"entry order not FILLED: {entry.get('status')!r}")
-
-    entry_order_id = int(entry.get("orderId") or 0)
-    entry_ms = int(entry.get("time") or 0)
-    entry_side = str(entry.get("side") or "").upper()
-    entry_qty = _D(str(entry.get("executedQty") or "0"))
-
-    if not entry_order_id or not entry_ms or entry_side not in ("BUY", "SELL") or entry_qty <= 0:
-        raise ValueError("entry order lacks valid orderId/time/side/executedQty")
+    algo_fallback = False
+    exit_order = None
+    if len(client_ids) == 1:
+        entry = binance.query_order(
+            symbol, orig_client_order_id=next(iter(client_ids))
+        )
+        if not isinstance(entry, dict) or entry.get("code") is not None:
+            raise ValueError(f"Binance entry order lookup failed: {entry!r}")
+        if entry.get("status") != "FILLED":
+            raise ValueError(f"entry order not FILLED: {entry.get('status')!r}")
+        if int(entry.get("time") or 0) <= 0:
+            raise ValueError("entry order lacks valid time")
+        start_ms = max(0, int(entry.get("time") or 0) - 1000)
+    elif not client_ids:
+        # BLOK16.3: benimsenmiş executor (custom_info null) — x-nb anchor yok;
+        # kapanış kimliği SL defterindeki algo kaydından gelir. Orada da kanıt
+        # yoksa raise → kapanış UNKNOWN kalır (eski davranışın koruması).
+        algo_fallback = True
+        exit_order = _resolve_closed_algo_exit(binance, symbol)
+        start_ms = max(0, _executor_created_ms(executor) - 120_000)
+    else:
+        raise ValueError(f"expected exactly one x-nb entry client ID, found {len(client_ids)}")
 
     # Fetch the complete userTrades sequence from just before the entry.
     all_trades = []
@@ -1087,7 +1248,7 @@ def _recover_stale_executor_net_pnl(executor, binance):
     for page in range(100):
         params = {"symbol": symbol, "limit": 1000}
         if from_id is None:
-            params["startTime"] = max(0, entry_ms - 1000)
+            params["startTime"] = start_ms
         else:
             params["fromId"] = from_id
 
@@ -1106,124 +1267,139 @@ def _recover_stale_executor_net_pnl(executor, binance):
         int(row.get("time", 0)), int(row.get("id", 0))
     ))
 
-    entry_rows = [
-        row for row in all_trades
-        if int(row.get("orderId", -1)) == entry_order_id
-    ]
-    if not entry_rows:
-        raise ValueError("entry order has no matching userTrades fills")
-
-    entry_filled = sum(
-        (_D(str(row.get("qty") or "0")) for row in entry_rows), _D("0")
-    )
-    tolerance = _D("0.00000001")
-    if abs(entry_filled - entry_qty) > tolerance:
-        raise ValueError(
-            f"entry fill mismatch: order={entry_qty}, userTrades={entry_filled}"
-        )
-
-    last_entry_key = max(
-        (int(row.get("time", 0)), int(row.get("id", 0)))
-        for row in entry_rows
-    )
-    exit_side = "BUY" if entry_side == "SELL" else "SELL"
-
-    exit_rows = []
-    exit_qty = _D("0")
-    for row in all_trades:
-        key = (int(row.get("time", 0)), int(row.get("id", 0)))
-        if key <= last_entry_key:
-            continue
-        if int(row.get("orderId", -1)) == entry_order_id:
-            continue
-
-        side = str(row.get("side") or "").upper()
-        if side == entry_side:
-            raise ValueError(
-                "another same-direction fill occurred before the original "
-                "position was fully closed; attribution is ambiguous"
-            )
-        if side != exit_side:
-            continue
-
-        exit_rows.append(row)
-        exit_qty += _D(str(row.get("qty") or "0"))
-
-        if exit_qty > entry_qty + tolerance:
-            raise ValueError("closing fills exceed entry quantity; possible reversal")
-        if exit_qty >= entry_qty - tolerance:
-            break
-
-    if abs(exit_qty - entry_qty) > tolerance or not exit_rows:
-        raise ValueError(
-            f"closing fills incomplete: entry={entry_qty}, close={exit_qty}"
-        )
-
-    close_ms = max(int(row.get("time", 0)) for row in exit_rows)
-    if close_ms < entry_ms:
-        raise ValueError("closing timestamp precedes entry")
-
-    # Every matched closing fill must belong to a Binance order explicitly
-    # marked reduceOnly. This prevents a later opposite-direction entry from
-    # being mistaken for the close of this executor.
-    exit_order_ids = {int(row.get("orderId", -1)) for row in exit_rows}
-    if not exit_order_ids or -1 in exit_order_ids:
-        raise ValueError("closing trade is missing a valid orderId")
-
-    orders_by_id = {}
-    order_cursor = None
-    for page in range(100):
-        order_params = {"symbol": symbol, "limit": 1000}
-        if order_cursor is None:
-            order_params["startTime"] = max(0, entry_ms - 1000)
-        else:
-            order_params["orderId"] = order_cursor
-        order_params["endTime"] = close_ms + 1000
-
-        order_batch = binance._get(
-            "/fapi/v1/allOrders", order_params, signed=True
-        )
-        if not isinstance(order_batch, list):
-            raise ValueError(
-                f"allOrders lookup failed: {order_batch!r}"
-            )
-
-        for order in order_batch:
-            try:
-                oid = int(order.get("orderId") or 0)
-            except (TypeError, ValueError):
-                continue
-            if oid in exit_order_ids:
-                orders_by_id[oid] = order
-
-        if exit_order_ids.issubset(orders_by_id):
-            break
-        if len(order_batch) < 1000:
-            break
-        order_cursor = int(order_batch[-1].get("orderId") or 0) + 1
+    if algo_fallback:
+        # BLOK16.3: giriş/çıkış atfı SL-algo yedeğinden; reduceOnly doğrulaması
+        # _match_closed_algo_fills + _resolve_closed_algo_exit içinde yapıldı.
+        (entry_order_id, entry_ms, entry_side, entry_qty,
+         entry_rows, exit_rows, close_ms) = _match_closed_algo_fills(
+            all_trades, exit_order, binance, symbol)
     else:
-        raise ValueError("allOrders pagination limit reached")
+        entry_order_id = int(entry.get("orderId") or 0)
+        entry_ms = int(entry.get("time") or 0)
+        entry_side = str(entry.get("side") or "").upper()
+        entry_qty = _D(str(entry.get("executedQty") or "0"))
+        if (not entry_order_id or not entry_ms
+                or entry_side not in ("BUY", "SELL") or entry_qty <= 0):
+            raise ValueError("entry order lacks valid orderId/time/side/executedQty")
 
-    missing_orders = exit_order_ids - set(orders_by_id)
-    if missing_orders:
-        raise ValueError(
-            f"closing order IDs absent from allOrders: {sorted(missing_orders)}"
-        )
+        entry_rows = [
+            row for row in all_trades
+            if int(row.get("orderId", -1)) == entry_order_id
+        ]
+        if not entry_rows:
+            raise ValueError("entry order has no matching userTrades fills")
 
-    for oid, order in orders_by_id.items():
-        raw_reduce_only = order.get("reduceOnly")
-        is_reduce_only = (
-            raw_reduce_only is True
-            or raw_reduce_only == 1
-            or (
-                isinstance(raw_reduce_only, str)
-                and raw_reduce_only.strip().lower() in ("true", "1")
-            )
+        entry_filled = sum(
+            (_D(str(row.get("qty") or "0")) for row in entry_rows), _D("0")
         )
-        if not is_reduce_only:
+        tolerance = _D("0.00000001")
+        if abs(entry_filled - entry_qty) > tolerance:
             raise ValueError(
-                f"closing order {oid} is not explicitly reduceOnly"
+                f"entry fill mismatch: order={entry_qty}, userTrades={entry_filled}"
             )
+
+        last_entry_key = max(
+            (int(row.get("time", 0)), int(row.get("id", 0)))
+            for row in entry_rows
+        )
+        exit_side = "BUY" if entry_side == "SELL" else "SELL"
+
+        exit_rows = []
+        exit_qty = _D("0")
+        for row in all_trades:
+            key = (int(row.get("time", 0)), int(row.get("id", 0)))
+            if key <= last_entry_key:
+                continue
+            if int(row.get("orderId", -1)) == entry_order_id:
+                continue
+
+            side = str(row.get("side") or "").upper()
+            if side == entry_side:
+                raise ValueError(
+                    "another same-direction fill occurred before the original "
+                    "position was fully closed; attribution is ambiguous"
+                )
+            if side != exit_side:
+                continue
+
+            exit_rows.append(row)
+            exit_qty += _D(str(row.get("qty") or "0"))
+
+            if exit_qty > entry_qty + tolerance:
+                raise ValueError("closing fills exceed entry quantity; possible reversal")
+            if exit_qty >= entry_qty - tolerance:
+                break
+
+        if abs(exit_qty - entry_qty) > tolerance or not exit_rows:
+            raise ValueError(
+                f"closing fills incomplete: entry={entry_qty}, close={exit_qty}"
+            )
+
+        close_ms = max(int(row.get("time", 0)) for row in exit_rows)
+        if close_ms < entry_ms:
+            raise ValueError("closing timestamp precedes entry")
+
+        # Every matched closing fill must belong to a Binance order explicitly
+        # marked reduceOnly. This prevents a later opposite-direction entry from
+        # being mistaken for the close of this executor.
+        exit_order_ids = {int(row.get("orderId", -1)) for row in exit_rows}
+        if not exit_order_ids or -1 in exit_order_ids:
+            raise ValueError("closing trade is missing a valid orderId")
+
+        orders_by_id = {}
+        order_cursor = None
+        for page in range(100):
+            order_params = {"symbol": symbol, "limit": 1000}
+            if order_cursor is None:
+                order_params["startTime"] = max(0, entry_ms - 1000)
+            else:
+                order_params["orderId"] = order_cursor
+            order_params["endTime"] = close_ms + 1000
+
+            order_batch = binance._get(
+                "/fapi/v1/allOrders", order_params, signed=True
+            )
+            if not isinstance(order_batch, list):
+                raise ValueError(
+                    f"allOrders lookup failed: {order_batch!r}"
+                )
+
+            for order in order_batch:
+                try:
+                    oid = int(order.get("orderId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if oid in exit_order_ids:
+                    orders_by_id[oid] = order
+
+            if exit_order_ids.issubset(orders_by_id):
+                break
+            if len(order_batch) < 1000:
+                break
+            order_cursor = int(order_batch[-1].get("orderId") or 0) + 1
+        else:
+            raise ValueError("allOrders pagination limit reached")
+
+        missing_orders = exit_order_ids - set(orders_by_id)
+        if missing_orders:
+            raise ValueError(
+                f"closing order IDs absent from allOrders: {sorted(missing_orders)}"
+            )
+
+        for oid, order in orders_by_id.items():
+            raw_reduce_only = order.get("reduceOnly")
+            is_reduce_only = (
+                raw_reduce_only is True
+                or raw_reduce_only == 1
+                or (
+                    isinstance(raw_reduce_only, str)
+                    and raw_reduce_only.strip().lower() in ("true", "1")
+                )
+            )
+            if not is_reduce_only:
+                raise ValueError(
+                    f"closing order {oid} is not explicitly reduceOnly"
+                )
 
     fee_total = _D("0")
     realized_total = _D("0")
