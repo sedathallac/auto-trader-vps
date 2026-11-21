@@ -44,6 +44,23 @@ def _isolate_validation_budget(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_entry_health():
+    """BLOK12 §4: _ENTRY_HEALTH süreç-içi MODÜL sözlüğüdür; §2'nin
+    validation_fill_cap kapısı (doluş tavanı aşımı) bir testte kurulursa
+    sonraki testlerin merkezi risk kapısını SESSİZCE kapatıyordu (sıralamaya
+    bağımlı kırmızılar). Diğer durum yalıtımlarıyla aynı desen: önce temizle,
+    sonra geri yükle. Üretim davranışı değişmez — gerçek süreçte kapı
+    yaşam döngüsü aynıdır; yalnız test izolasyonudur."""
+    saved = dict(auto_trader._ENTRY_HEALTH)
+    auto_trader._ENTRY_HEALTH.clear()
+    try:
+        yield
+    finally:
+        auto_trader._ENTRY_HEALTH.clear()
+        auto_trader._ENTRY_HEALTH.update(saved)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_sl_ledger(tmp_path):
     _orig = auto_trader.SL_LEDGER_DB
     auto_trader.SL_LEDGER_DB = str(tmp_path / "risk_ledger.db")

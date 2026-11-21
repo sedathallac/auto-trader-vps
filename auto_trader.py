@@ -23,6 +23,7 @@ from position_reservation import PositionReserver
 import uuid
 import validation_budget as validation_budget_mod
 import operator_approval as operator_approval_mod
+import api_guard
 import coin_quality
 import leverage_policy
 import sizing_policy
@@ -377,6 +378,27 @@ class AccountSnapshot:
                 f"available={self.available_balance}, can_trade={self.can_trade})")
 
 
+def _api_response(resp):
+    """BLOK12 §4 — her Binance REST yanıtının tek geçiş noktası.
+
+    429/418 → api_guard'a not (Retry-After uygulanır, artışlı backoff); başarılı
+    2xx grevleri sıfırlar. Gövde .json() olarak döner; çözümlenemeyen gövde
+    hata sözlüğüdür (çağıranlar isinstance(list)/'code' kontrolüyle fail-closed).
+    Bu fonksiyon HİÇBİR isteği yeniden göndermez."""
+    try:
+        code = int(getattr(resp, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in (429, 418):
+        api_guard.note_http_status(code, getattr(resp, "headers", None))
+    elif 200 <= code < 300:
+        api_guard.success()
+    try:
+        return resp.json()
+    except ValueError:
+        return {"code": -1, "msg": f"non-json http {code}"}
+
+
 class BinanceAPI:
     def __init__(self, key, secret, base=None):
         self.key = key
@@ -399,18 +421,26 @@ class BinanceAPI:
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 60000
-            return _session.get(f"{self.base}{path}?{self._sign(params)}",
-                                headers=self._hdr(), timeout=15).json()
-        return _session.get(f"{self.base}{path}", params=params, timeout=15).json()
+            resp = _session.get(f"{self.base}{path}?{self._sign(params)}",
+                                headers=self._hdr(), timeout=15)
+        else:
+            resp = _session.get(f"{self.base}{path}", params=params, timeout=15)
+        return _api_response(resp)
 
     def _post(self, path, params, method="POST"):
+        # BLOK12 §4: POST/DELETE urllib3 tarafından YENİDEN GÖNDERİLMEZ
+        # (allowed_methods=["GET"]); buradan kör retry yolu yok. 429/418 yalnız
+        # not edilir → cooldown, yeni giriş fail-closed; ACK belirsizliğinde
+        # durum KORUNUR, emir tekrarlanmaz.
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 60000
         url = f"{self.base}{path}?{self._sign(params)}"
         if method == "DELETE":
-            return _session.delete(url, headers=self._hdr(), timeout=15).json()
-        return _session.post(url, headers=self._hdr(), timeout=15).json()
+            resp = _session.delete(url, headers=self._hdr(), timeout=15)
+        else:
+            resp = _session.post(url, headers=self._hdr(), timeout=15)
+        return _api_response(resp)
 
     def account(self):
         """GET /fapi/v2/account — the startup check reads balance and canTrade from here."""
@@ -2379,23 +2409,91 @@ def check_stale_data(binance, max_age_sec=30):
         return False
 
 
-def calculate_atr(binance, symbol, interval="15m", period=14):
-    """ATR'yi yüzde olarak döndür (örn. 0.025 = %2.5)"""
-    try:
+# ------------------------------------------------------- BLOK12 §4: KAPALI BAR
+# Strateji kararları YALNIZ kapanmış mumlardan hesaplanır. klines satırında
+# index 6 = close_time (ms). close_time > now → mum AÇIK → sete ASLA girmez.
+# Son kapanan bar çok eskiyse (veri eksik/gecikmiş) stale=True → giriş yok.
+# (Bu bot REST-only'dir; websocket kullanmaz — WS-break senaryosu REST hata
+# modlarıyla test edilir: bozuk/eksik veri → None → yeni giriş fail-closed.)
+_INTERVAL_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+                "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+                "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000,
+                "12h": 43_200_000, "1d": 86_400_000}
+_CLOSED_KL_CACHE = {}
+
+
+def _interval_ms(interval):
+    return _INTERVAL_MS.get(str(interval), 900_000)
+
+
+def closed_bars(klines, interval="15m", now_ms=None, stale_factor=2.5):
+    """(kapanmış barlar, stale) — BLOK12 §4 kapanış-zamanı sözleşmesi.
+
+    Bozuk/eksik alanlı satır → (None, True) (fail-closed). Açık mum hariç.
+    Hiç kapanmış bar yok ya da son kapanan bar interval*stale_factor'dan
+    eskiyse stale=True — çağıran yeni girişe veri yok muamelesi yapmalı."""
+    if not isinstance(klines, list) or not klines:
+        return None, True
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    out = []
+    for k in klines:
+        if not isinstance(k, (list, tuple)) or len(k) < 8:
+            return None, True
+        try:
+            ct = int(k[6])
+            float(k[4])
+        except (TypeError, ValueError):
+            return None, True
+        if ct <= now:
+            out.append(k)
+    if not out:
+        return None, True
+    stale = (now - int(out[-1][6])) > _interval_ms(interval) * stale_factor
+    return out, stale
+
+
+def closed_klines_for(binance, symbol, interval="15m", need=15, now_ms=None):
+    """Tek kaynak: ATR ve hacim AYNI kapanmış bar setinden hesaplansın diye
+    zaman kovası başına tek fetch; son `need` kapanmış barı döndürür.
+    Dönen: (bars|None, stale). Bozuk/veri-yok → (None, True)."""
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    im = _interval_ms(interval)
+    key = (symbol, str(interval), now // max(1, im))
+    ent = _CLOSED_KL_CACHE.get(key)
+    if ent is None or len(ent[0]) < need:
         klines = binance._get("/fapi/v1/klines", {
-            "symbol": symbol, "interval": interval, "limit": period + 1
-        })
-        if not isinstance(klines, list) or len(klines) < period + 1:
+            "symbol": symbol, "interval": interval, "limit": need + 2})
+        bars, _ = closed_bars(klines, interval, now_ms=now)
+        if bars is None:
+            return None, True
+        if len(_CLOSED_KL_CACHE) > 512:
+            _CLOSED_KL_CACHE.clear()
+        _CLOSED_KL_CACHE[key] = (bars, len(bars))
+        ent = (bars,)
+    bars = ent[0]
+    stale = (now - int(bars[-1][6])) > im * 2.5
+    return bars[-need:], stale
+
+
+def calculate_atr(binance, symbol, interval="15m", period=14):
+    """ATR'yi yüzde olarak döndür (örn. 0.025 = %2.5).
+
+    BLOK12 §4: YALNIZ kapanmış mumlar (son açık mum hesaplamaya GİRMEZ); son
+    kapanan bar çok eskiyse (veri eksik/bağlantı kopması) None → giriş kapalı."""
+    try:
+        bars, stale = closed_klines_for(binance, symbol, interval,
+                                        need=period + 1)
+        if stale or bars is None or len(bars) < period + 1:
             return None
         trs = []
-        for i in range(1, len(klines)):
-            high = float(klines[i][2])
-            low = float(klines[i][3])
-            prev_close = float(klines[i-1][4])
+        for i in range(1, len(bars)):
+            high = float(bars[i][2])
+            low = float(bars[i][3])
+            prev_close = float(bars[i-1][4])
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
             trs.append(tr)
         atr_abs = sum(trs) / len(trs)
-        current_price = float(klines[-1][4])
+        current_price = float(bars[-1][4])   # son KAPALI kapanış
         return atr_abs / current_price if current_price > 0 else None
     except Exception as e:
         log.warning(f"ATR hesaplanamadı {symbol}: {e}")
@@ -2545,14 +2643,17 @@ def _attach_coin_quality(binance, symbol, ticker, cache=None, atr_pct=None, dire
 
 
 def _volume_confirmation(binance, symbol, interval="15m", lookback=20):
-    """Hacim-teyidi: son mum hacmi / önceki `lookback` mum ortalaması (spike oranı).
-    >1 = artan ilgi (hareketi teyit). None=veri yok/hata (çağıran nötr'e düşer)."""
+    """Hacim-teyidi: son KAPALI mum hacmi / önceki `lookback` kapalı mum
+    ortalaması (spike oranı). >1 = artan ilgi (hareketi teyit).
+
+    BLOK12 §4: açık mum KULLANILMAZ; ATR ile aynı kapanmış bar seti paylaşılır
+    (closed_klines_for). None=veri yok/bozuk/stale (çağıran nötr'e düşer)."""
     try:
-        kl = binance._get("/fapi/v1/klines",
-                          {"symbol": symbol, "interval": interval, "limit": lookback + 1})
-        if not isinstance(kl, list) or len(kl) < lookback + 1:
+        bars, stale = closed_klines_for(binance, symbol, interval,
+                                        need=lookback + 1)
+        if stale or bars is None or len(bars) < lookback + 1:
             return None
-        vols = [float(k[5]) for k in kl]      # klines index 5 = base volume
+        vols = [float(k[5]) for k in bars]    # klines index 5 = base volume
         prev = vols[:-1]
         avg = sum(prev) / len(prev) if prev else 0.0
         return (vols[-1] / avg) if avg > 0 else None
@@ -3520,6 +3621,15 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     if risk is None and not dry_run:
         log.critical("  atlandı: risk engine yok — gerçek yeni giriş kapalı (fail-closed)")
         return False
+    # BLOK12 §4: 429/418 cooldown'u sürüyorsa YENİ GİRİŞ fail-closed kapalı.
+    # (Salt-okuma yolları devam eder; emir POST'u bu modül tarafından asla
+    # yeniden gönderilmez — cooldown yalnız yeni giriş kapısını kapatır.)
+    if not dry_run:
+        _rl = api_guard.blocked()
+        if _rl:
+            log.critical(f"  atlandı: rate-limit cooldown ({_rl}) — yeni giriş yok "
+                         f"(kalan {api_guard.cooldown_remaining():.0f}s)")
+            return False
     # ENTEGRE NOT: 79bed1d'nin "fonksiyon başında hb.active_executors()" üst-C6
     # bloğu bu ağaca hiç girmedi; 6ac0a47 A2 bloğu (aşağıda) onun yerine geçer —
     # sayım kaynağı borsa slotları ∪ pending, HB_OFFLINE boş-sayım dalı dahil.

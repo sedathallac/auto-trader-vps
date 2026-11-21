@@ -103,7 +103,12 @@ class TestIntentModule(unittest.TestCase):
         def worker(w):
             b = _budget(self.tmp)          # AYNI dosya, ayrı instance
             for k in range(6):
-                r = b.reserve("ETHUSDT", 10.0, f"w{w}k{k}")
+                try:
+                    r = b.reserve("ETHUSDT", 10.0, f"w{w}k{k}")
+                except VB.BudgetError:
+                    # BLOK12: yoğun içeride-koşumda SQLite kilit çakışması
+                    # FAIL-CLOSED RED'dir — hak TÜKETİLMEZ, muhasebeye yazılmaz.
+                    r = None
                 with lk:
                     results.append(r)
         ts = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
@@ -114,7 +119,8 @@ class TestIntentModule(unittest.TestCase):
         st = self.b.status()
         self.assertLessEqual(st["trades_used"], 2)
         self.assertLessEqual(st["notional_used"], 100.0 + 1e-9)
-        consumed = [r for r in results if r.ok and r.first_use]
+        consumed = [r for r in results
+                    if r is not None and r.ok and r.first_use]
         self.assertEqual(len(consumed), st["trades_used"])   # mutabakat
 
     def test_migration_eski_sema_uyumlu(self):

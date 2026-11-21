@@ -768,7 +768,8 @@ class TestPendingEntryLifecycle(Base):
         auto_trader.MAX_OPEN_POSITIONS = 2
         names = ("check_liquidity", "check_correlation_limit", "decide_side",
                  "calculate_atr", "calculate_position_size", "_live_cfg",
-                 "_validation_reserve")
+                 "_validation_reserve", "_validation_fill_guard",
+                 "_validation_fill_exceeded", "_operator_gate_check")
         self._orig = {n: getattr(auto_trader, n) for n in names}
         auto_trader.check_liquidity = lambda b, s: (True, "ok")
         auto_trader.check_correlation_limit = lambda s, b: True
@@ -782,8 +783,14 @@ class TestPendingEntryLifecycle(Base):
         # test_blok10_open_coin_integration'de (200 USDT RED dahil ayrı testler)
         # doğrulanır (per-trade tavan RED testi dahil). rid="test-rid":
         # _VB_BUDGET None iken confirm/release no-op.
-        auto_trader._validation_reserve = lambda s, n: (True, "test-rid",
-                                                        "test-bypass")
+        # BLOK12 §2/§1 aynı gerekçeyle genişletildi: fill ön-koruma/fill denetim
+        # imzaları ve operatör onay kapısı da harness'in 200 USDT simülasyonunu
+        # RED ederdi (kapıların kendileri BLOK12 test dosyalarında doğrulanır).
+        auto_trader._validation_reserve = lambda s, n, i=None: (
+            True, "test-rid", "test-bypass")
+        auto_trader._validation_fill_guard = lambda n, s: (True, "test-bypass")
+        auto_trader._validation_fill_exceeded = lambda s, f: None
+        auto_trader._operator_gate_check = lambda: (True, "test-bypass")
         auto_trader._live_cfg = lambda: SimpleNamespace(
             is_live=False, max_position_pct=None, max_notional=0, max_leverage=20)
 
