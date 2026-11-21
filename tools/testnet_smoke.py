@@ -48,6 +48,32 @@ def precheck(env):
     return k, s
 
 
+def order_approval(env):
+    """BLOK12 §7 — --place-order AYRI, KALICI operatör onayı bekliyor.
+
+    Operatör 0600 izinli bir işaret dosyası yazar (içeriği hiçbir yere
+    basılmaz) ve TESTNET_ORDER_APPROVAL_FILE ile işaretler. Dosya yok /
+    izinler gevşek / boş → RED (BLOCKED). KIMLIK SOHBETTE ISTENMEZ:
+    anahtarlar yalnız korumalı env veya secret store ile sağlanır."""
+    fp = env.get("TESTNET_ORDER_APPROVAL_FILE")
+    if not fp:
+        raise SmokeRefused(
+            "OPERATÖR-ONAYI-BEKLENIYOR: testnet emir testi AYRI onay "
+            "ister — TESTNET_ORDER_APPROVAL_FILE (0600 işaret dosyası) "
+            "ayarlanmadan --place-order koşmaz")
+    try:
+        st = os.stat(fp)
+    except OSError:
+        raise SmokeRefused(
+            "OPERATÖR-ONAYI dosyası yok/okunamıyor — emir testi BLOCKED")
+    if st.st_mode & 0o077:
+        raise SmokeRefused(
+            "OPERATÖR-ONAYI dosya izinleri gevşek (chmod 600 gerekir) — RED")
+    if st.st_size == 0:
+        raise SmokeRefused("OPERATÖR-ONAYI dosyası boş — RED")
+    return True
+
+
 def _signed_params(secret, params):
     q = urllib.parse.urlencode(params)
     sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
@@ -97,6 +123,9 @@ def run_smoke(env, symbol="BTCUSDT", place_order=False, price=None,
         raise SmokeRefused("account beklenmedik yanıt (anahtar testnet mi?)")
     steps.append("account OK: testnet bakiye alanı görüldü (değer loglanmaz)")
     if place_order:
+        # BLOK12 §7: ping+account salt-okunur; EMİR ayrı operatör onayına
+        # bağlıdır (onaysız bu satırdan sonrası ASLA koşmaz).
+        order_approval(env)
         if fetch is None:
             with urllib.request.urlopen(TESTNET_BASE + "/fapi/v1/ticker/price"
                                         "?symbol=" + symbol, timeout=10) as r:
@@ -148,6 +177,8 @@ def main(argv=None, env=None):
     except SmokeRefused as e:
         print("RED:", e)
         return 2
+    print("NOT: TESTNET SONUCU — ÜRETİM KANITI DEĞİLDİR (base URL kodda "
+          "sabit; anahtar kümesi ayrı; üretim davranışını kanıtlamaz)")
     return 0
 
 

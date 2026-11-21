@@ -80,7 +80,18 @@ class TestSmoke(unittest.TestCase):
 
     def test_06_place_order_akisi(self):
         f = _Fetch()
-        steps = TS.run_smoke(ENV_OK, symbol="BTCUSDT", place_order=True,
+        env = dict(ENV_OK)
+        # BLOK12 §7: emir adımı AYRI kalıcı operatör onayı ister — test 0600
+        # işaret dosyası kurar (onay akışının kendisi
+        # tests/test_blok12_testnet_gate.py'de).
+        import tempfile
+        fd, fp = tempfile.mkstemp()
+        os.write(fd, b"operator-approved")
+        os.close(fd)
+        os.chmod(fp, 0o600)
+        self.addCleanup(os.remove, fp)
+        env["TESTNET_ORDER_APPROVAL_FILE"] = fp
+        steps = TS.run_smoke(env, symbol="BTCUSDT", place_order=True,
                              fetch=f, sleep=lambda s: None)
         # ping/account/limit/query/cancel = 5 adım
         self.assertEqual(len(steps), 5)
