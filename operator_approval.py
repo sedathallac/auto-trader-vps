@@ -323,3 +323,61 @@ class ApprovalGate:
             return False, "UCUNCU-ISLEM-YASAK: üçüncü işlem daima reddedilir"
         ok, why = self.consume(2, token)
         return ok, why
+
+    # ---- BLOK12 devam-E §3: OKUMA-SADECE doğrulama (gönderim ÖNCESİ) ----
+    # Eski sıralama token'ı POST'tan ÖNCE tüketiyordu; teyitli emir
+    # başarısızlığında bütçe iade olsa da token ölü kalır ve ikinci işlem
+    # kalıcı kilitlenirdi. Yeni sözleşme: önce verify (yazma YOK), emir
+    # doğrulanınca consume. Kalıntu risk dürüstçe belgeli: POST↔consume crash
+    # penceresi (sınırlar: tek-süreç kilidi + 2 işlem hard-cap + pending slot).
+
+    def verify(self, seq: int, token) -> tuple[bool, str]:
+        """consume'un YAZMASIZ aynası — aynı RED nedenleri, tek fark: hiçbir
+        satır güncellenmez (süre-dolması bile işaretlenmez; consume anında
+        yeniden ve atomik doğrulanır). Başarılı dönüş, aynı token ile
+        consume'un da başarılı olacağını taahhüt ETMEZ (yarış: revoke/expiry/
+        consume-arası); consumption anı için consume otoritedir."""
+        if not isinstance(token, str) or not token:
+            return False, "ONAY-YOK: token verilmedi"
+        if seq >= MAX_OPS_HARD + 1:
+            return False, "UCUNCU-ISLEM-YASAK: üçüncü işlem daima reddedilir"
+        con = self._conn()
+        try:
+            row = con.execute(
+                "SELECT token_hash, expires_at, status FROM gate_approvals"
+                " WHERE seq=?", (seq,)).fetchone()
+            if row is None:
+                return False, "ONAY-YOK: bu seq için kayıtlı onay yok"
+            try:
+                thash, exp, status = str(row[0]), float(row[1]), str(row[2])
+            except (TypeError, ValueError):
+                return False, "ONAY-BOZUK: kayıt çözümlenemedi (fail-closed)"
+            if status == "CONSUMED":
+                return False, "ONAY-KULLANILDI: tek kullanımlık tüketildi"
+            if status == "EXPIRED":
+                return False, "ONAY-SURESI-DOLDU"
+            if status == "REVOKED":
+                return False, "ONAY-IPTAL-EDILMIS"
+            if status != "GRANTED":
+                return False, "ONAY-BOZUK: beklenmeyen durum (fail-closed)"
+            if self._now() >= exp:
+                return False, "ONAY-SURESI-DOLDU"
+            if not secrets.compare_digest(thash, _h(token)):
+                return False, "ONAY-GECERSIZ: token eşleşmedi"
+            if self._ops_completed(con) < seq - 1:
+                return False, "ILK-ISLEM-TAMAMLANMADI: onay kullanılamaz"
+            return True, "ONAY-DOGRULANDI (henüz tüketilmedi)"
+        except sqlite3.Error as e:
+            raise GateError(f"onay doğrulaması başarısız: {e}") from e
+        finally:
+            con.close()
+
+    def entry_verify(self, seq: int, token) -> tuple[bool, str]:
+        """entry_consume'un okuma-sadece aynası (gönderim öncesi kapı)."""
+        if seq <= 0:
+            return False, "SIRA-BELIRSIZ: işlem sırası çözümlenemedi"
+        if seq == 1:
+            return True, "BIRINCI-ISLEM: bütçe kapısı uygulandı"
+        if seq >= MAX_OPS_HARD + 1:
+            return False, "UCUNCU-ISLEM-YASAK: üçüncü işlem daima reddedilir"
+        return self.verify(seq, token)

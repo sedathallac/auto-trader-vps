@@ -3492,6 +3492,13 @@ def entry_intent(symbol, side, notional, decision_price):
     return f"val:{symbol}:{s}:{n:.6f}:{p:.6f}"
 
 
+# BLOK12 devam-E §1: MUTAK işlem-başı emir tavanı (USDT) — KODDA sabittir.
+# Bütçe env'i (MAX_VALIDATION_POSITION_NOTIONAL_USDT) bu tavanı YALNIZ
+# sıkılaştırabilir (min); 50'nin ÜSTÜNE hiçbir ayarla çıkarılamaz. Ön gard,
+# pending garanti zarfı ve dolum denetimi aynı min-tavanı taşır.
+ABS_ORDER_NOTIONAL_CAP_USDT = 50.0
+
+
 def _validation_fill_envelope(final_notional, slippage_pct):
     """(cap, drift, worst) veya None — BLOK12 devam-C GARANTİ ZARFI.
 
@@ -3505,7 +3512,9 @@ def _validation_fill_envelope(final_notional, slippage_pct):
     if not enabled or not valid or budget is None:
         return None
     try:
-        cap = float(budget.status()["max_per_trade_usdt"])
+        # BLOK12 devam-E §1: mutlak tavan — env yalnız sıkılaştırır (min).
+        cap = min(float(budget.status()["max_per_trade_usdt"]),
+                  ABS_ORDER_NOTIONAL_CAP_USDT)
     except validation_budget_mod.BudgetError:
         return None
     drift = max(float(slippage_pct or 0.0),
@@ -3541,7 +3550,10 @@ def _validation_fill_exceeded(symbol, actual_quote_filled):
     if not enabled or not valid or budget is None:
         return None
     try:
-        cap = float(budget.status()["max_per_trade_usdt"])
+        # BLOK12 devam-E §1: denetim de MUTAK tavanla konuşur (env 100 olsa
+        # bile GERÇEK 60 USDT dolum ihlaldir — sessiz geçmez).
+        cap = min(float(budget.status()["max_per_trade_usdt"]),
+                  ABS_ORDER_NOTIONAL_CAP_USDT)
     except validation_budget_mod.BudgetError:
         return "bütçe deposu okunamadı (fill denetimi)"
     try:
@@ -3586,22 +3598,21 @@ def _validation_reserve(symbol, notional, intent):
     return True, r.rid, r.reason
 
 
-def _operator_gate_check():
-    """(ok, why) — BLOK12 §1 KALICI operatör onayı kapısı.
+def _operator_gate_context():
+    """(gate, seq, token, err) — onay kapısının ortak okuması (devam-E §3).
 
-    İşlem sırası = bütçe reserve SONRASI trades_used (bu giriş de sayılmıştır).
-    1. işlem: runbook + bütçe yeter. 2. işlem: SQLite'ta kayıtlı, süresi
-    geçmemiş, TEK KULLANIMLIK onay token'ı (OPERATOR_APPROVAL_TOKEN_FILE
-    dosyasından) tüketilmelidir; restart onayı sıfırlamaz (kalıcı depo).
-    3. işlem: daima RED (modülde kilitli). Depo hatası → RED (fail-closed).
-    Çağıran RED'de bütçe hakkını İADE etmelidir (POST'a gidilmedi)."""
+    Bütçe sırası + gate deposu + 0600 izinli token dosyası. err doluysa her
+    iki kapı da RED vermeli (fail-closed). BLOK12 devam-D izin denetimi
+    burada: fstat (open→fstat TOCTOU'suz); grup/diğer okuyabiliyorsa token
+    ele geçirilmiş sayılır → RED ve token HARCANMAZ (chmod 600 gerekir)."""
     enabled, valid, budget, why0 = _validation_control()
     if not enabled or not valid or budget is None:
-        return False, why0 if not valid else "bütçe kapalı — onay kapısı anlamsız"
+        return None, None, None, (
+            why0 if not valid else "bütçe kapalı — onay kapısı anlamsız")
     try:
         seq = int(budget.status()["trades_used"])
     except validation_budget_mod.BudgetError as e:
-        return False, f"bütçe deposu okunamadı (fail-closed): {e}"
+        return None, None, None, f"bütçe deposu okunamadı (fail-closed): {e}"
     gate_db = (os.getenv("VALIDATION_APPROVAL_DB")
                or str(STATE_DIR / "validation_gate.db"))
     tok_file = os.getenv("OPERATOR_APPROVAL_TOKEN_FILE", "")
@@ -3611,31 +3622,74 @@ def _operator_gate_check():
             approval_ttl_s=_env_float("VALIDATION_APPROVAL_TTL", 3600.0))
         token = None
         if tok_file:
-            # BLOK12 devam-D: izinler KODDA doğrulanır — fstat (open→fstat
-            # sırası TOCTOU'suz); grup/diğer okuyabiliyorsa token ele
-            # geçirilmiş sayılır: RED ve token HARCANMAZ (chmod 600 gerekir).
             try:
                 _fd = os.open(tok_file, os.O_RDONLY)
             except OSError:
-                return False, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
+                return None, None, None, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
             try:
                 if os.fstat(_fd).st_mode & 0o077:
-                    return False, ("ONAY-DOSYASI-İZİN: grup/diğer okuyabilir "
-                                   "(chmod 600 gerekir) — RED, token HARCANMADI")
+                    return None, None, None, (
+                        "ONAY-DOSYASI-İZİN: grup/diğer okuyabilir "
+                        "(chmod 600 gerekir) — RED, token HARCANMADI")
                 with os.fdopen(_fd, "r", encoding="utf-8") as fh:
                     _fd = -1
                     token = fh.read().strip() or None
             except OSError:
-                return False, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
+                return None, None, None, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
             finally:
                 if _fd != -1:
                     try:
                         os.close(_fd)
                     except OSError:
                         pass
-        return gate.entry_consume(seq, token)
+        return gate, seq, token, None
     except operator_approval_mod.GateError as e:
-        return False, f"GATE-HATASI (fail-closed): {e}"
+        return None, None, None, f"GATE-HATASI (fail-closed): {e}"
+
+
+def _operator_gate_check():
+    """(ok, why) — BLOK12 §1 KALICI operatör onayı kapısı, GÖNDERİM ÖNCESİ
+    DOĞRULAMA (devam-E §3: mutasyonsuz — token HARC ANMAZ).
+
+    İşlem sırası = bütçe reserve SONRASI trades_used (bu giriş de sayılmıştır).
+    1. işlem: runbook + bütçe yeter. 2. işlem: SQLite'ta kayıtlı, süresi
+    geçmemiş, TEK KULLANIMLIK onay token'ı (0600 dosyadan) DOĞRULANMALIDIR;
+    restart onayı sıfırlamaz (kalıcı depo). 3. işlem: daima RED (kilitli).
+    Depo hatası → RED (fail-closed). Çağıran RED'de bütçe hakkını İADE
+    etmelidir (POST'a gidilmedi). Tüketim YALNIZ _operator_gate_consume ile,
+    emrin kaderi belirlendikten SONRA yapılır — teyitli başarısızlık token'ı
+    asla yakmaz (bütçe iadesiyle retry açık kalır)."""
+    gate, seq, token, err = _operator_gate_context()
+    if err:
+        return False, err
+    return gate.entry_verify(seq, token)
+
+
+def _operator_gate_consume():
+    """(ok, why) — BLOK12 devam-E §3: tek-kullanımlık token tüketimi, YALNIZ
+    emrin kaderi "bu deneme harcandı" olduğunda çağrılır:
+      * executor_id doğrulandı (CONSUMED) → tüket;
+      * UNKNOWN kader (bilinçli gönderilmiş olabilir) → tüket (tekrar yasak);
+      * TEYİTLİ başarısızlık → hiç çağrılmaz (token yaşamaya devam eder).
+    Kalıntu risk (dürüst sınır): POST↔consume arasındaki çok küçük crash
+    penceresinde token tüketilmeden kalabilir; sınırlar: §8 tek-süreç kilidi,
+    2 işlem hard-cap (3. daima RED), pending slot işgali. consume başarısızlığı
+    GÖNDERİLMİŞ emri geri almaz — yalnız CRITICAL mutabakat kaydı."""
+    gate, seq, token, err = _operator_gate_context()
+    if err:
+        log.critical(f"🚨 onay token tüketimi okunamadı ({err}) — emir "
+                     f"gönderilmiş olabilir; operatör mutabakatı gerekir")
+        return False, err
+    try:
+        ok, why = gate.entry_consume(seq, token)
+        if not ok:
+            log.critical(f"🚨 onay token tüketimi RED ({why}) — emir "
+                         f"gönderilmiş olabilir; operatör mutabakatı gerekir")
+        return ok, why
+    except operator_approval_mod.GateError as e:
+        log.critical(f"🚨 onay token tüketimi başarısız ({e}) — operatör "
+                     f"mutabakatı gerekir")
+        return False, f"GATE-HATASI: {e}"
 
 
 def _validation_confirm(rid, executor_id=None, op_period=None):
@@ -4211,6 +4265,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # gönderilebilir (ilk işlem runbook+bütçe yolundan geçer; üçüncüsü daima
     # RED). RED → POST'A GİDİLMEZ, ayrılan bütçe hakkı iade edilir (teyitli
     # başarısızlık), slot serbest bırakılır.
+    # BLOK12 devam-E §3: burada yalnız DOĞRULAMA yapılır (token HARCANMAZ);
+    # tüketim aşağıda, emrin kaderi belirlendikten sonra — teyitli başarısızlık
+    # token'ı yakmaz, ikinci işlem yeniden denenebilir.
     _og_ok, _og_why = _operator_gate_check()
     if not _og_ok:
         log.warning(f"  atlandı: operatör onay kapısı ({_og_why})")
@@ -4254,8 +4311,13 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         # Bütçe kaderi reserver'dan BAĞIMSIZDIR (konservatif: UNKNOWN→koru, teyitli→iade).
         if _keep:
             log.warning(f"  🔒 doğrulama bütçe hakkı da KORUNUYOR (rid={_vb_rid})")
+            # BLOK12 devam-E §3: UNKNOWN kader = deneme harcandı → token
+            # TÜKETİLİR (bilinçli gönderilmiş olabilecek emrin tekrarı yasak).
+            _operator_gate_consume()
         else:
             _validation_release(_vb_rid)
+            # Teyitli başarısızlık: token HARCANMAZ (devam-E §3) — bütçe
+            # iadesiyle birlikte ikinci işlem aynı onayla yeniden deneyebilir.
         # FAZ14f: kimlik/konfig hatası sembolün suçu değil — karalisteye YAZMA.
         if _is_hb_auth_error(er):
             global _HB_AUTH_BROKEN
@@ -4270,6 +4332,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     # BLOK10 §3: hak tüketildi (CONSUMED, kalıcı); BLOK12 §2: emir kimliği ve
     # işlem dönemi (intent) aynı geçişte bağlanır.
     _validation_confirm(_vb_rid, executor_id=str(eid), op_period=_vb_intent)
+    # BLOK12 devam-E §3: emir DOĞRULANDI — tek kullanımlık onay token'ı ancak
+    # şimdi tüketilir. Tüketim hatası gönderilmiş emri geri ALMAZ; yalnız
+    # CRITICAL mutabakat kaydı düşülür (bütçe + slot zaten consumption'lı).
+    _operator_gate_consume()
 
     # FAZ14p: dolum beklemesi artık TICK'LER ARASINDA ilerler. Eski hâli ana thread'i
     # FILL_WAIT_S (300s) boyunca time.sleep ile kilitliyordu: tarama, SL denetimi ve

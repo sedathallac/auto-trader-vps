@@ -676,7 +676,7 @@ Hüküm: **READY FOR FINAL OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.** (
 
 ## 5) BLOK12 DEVAM A–D (2026-11-21, operatör takviye maddeleri) — commit 182a0bd
 
-| Madde | Kök neden | Kızıl→Yeşil |
+| Madde | Kök neden | Kırmızı→Yeşil |
 |---|---|---|
 | A | 429/418 gardı yalnız open_coin başında; tur içinde beliren cooldown'da istekler gidiyordu | test_blok12_sendtime_gates.py: sentry transport (tek ağ denemesi patlar) — GET/POST/DELETE local_block; tur-içi 429 → POST YOK + hak iade (trades_used 0'a döner); _reservation_should_keep(local_block)=False |
 | B | SIGTERM yalnız fonksiyon başında; POST öncesi pencere yarışı | TestShutdownRaceAtCreateExecutor: sinyal dikişi onay kapısı↔POST arasında; hb.created==[], iade, "create_executor ÖNCESİ shutdown"; negatif kontrol POST koşar |
@@ -689,3 +689,19 @@ dolum-sonraki tick, sonra yeni girişler kilitli.
 
 Kanıt: RED 14 failed → GREEN 51/51; tam tests/ **1315 passed + 9 subtests
 exit 0**; secret scan TEMİZ; canlı istek/emir YOK.
+
+## 6) BLOK12 DEVAM E (2026-11-21, inceleme tablosu maddeleri)
+
+Operatör inceleme tablosunun kodda kapanabilir üç maddesi; her biri önce
+KIRMIZI (HEAD 281b040 worktree'de koşuldu) sonra YEŞİL kanıtla kapandı.
+
+| Madde | Bulgu | Kök neden / dürüst durum | Kırmızı→Yeşil |
+|---|---|---|---|
+| E1 | 50 USDT mutlak emir tavanı → Kanıtlanmadı | Tavan tek noktadan (validation_budget config clamp'ı HARD_MAX_PER_TRADE=50) korunuyordu; clamp gevşerse (regresyon) 80 USDT'lik plan POST'a gidebiliyordu | test_blok12_abs_cap.py (7): clamp-gevşemesi simülasyonunda HEAD'de hb.created dolu (KIRMIZI 5); düzeltme: auto_trader'da BAĞIMSIZ ABS_ORDER_NOTIONAL_CAP_USDT=50.0 — zarf/guard/dolum denetimi tavanı min(bütçe, 50); env yalnız sıkılaştırır. Katmanlar L1 clamp / L2 PER_TRADE_CAP / L3 worst-fill / L4 mutlak sabit belgelendi |
+| E2 | Cooldown sırasında acil risk azaltma → Ek doğrulama gerekli | Yanıltmaca arandı: BULUNMADI — cancel DELETE gardan geçer (local_block), adapter sorgu kodu ile UNKNOWN sayar ("iptal edildi" yanılması yok), sl_status kesintiyi SL_ABSENT saymaz; HB stop (HBAPI, localhost) Binance gardından bağımsız = acil fren açık; borsa-üstü algo SL sunucuda durur | test_blok12_cooldown_emergency.py (8): tek sentry taşıyıcı (BinanceAPI+HBAPI aynı _session; URL'den ayrılır) — cooldown'da /fapi'ye TEK istek YOK, HB stop KOŞAR, iki yapısal sabitleme (HBAPI api_guard TASIMAZ; BinanceAPI _get/_post gardlı). Operasyon notu: 418 sürerken watchdog --once KOŞULMAZ (§10.2) |
+| E3 | İkinci onay token sıralaması → Düzeltme gerekli | Token POST ÖNCESİ consume ediliyordu; teyitli emir başarısızlığında bütçe iade olsa da token ÖLÜ kalıyor, ikinci işlem kalıcı ONAY-KULLANILDI kilidine düşüyordu (HEAD KIRMIZI: state APPROVAL_CONSUMED) | operator_approval.entry_verify (yazmasız ayna) + _operator_gate_consume: doğrula-ÖNCE / emir kaderiyle tüket-SONRA (executor_id doğrulandı → tüket; UNKNOWN → tüket [tekrar yasak]; teyitli başarısızlık → HARCANMAZ, retry açık). Kalıntu risk belgeli: POST↔consume crash penceresi — sınırlar §8 tek-süreç + 2 işlem hard-cap + pending slot. test_blok12_approval_ordering.py (8) + kaynak-sıra pinleri |
+
+Kanıt: RED 11 failed/12 passed (HEAD worktree; 12 = cooldown doğrulama +
+katman/KADER pinleri, kasıtlı yeşil) → YEŞİL BLOK12 süitleri 74 passed;
+tam tests/ ve preflight aşağıda. Canlı istek/emir YOK; üretim 108002c
+dokunulmadı.

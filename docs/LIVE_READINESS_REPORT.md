@@ -261,3 +261,34 @@ kötü-üstü doluş da yeni girişleri kilitler; ikinci onay token dosyasının
 izinleri kodda doğrulanır (0600 dışı RED, token harcanmaz). Kanıt zinciri
 MISSION_STATE "BLOK12 DEVAM A–D". Hüküm değişmedi: **READY FOR FINAL
 OPERATOR REVIEW — NOT DEPLOYED.**
+
+### 10.2 Devam E — mutlak tavan, acil risk azaltma, onay sırası
+
+İnceleme tablosunun üç maddesi kırmızı→yeşil kapandı (ayrıntı
+MISSION_STATE "BLOK12 DEVAM E"):
+
+- **50 USDT mutlak emir tavanı (Kanıtlanmadı → KANITLI):** tavan artık dört
+  bağımsız katman: L1 bütçe config clamp'ı (env>50 yapılandırılamaz), L2
+  reserve PER_TRADE_CAP, L3 worst-fill ön gardı, L4 auto_trader'daki
+  `ABS_ORDER_NOTIONAL_CAP_USDT = 50.0` sabiti — zarf/guard/dolum denetimi
+  tavanı `min(bütçe-tavanı, 50)` ile hesaplar; L1 gevşetse bile 50 aşılınamaz
+  (regresyon simülasyonlu test: HEAD'de 80 USDT POST'a gidiyordu, şimdi POST
+  YOK). Env tavanı yalnız SIKILAŞTIRABİLİR.
+- **Cooldown'da acil risk azaltma (Ek doğrulama → DOĞRULANDI):** 429/418
+  yerel cooldown'da GET/POST/DELETE ayrımı yok — Binance'e tek istek gitmez;
+  iptal/durum/SL sorguları UNKNOWN sayılır, ASLA "kapatıldı/SL yok" iddiası
+  üretilmez (fail-closed). Acil fren açıktır: HB `stop_executor`
+  (localhost/HBAPI) Binance gardından etkilenmez; borsa-üstü algo
+  STOP_MARKET SL sunucuda durur. **Operasyon notu: 418 sürerken
+  `verify_watchdog.py --once` KOŞULMAZ** — yakmış istekler ban süresini
+  uzatır; cooldown bitiminde koşun (`api_guard.cooldown_remaining()`).
+- **İkinci onay token sıralaması (Düzeltme gerekli → DÜZELTİLDİ):** gönderim
+  öncesi kapı artık YALNIZ doğrular (okuma-sadece `entry_verify`); tek
+  kullanım tüketimi emrin kaderinden SONRA: executor doğrulandı veya UNKNOWN
+  → tüket; TEYİTLİ başarısızlık → token harcanmaz, bütçe iadesiyle ikinci
+  işlem aynı onayla yeniden denenebilir. Kalıntu risk (belgeli): POST↔consume
+  crash penceresinde token tüketilmeden kalabilir; sınırlar: §8 tek-süreç
+  kilidi + 2 işlem hard-cap + pending slot işgali.
+
+Kanıt zinciri ve test adları MISSION_STATE'te; hüküm değişmedi: **READY FOR
+FINAL OPERATOR REVIEW — NOT DEPLOYED.**

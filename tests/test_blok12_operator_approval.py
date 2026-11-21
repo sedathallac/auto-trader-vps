@@ -183,10 +183,17 @@ class TestAutoTraderGate(unittest.TestCase):
             fh.write(tok + "\n")
         os.chmod(tp, 0o600)
         os.environ["OPERATOR_APPROVAL_TOKEN_FILE"] = tp
+        # BLOK12 devam-E §3: gönderim öncesi kapı DOĞRULAR (mutasyonsuz,
+        # tekrarlanabilir); TEK KULLANIM tüketimde (_operator_gate_consume).
         gok3, why3 = auto_trader._operator_gate_check()
-        self.assertTrue(gok3, why3)                      # tüketildi
-        gok4, why4 = auto_trader._operator_gate_check()
-        self.assertFalse(gok4)                           # tek kullanım
+        self.assertTrue(gok3, why3)                      # doğrulandı
+        gok3b, _ = auto_trader._operator_gate_check()
+        self.assertTrue(gok3b)                           # verify tekrarlanabilir
+        cok, cwhy = auto_trader._operator_gate_consume()
+        self.assertTrue(cok, cwhy)                       # tek kullanım BURADA
+        self.assertFalse(auto_trader._operator_gate_check()[0])  # verify de RED
+        cok2, why4 = auto_trader._operator_gate_consume()
+        self.assertFalse(cok2)                           # tek kullanım
         self.assertIn("KULLANILDI", why4)
 
     def test_token_dosyasi_okunamazsa_red(self):
@@ -263,11 +270,17 @@ class TestTokenFilePermissions(unittest.TestCase):
         self.assertFalse(gok)
         self.assertIn("600", why)
 
-    def test_0600_gecer_ve_token_tuketilir(self):
+    def test_0600_dogrulanir_token_henuz_harcanmaz(self):
+        # BLOK12 devam-E §3: gönderim öncesi kapı DOĞRULAMA yapar; tüketim
+        # emrin kaderinden sonra _operator_gate_consume ile olur.
         self._to_second()
         self._write(0o600)
         gok, why = auto_trader._operator_gate_check()
         self.assertTrue(gok, why)
+        self.assertEqual(self.g.state()["state"], "APPROVED_AWAITING_USE")
+        cok, cwhy = auto_trader._operator_gate_consume()
+        self.assertTrue(cok, cwhy)
+        self.assertEqual(self.g.state()["state"], "APPROVAL_CONSUMED")
 
 
 if __name__ == "__main__":
