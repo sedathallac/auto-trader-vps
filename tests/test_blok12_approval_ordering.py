@@ -196,6 +196,62 @@ class TestOpenCoinOrdering(LiveWiringBase, _SecondTradeBase):
         self.assertEqual(hb2.created, [])
 
 
+class TestCrashWindowRestart(LiveWiringBase, _SecondTradeBase):
+    """Görev §4: POST ile token tüketimi arasında süreç kapanırsa
+    restart/reconcile AYNI emri yanlışlıkla TEKRAR ÜRETMEZ.
+
+    Simülasyon: open_coin başarılı (POST gitti, bütçe CONSUMED, executor
+    bağlandı) ama _operator_gate_consume ÇALIŞMADI (crash penceresi — token
+    APPROVED_AWAITING_USE kaldı). Restart: bellek sıfır, disk/DB kalıcı.
+    Bariyer token DEĞİL, bütçe/intent + pending kaydıdır (o yüzden kalıntı
+    pencere emir üretimi için ZARARSIZDIR; token tek başına yetki taşımaz).
+    """
+
+    def setUp(self):
+        LiveWiringBase.setUp(self)
+        _SecondTradeBase.setUp(self)
+
+    def tearDown(self):
+        _SecondTradeBase.tearDown(self)
+        LiveWiringBase.tearDown(self)
+
+    def test_post_sonrasi_consume_oncesi_crash_retry_emir_uretmez(self):
+        binance, hb = FakeBinance(), FakeHB()
+        cc, _ = _coordinator(binance, hb, self.db)
+        with mock.patch.object(auto_trader, "_operator_gate_consume",
+                               lambda: (True, "crash-sim")):
+            res = auto_trader.open_coin(binance, hb, self._coin(),
+                                        dry_run=False, risk=_RiskOK(),
+                                        reserver=None, coordinator=cc)
+        self.assertTrue(res)
+        self.assertEqual(hb.created, [self._coin()["symbol"]])
+        # Crash penceresi durumu: token HÂLÂ kullanılmamış, bütçe CONSUMED.
+        self.assertEqual(self.g.state()["state"], "APPROVED_AWAITING_USE")
+        st1 = auto_trader._VB_BUDGET.status()
+        self.assertEqual(st1["trades_used"], 2)
+        self.assertEqual(st1["max_trades"], 2)   # üçüncü işlem zaten imkânsız
+
+        # --- restart simülasyonu: bellek boş, disk/SQLite kalıcı ---
+        auto_trader._PENDING_FILLS.clear()
+        auto_trader._PENDING_LOADED[0] = False
+        auto_trader._load_pending_fills()
+        self.assertTrue(auto_trader._PENDING_FILLS,
+                        "pending kayıt diskten geri yüklenmedi")
+        sid = str(self._coin()["symbol"])
+        self.assertTrue(any(p.get("symbol") == sid
+                            for p in auto_trader._PENDING_FILLS.values()))
+
+        # Retry AYNI mantıksal girişi tekrar ÜRETEMEZ: POST yok, hak yanmaz.
+        hb2 = FakeHB()
+        res2 = auto_trader.open_coin(binance, hb2, self._coin(),
+                                     dry_run=False, risk=_RiskOK(),
+                                     reserver=None, coordinator=cc)
+        self.assertFalse(res2)
+        self.assertEqual(hb2.created, [])
+        st2 = auto_trader._VB_BUDGET.status()
+        self.assertEqual(st2["trades_used"], 2)      # artış YOK (intent tanındı)
+
+
 class TestSourceOrderingPin(unittest.TestCase):
     def test_consume_kaynagi_create_executor_sonrasinda(self):
         src = inspect.getsource(auto_trader.open_coin)
