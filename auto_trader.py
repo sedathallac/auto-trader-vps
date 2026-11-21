@@ -22,6 +22,7 @@ import risk_engine as risk_engine_mod
 from position_reservation import PositionReserver
 import uuid
 import validation_budget as validation_budget_mod
+import operator_approval as operator_approval_mod
 import coin_quality
 import leverage_policy
 import sizing_policy
@@ -3445,6 +3446,41 @@ def _validation_reserve(symbol, notional, intent):
     return True, r.rid, r.reason
 
 
+def _operator_gate_check():
+    """(ok, why) — BLOK12 §1 KALICI operatör onayı kapısı.
+
+    İşlem sırası = bütçe reserve SONRASI trades_used (bu giriş de sayılmıştır).
+    1. işlem: runbook + bütçe yeter. 2. işlem: SQLite'ta kayıtlı, süresi
+    geçmemiş, TEK KULLANIMLIK onay token'ı (OPERATOR_APPROVAL_TOKEN_FILE
+    dosyasından) tüketilmelidir; restart onayı sıfırlamaz (kalıcı depo).
+    3. işlem: daima RED (modülde kilitli). Depo hatası → RED (fail-closed).
+    Çağıran RED'de bütçe hakkını İADE etmelidir (POST'a gidilmedi)."""
+    enabled, valid, budget, why0 = _validation_control()
+    if not enabled or not valid or budget is None:
+        return False, why0 if not valid else "bütçe kapalı — onay kapısı anlamsız"
+    try:
+        seq = int(budget.status()["trades_used"])
+    except validation_budget_mod.BudgetError as e:
+        return False, f"bütçe deposu okunamadı (fail-closed): {e}"
+    gate_db = (os.getenv("VALIDATION_APPROVAL_DB")
+               or str(STATE_DIR / "validation_gate.db"))
+    tok_file = os.getenv("OPERATOR_APPROVAL_TOKEN_FILE", "")
+    try:
+        gate = operator_approval_mod.ApprovalGate(
+            gate_db,
+            approval_ttl_s=_env_float("VALIDATION_APPROVAL_TTL", 3600.0))
+        token = None
+        if tok_file:
+            try:
+                with open(tok_file, "r", encoding="utf-8") as fh:
+                    token = fh.read().strip() or None
+            except OSError:
+                return False, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
+        return gate.entry_consume(seq, token)
+    except operator_approval_mod.GateError as e:
+        return False, f"GATE-HATASI (fail-closed): {e}"
+
+
 def _validation_confirm(rid, executor_id=None, op_period=None):
     """POST başarılı → CONSUMED. Hata olursa rezervasyon KALIR (güvenli taraf).
 
@@ -3921,6 +3957,18 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.warning(f"  atlandı: doğrulama bütçesi ({_vb_why})")
         if reserver is not None and _res_id is not None:
             reserver.release(_res_id, reason="validation_budget")
+        return False
+
+    # BLOK12 §1: ikinci işlem YALNIZ kalıcı, tek kullanımlık operatör onayıyla
+    # gönderilebilir (ilk işlem runbook+bütçe yolundan geçer; üçüncüsü daima
+    # RED). RED → POST'A GİDİLMEZ, ayrılan bütçe hakkı iade edilir (teyitli
+    # başarısızlık), slot serbest bırakılır.
+    _og_ok, _og_why = _operator_gate_check()
+    if not _og_ok:
+        log.warning(f"  atlandı: operatör onay kapısı ({_og_why})")
+        _validation_release(_vb_rid)
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="operator_gate")
         return False
 
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)

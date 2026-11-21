@@ -29,7 +29,9 @@ from test_inc13_live_wiring import FakeBinance, FakeHB, LiveWiringBase, _RiskOK,
 
 _ENV_KEYS = ("CONTROLLED_LIVE_VALIDATION", "MAX_VALIDATION_TRADES",
              "MAX_VALIDATION_POSITION_NOTIONAL_USDT",
-             "MAX_VALIDATION_TOTAL_NOTIONAL_USDT")
+             "MAX_VALIDATION_TOTAL_NOTIONAL_USDT",
+             # BLOK12 §1: onay kapısı env'leri de testler arası sızmamalı
+             "VALIDATION_APPROVAL_DB", "OPERATOR_APPROVAL_TOKEN_FILE")
 
 
 class TestControlledBudgetIntegration(LiveWiringBase):
@@ -65,6 +67,22 @@ class TestControlledBudgetIntegration(LiveWiringBase):
                 else:
                     os.environ[k] = v
 
+    def _arm_operator_gate(self):
+        """BLOK12 §1: 1. işlem altı kanıtla TAMAMLANDI + grant + token dosyası."""
+        import operator_approval as oa
+        db = os.path.join(self.tmp, "gate.db")
+        os.environ["VALIDATION_APPROVAL_DB"] = db
+        g = oa.ApprovalGate(db)
+        six = {k: True for k in oa.SIX_EVIDENCE}
+        self.assertTrue(g.record_completion(1, six, "test-operator"))
+        tok = g.grant("test-operator")
+        self.assertIsNotNone(tok)
+        tp = os.path.join(self.tmp, "gate.token")
+        with open(tp, "w") as fh:
+            fh.write(tok)
+        os.chmod(tp, 0o600)
+        os.environ["OPERATOR_APPROVAL_TOKEN_FILE"] = tp
+
     def _open(self, binance, hb, cc, risk=None, price=None):
         coin = dict(self._coin())
         if price is not None:
@@ -93,6 +111,8 @@ class TestControlledBudgetIntegration(LiveWiringBase):
             cc, _ = _coordinator(binance, hb, self.db)
             # BLOK12 §2: üçü de AYNI mantıksal giriş olsaydı intent tekrarı
             # engellenirdi; ayrı fiyatlarla üç AYRI karar simüle edilir.
+            # BLOK12 §1: 2. işlem için kalıcı tek-kullanımlık onay hazırlanır.
+            self._arm_operator_gate()
             self.assertIs(self._open(binance, hb, cc, price="80"), True)
             self.assertIs(self._open(binance, hb, cc, price="80.5"), True)
             self.assertEqual(len(hb.created), 2)
