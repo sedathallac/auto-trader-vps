@@ -135,8 +135,11 @@ bilinçli kararıyla ve yeni kanıt setiyle sıfırlanır — bu görevde sıfı
 2. `VALIDATION_ALLOW_SHORT_ENTRIES=true` = garanti-üstü tercihtir; default
    bozulmadıkça SHORT giriş yok.
 3. Validation kapalı çalıştırma E1'sizdir — runbook yasaklar (§3/5-6).
-4. İzole koşumda 2 sıra-bağımlı test HEAD'den kalma kırmızıdır (LIVE_READINESS
-   §10.4 notu); tam-süitte yeşildir.
+4. 2 kablolama testi (faz12/faz13) iki katmanlı sıra-bağımlıdır (mekanizma
+   LIVE_READINESS §10.4): izole kırmızı cf3c32d'den kalma `_CLOSED_KL_CACHE`
+   sızıntısına bağlıdır (onarım miras, üretim doğru); E1'in SHORT-default-RED'i
+   bunları tam-süitte de kırmızıya düşürmüştü — testler artık operatör
+   drift-zarfı env'i ile opt-in koşar (üretim varsayılanı değişmez).
 5. Commit imzası ve CI yok; kapı insan + bu belgedir.
 
 ## 8. HÜKÜM: BLOCKED — dışsal kapılar (her biri TEK operasyon, §3'te)

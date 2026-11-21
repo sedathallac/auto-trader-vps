@@ -189,6 +189,13 @@ class PreflightWiringTest(unittest.TestCase):
             return preflight.PreflightResult(False, [preflight.Step("config", False, "x")],
                                              "config", "blocked")
 
+        # E1 (devam-F): decide_side(bu coin)=SHORT ve yeni sözleşme gereği
+        # SHORT giriş varsayılan RED (SHORT-GARANTİSİZ realized-quote tavanı
+        # yok). Bu test PREFLIGHT SIRASINI kanıtlar, tavanı değil — operatörün
+        # yaptığı gibi drift-zarfı env'i ile opt-in yapılır (üretim varsayılanı
+        # değişmez; default RED, test_blok12_e1_limit_cap'te sabitlidir).
+        os.environ["VALIDATION_ALLOW_SHORT_ENTRIES"] = "true"
+        self.addCleanup(os.environ.pop, "VALIDATION_ALLOW_SHORT_ENTRIES", None)
         orig = auto_trader.preflight.pre_flight_check
         auto_trader.preflight.pre_flight_check = fake_pf
         try:

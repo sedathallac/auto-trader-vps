@@ -171,6 +171,11 @@ def test_order_path_reaches_create_executor_when_gate_passes(monkeypatch):
     # (tek kaynak: test_faz12_layer_wiring). Gerçek giriş beklenen test risk'siz çağrılmaz.
     from test_faz12_layer_wiring import _FakeBinance, _FakeHB, _RiskOK
 
+    # E1 (devam-F): bu coin'in yönü SHORT ve E1 varsayılan sözleşmesi SHORT'u
+    # RED der (garanti üretilemez). Test EMİR YOLU kablolamasını kanıtlar →
+    # operatör drift-zarfı env izni; default RED pini test_blok12_e1_limit_cap.
+    monkeypatch.setenv("VALIDATION_ALLOW_SHORT_ENTRIES", "true")
+
     posted = []
     hb = _FakeHB()
 

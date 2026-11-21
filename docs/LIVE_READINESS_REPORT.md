@@ -307,4 +307,19 @@ DEPLOY EDİLMEDİ; üretim 108002c HALTED dokunulmadı.
 | **E2** 418 sürerken istek YOK | Bulunan GERÇEK kusur: api_guard bellek-içiydi → restart ban'ı sıfırlar, ayrı süreçteki orphan_watchdog ban'dan habersiz tur atardı (ban uzaması). `api_guard.json` (STATE_DIR; yalnız bitiş+zaman, sır YOK) → `blocked()=bellek∨dosya`; watchdog turdan ÖNCE gardı denetler, aktifse exit 2 İSTEKSİZ. Yetim SL: yalnız taze FLAT+tracked+algoId-belirli iptal; doğrulanamaz sorgu tracked'de kalır — belirsiz eşleşmede otomatik iptal YOK (mevcut, korundu). | `test_blok12_guard_file_crossproc.py` 7 test (7 RED→yeşil); cooldown/api_guard/watchdog suite'leri 86 passed |
 | **E3** POST↔consume crash | Üretim kodu YENİDEN YAZILMADI; restart simülasyonlu hedef test: POST gitmiş+consume'lanmamış durumdan restart → aynı intent POST ÜRETEMEZ, bütçe 2/2 sabit; kalıntı token tek başına yetki taşımaz. Kalıntı pencere belgelenmeye devam eder. | `test_blok12_approval_ordering.py::TestCrashWindowRestart` (8 passed) |
 
-Bilinen sıra-bağımlılığı (dürüst not): `test_faz12_layer_wiring::test_open_coin_calls_preflight_before_order` ve `test_faz13_calibration_regime_scan::test_order_path_reaches_create_executor_when_gate_passes` İZOLE dosya koşumunda HEAD'de de KIRMIZI (önceden-var olan; tam-süitte yeşil). Nihai tam-koşum sayısı ve preflight FINAL_RELEASE_HANDOFF.md §0'dadır.
+Bilinen sıra-bağımlılığı (dürüst not, iki katmanlı — mekanizma bu turda bulundu):
+`test_faz12_layer_wiring::test_open_coin_calls_preflight_before_order` ve
+`test_faz13_calibration_regime_scan::test_order_path_reaches_create_executor_when_gate_passes`
+(1) E1 öncesi: İZOLE koşumda cf3c32d'de de KIRMIZI — mekanizma: modül-seviyesi
+`_CLOSED_KL_CACHE` bar önbelleği tam-süitte önceki testlerce SOLUSDT/15m ile
+dolduruluyor; izole koşumda testin sahte kline'ı tek+ESKİ bar → BLOK10 F-C
+gereği `calculate_atr` fail-closed None → giriş RED (üretim davranışı DOĞRU;
+test sahte verisi yetersiz). (2) E1 ile: `decide_side` bu coin'i SHORT verir →
+E1 varsayılan RED'i bu iki kablolama testini TAM SÜİTTE de kırmızıya düşürdü
+(nihai-öncesi ilk tam-koşumda görüldü ve düzeltildi): testler artık SHORT
+kablolama yollarını operatörün yaptığı gibi `VALIDATION_ALLOW_SHORT_ENTRIES`
+env drift-zarfı ile opt-in koşar (TEST TARAFI; üretim varsayılanı değişmez;
+default RED pini `test_blok12_e1_limit_cap`). İzole kırmızı (1) miras kalır ve
+bilinçli olarak ONARILMADI (cf3c32d'den kalma, belgeli; üretim koduna dokunuş
+gerektirmez). Nihai tam-koşum sayısı ve preflight FINAL_RELEASE_HANDOFF.md §0
+kanıt bağlamındadır.
