@@ -201,5 +201,74 @@ class TestAutoTraderGate(unittest.TestCase):
         self.assertIn("ONAY-DOSYASI-OKUNAMADI", why)
 
 
+class TestTokenFilePermissions(unittest.TestCase):
+    """BLOK12 devam-D: token DOSYASI izinleri KODDA doğrulanır — 0600 dışı
+    (grup/diğer okuyabilir) RED; RED durumunda token HARCANMAZ."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="b12tok-")
+        self._saved = {k: os.environ.get(k) for k in
+                       ("CONTROLLED_LIVE_VALIDATION", "VALIDATION_BUDGET_DB",
+                        "VALIDATION_APPROVAL_DB",
+                        "OPERATOR_APPROVAL_TOKEN_FILE")}
+        os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
+        os.environ["VALIDATION_BUDGET_DB"] = os.path.join(self.tmp, "vb.db")
+        os.environ["VALIDATION_APPROVAL_DB"] = os.path.join(self.tmp,
+                                                            "gate.db")
+        os.environ.pop("OPERATOR_APPROVAL_TOKEN_FILE", None)
+        auto_trader._VB_CFG = None
+        auto_trader._VB_BUDGET = None
+        # 2. işleme kadar gel: 1. reserve+gate, kayıt+grant
+        self.assertTrue(auto_trader._validation_reserve(
+            "ETHUSDT", 40.0, "i1")[0])
+        self.assertTrue(auto_trader._operator_gate_check()[0])
+        self.g = OA.ApprovalGate(os.environ["VALIDATION_APPROVAL_DB"])
+        self.assertTrue(self.g.record_completion(1, SIX, "op"))
+        self.tok = self.g.grant("op")
+        self.assertIsNotNone(self.tok)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        auto_trader._VB_CFG = None
+        auto_trader._VB_BUDGET = None
+
+    def _to_second(self):
+        self.assertTrue(auto_trader._validation_reserve(
+            "ETHUSDT", 35.0, "i2")[0])
+
+    def _write(self, mode):
+        tp = os.path.join(self.tmp, "tok")
+        with open(tp, "w") as fh:
+            fh.write(self.tok)
+        os.chmod(tp, mode)
+        os.environ["OPERATOR_APPROVAL_TOKEN_FILE"] = tp
+        return tp
+
+    def test_dunya_oku_0644_red_ve_token_harcanmar(self):
+        self._to_second()
+        self._write(0o644)
+        gok, why = auto_trader._operator_gate_check()
+        self.assertFalse(gok)
+        self.assertIn("600", why)
+        self.assertEqual(self.g.state()["state"], "APPROVED_AWAITING_USE")
+
+    def test_grup_oku_0640_red(self):
+        self._to_second()
+        self._write(0o640)
+        gok, why = auto_trader._operator_gate_check()
+        self.assertFalse(gok)
+        self.assertIn("600", why)
+
+    def test_0600_gecer_ve_token_tuketilir(self):
+        self._to_second()
+        self._write(0o600)
+        gok, why = auto_trader._operator_gate_check()
+        self.assertTrue(gok, why)
+
+
 if __name__ == "__main__":
     unittest.main()

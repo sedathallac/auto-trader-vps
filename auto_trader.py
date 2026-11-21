@@ -418,6 +418,15 @@ class BinanceAPI:
         return {"X-MBX-APIKEY": self.key}
 
     def _get(self, path, params=None, signed=False):
+        # BLOK12 devam-A: yerel cooldown sürüyorsa İSTEK GÖNDERİLMEZ — transport
+        # hiç yoklanmaz (418 ban süresi yanmış isteklerle uzar; pozisyonlar
+        # borsa-üstü SL ile korunur). Teyitli başarısızlık: local_block.
+        _rl = api_guard.blocked()
+        if _rl:
+            log.warning(f"⛔ GET {path} gönderilmedi — yerel rate-limit gardi "
+                        f"({_rl}, kalan {api_guard.cooldown_remaining():.0f}s)")
+            return {"code": -1003, "msg": f"LOCAL-COOLDOWN:{_rl}",
+                    "local_block": True}
         params = dict(params or {})
         if signed:
             params["timestamp"] = int(time.time() * 1000)
@@ -433,6 +442,15 @@ class BinanceAPI:
         # (allowed_methods=["GET"]); buradan kör retry yolu yok. 429/418 yalnız
         # not edilir → cooldown, yeni giriş fail-closed; ACK belirsizliğinde
         # durum KORUNUR, emir tekrarlanmaz.
+        # BLOK12 devam-A: gönderim-anı gardı — cooldown'da POST/DELETE de
+        # GÖNDERİLMEZ (istek gitmediği için bu UNKNOWN DEĞİLDİR).
+        _rl = api_guard.blocked()
+        if _rl:
+            log.warning(f"⛔ {method} {path} gönderilmedi — yerel rate-limit "
+                        f"gardi ({_rl}, kalan "
+                        f"{api_guard.cooldown_remaining():.0f}s)")
+            return {"code": -1003, "msg": f"LOCAL-COOLDOWN:{_rl}",
+                    "local_block": True}
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 60000
@@ -3474,6 +3492,27 @@ def entry_intent(symbol, side, notional, decision_price):
     return f"val:{symbol}:{s}:{n:.6f}:{p:.6f}"
 
 
+def _validation_fill_envelope(final_notional, slippage_pct):
+    """(cap, drift, worst) veya None — BLOK12 devam-C GARANTİ ZARFI.
+
+    Dürüst sınır: tavan ancak GERÇEK doluş kayması ≤ drift ise ihlal edilmez
+    (worst = plan × (1+drift), drift = max(gerçek slipaj, taban)). Drift-üstü
+    kayma GARANTİ EDİLEMEZ — pending kayda yazılır, dolum tespitinde gerçek
+    filled_amount_quote ile kıyaslanır ve aşım yeni girişleri anında kilitler
+    (tespit gecikmesi en fazla bir dolum-sonraki tick). Depo okunamazsa None
+    (çağıran fail-closed)."""
+    enabled, valid, budget, _why = _validation_control()
+    if not enabled or not valid or budget is None:
+        return None
+    try:
+        cap = float(budget.status()["max_per_trade_usdt"])
+    except validation_budget_mod.BudgetError:
+        return None
+    drift = max(float(slippage_pct or 0.0),
+                _env_float("VALIDATION_WORST_FILL_DRIFT_PCT", 0.005))
+    return cap, drift, round(float(final_notional) * (1.0 + drift), 6)
+
+
 def _validation_fill_guard(final_notional, slippage_pct):
     """(ok, why) — BLOK12 §2 ÖN koruma: en-kötü-doluş notional'ı işlem-başı
     tavanını aşacaksa giriş POST'A GİTMEDEN reddedilir (market fiyat kayması
@@ -3483,16 +3522,15 @@ def _validation_fill_guard(final_notional, slippage_pct):
         return True, "N/A (bütçe kapalı — reserve zaten RED verecek)"
     if not valid or budget is None:
         return False, why
-    try:
-        cap = float(budget.status()["max_per_trade_usdt"])
-    except validation_budget_mod.BudgetError as e:
-        return False, f"bütçe deposu hatası (fail-closed): {e}"
-    drift = max(float(slippage_pct or 0.0),
-                _env_float("VALIDATION_WORST_FILL_DRIFT_PCT", 0.005))
+    env = _validation_fill_envelope(final_notional, slippage_pct)
+    if env is None:
+        return False, "bütçe deposu hatası (fail-closed)"
+    cap, drift, worst = env
     if validation_budget_mod.worst_case_fill_ok(final_notional, cap, drift):
         return True, f"worst-fill={final_notional * (1 + drift):.4f} ≤ {cap}"
-    return False, (f"WORST-FILL-TAVAN: plan={final_notional:.2f} × (1+drift "
-                   f"{drift:.4f}) > {cap:.2f} — miktar/fiyat ÖNDEN korunur")
+    return False, (f"WORST-FILL-TAVAN: plan={float(final_notional):.2f} × "
+                   f"(1+drift {drift:.4f}) > {cap:.2f} — miktar/fiyat ÖNDEN "
+                   f"korunur")
 
 
 def _validation_fill_exceeded(symbol, actual_quote_filled):
@@ -3573,11 +3611,28 @@ def _operator_gate_check():
             approval_ttl_s=_env_float("VALIDATION_APPROVAL_TTL", 3600.0))
         token = None
         if tok_file:
+            # BLOK12 devam-D: izinler KODDA doğrulanır — fstat (open→fstat
+            # sırası TOCTOU'suz); grup/diğer okuyabiliyorsa token ele
+            # geçirilmiş sayılır: RED ve token HARCANMAZ (chmod 600 gerekir).
             try:
-                with open(tok_file, "r", encoding="utf-8") as fh:
+                _fd = os.open(tok_file, os.O_RDONLY)
+            except OSError:
+                return False, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
+            try:
+                if os.fstat(_fd).st_mode & 0o077:
+                    return False, ("ONAY-DOSYASI-İZİN: grup/diğer okuyabilir "
+                                   "(chmod 600 gerekir) — RED, token HARCANMADI")
+                with os.fdopen(_fd, "r", encoding="utf-8") as fh:
+                    _fd = -1
                     token = fh.read().strip() or None
             except OSError:
                 return False, "ONAY-DOSYASI-OKUNAMADI (fail-closed)"
+            finally:
+                if _fd != -1:
+                    try:
+                        os.close(_fd)
+                    except OSError:
+                        pass
         return gate.entry_consume(seq, token)
     except operator_approval_mod.GateError as e:
         return False, f"GATE-HATASI (fail-closed): {e}"
@@ -4132,6 +4187,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         if reserver is not None and _res_id is not None:
             reserver.release(_res_id, reason="fill_cap_guard")
         return False
+    # BLOK12 devam-C: garanti zarfi pending kayda taşınır — dolum denetimi
+    # GERÇEK notional'ı bu zarfla kıyaslar (None: bütçe kapalı/depo hatası —
+    # denetim tavan-okunabilirliğine düşer).
+    _fg_env = _validation_fill_envelope(final_notional, slippage_pct)
 
     # BLOK10 §3: doğrulama modu AÇIK ise bağımsız bütçe hakkı POST'TAN ÖNCE
     # ayrılır (SQLite, atomik). Ret/depo-hatası → emir YOK. UNKNOWN → hak kalır;
@@ -4158,6 +4217,27 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         _validation_release(_vb_rid)
         if reserver is not None and _res_id is not None:
             reserver.release(_res_id, reason="operator_gate")
+        return False
+
+    # BLOK12 devam-A/B: GÖNDERİM-ANI kapıları — POST'a giden SON adım.
+    # Giriş kapısından buraya kadarki API turları yeni bir 429/418 getirebilir;
+    # SIGTERM de aynı pencerede gelebilir. Her iki ret de TEYİTLİ
+    # başarısızlıktır: istek hiç gönderilmedi → UNKNOWN değil → bütçe iade,
+    # slot serbest (intent silinmez; restart'ta aynı karar yeniden denebilir).
+    if shutdown_requested():
+        log.critical("  atlandı: create_executor ÖNCESİ shutdown — POST YOK "
+                     "(bütçe iade, slot serbest)")
+        _validation_release(_vb_rid)
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="shutdown_pre_order")
+        return False
+    _st_rl = api_guard.blocked()
+    if _st_rl:
+        log.critical(f"  atlandı: create_executor ÖNCESİ rate-limit gardi "
+                     f"({_st_rl}) — POST YOK (bütçe iade, slot serbest)")
+        _validation_release(_vb_rid)
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="rate_limit_pre_order")
         return False
 
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
@@ -4215,6 +4295,10 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         "opened_at": time.time(),
         "entry_client_order_ids": list(entry_ids),
         "entry_client_order_id": entry_ids[-1] if entry_ids else None,
+        # BLOK12 devam-C: garanti zarfi (cap, ayrılan en-kötü) — restart'ta
+        # da diskten okunur; denetim bunu kullanır.
+        "cap_per_trade_usdt": (_fg_env[0] if _fg_env else None),
+        "worst_fill_usdt": (_fg_env[2] if _fg_env else None),
     })
     log.info(f"  ⏳ dolum bekleniyor (tick'ler arası, {FILL_WAIT_S:.0f}s): executor={eid}")
     return True
@@ -5320,9 +5404,26 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
             # BLOK12 §2: GERÇEK gerçekleşen notional (HB filled_amount_quote)
             # tavanı aştıysa CRITICAL + gelecek girişler fail-closed kilit.
             _fx = _validation_fill_exceeded(symbol, filled)
+            if not _fx:
+                # BLOK12 devam-C: tavan İÇİ ama ayrılan en-kötünün üstü →
+                # garanti sınırı aşıldı (slipaj, garantilenen payı tüketti).
+                # Bozuk zarf doğrulanamaz → fail-closed. Eski kayıtlar
+                # (zarfsız) yalnız tavan denetiminde kalır.
+                _w = ctx.get("worst_fill_usdt")
+                if _w is not None:
+                    try:
+                        if filled > float(_w) + validation_budget_mod._EPS:
+                            _fx = (f"{symbol}: GERÇEK fill {filled:.2f} > "
+                                   f"ayrılan en-kötü {float(_w):.2f} — "
+                                   f"GARANTİ-SINIRI aşımı (tavan içi, "
+                                   f"slipaj garantisi ihlali)")
+                    except (TypeError, ValueError):
+                        _fx = (f"{symbol}: fill garanti zarfı "
+                               f"doğrulanamadı ({_w!r}) — fail-closed")
             if _fx:
-                log.critical(f"  🚨 BLOK12 §2 fill-tavan: {_fx} — yeni girişler "
-                             f"sağlık kapısıyla KAPALI (inceleme gerekli)")
+                log.critical(f"  🚨 BLOK12 §2/DEVAM-C fill denetimi: {_fx} — "
+                             f"yeni girişler sağlık kapısıyla KAPALI "
+                             f"(inceleme gerekli)")
                 _entry_health_set("validation_fill_cap", _fx)
             _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
                                   reserver, out, "filled")

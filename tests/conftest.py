@@ -61,6 +61,22 @@ def _isolate_entry_health():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_api_guard():
+    """BLOK12 devam-A: _get/_post artık api_guard cooldown'una bakıyor — bir
+    test gerçek saatli cooldown bırakırsa SONRAKİ testlerin sahte transport'u
+    susturulurdu (sessiz toplu kırmızı). Durumu testten önce temizle, sonra
+    geri yükle."""
+    import api_guard
+    saved = dict(api_guard._STATE)
+    api_guard.reset()
+    try:
+        yield
+    finally:
+        api_guard.reset()
+        api_guard._STATE.update(saved)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_shutdown_flag():
     """BLOK12 §8: _SHUTTING_DOWN süreç-içi bayraktır; bir §8 testi bayrağı
     True bırakırsa SONRAKİ tüm canlı-yol testleri open_coin kapısından

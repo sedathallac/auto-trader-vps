@@ -7,6 +7,7 @@ bozar); shutdown açıkken open_coin dry-run'da bile False döner; uyku ≤1s
 dilimlerle bölünür ve bayrakla ERKEN döner; bütçe/emir(pending)/onay durumu
 deponun yeniden açılışında (restart simülasyonu) korunur. Ağ YOK.
 """
+import contextlib
 import inspect
 import os
 import re
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -227,6 +229,91 @@ class TestStateSurvivesReopen(_FlagBase):
         self.assertEqual(auto_trader._PENDING_FILLS["eid-s8"]["status"],
                          "UNKNOWN")                  # in-flight akıbeti bozulmadı
         self.assertTrue(os.path.exists(disk))
+
+
+from test_inc13_live_wiring import (FakeBinance, FakeHB,  # noqa: E402
+                                    LiveWiringBase, _RiskOK, _coordinator)
+
+
+class TestShutdownRaceAtCreateExecutor(LiveWiringBase):
+    """BLOK12 devam-B: SIGTERM pencere yarışı. Giriş kapısından geçildikten
+    SONRA, create_executor POST'unun bir önceki son adımında sinyal gelirse
+    istek GÖNDERİLMEZ; bütçe hakkı ve slot teyitli başarısızlık olarak iade
+    edilir (istek gitmedi → UNKNOWN değil). Ağ YOK (LiveWiringBase)."""
+
+    @contextlib.contextmanager
+    def _vb(self):
+        old_env = {k: os.environ.get(k) for k in (
+            "CONTROLLED_LIVE_VALIDATION", "MAX_VALIDATION_TRADES",
+            "MAX_VALIDATION_POSITION_NOTIONAL_USDT",
+            "MAX_VALIDATION_TOTAL_NOTIONAL_USDT",
+            "VALIDATION_APPROVAL_DB", "OPERATOR_APPROVAL_TOKEN_FILE")}
+        old_dir, old_bl = auto_trader.STATE_DIR, auto_trader.BLACKLIST_FILE
+        saved = (auto_trader._VB_CFG, auto_trader._VB_BUDGET)
+        tmp = Path(self.tmp)
+        auto_trader.STATE_DIR = tmp
+        auto_trader.BLACKLIST_FILE = tmp / ".bl.json"
+        os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
+        os.environ["MAX_VALIDATION_TRADES"] = "2"
+        os.environ["MAX_VALIDATION_POSITION_NOTIONAL_USDT"] = "50"
+        os.environ["MAX_VALIDATION_TOTAL_NOTIONAL_USDT"] = "100"
+        os.environ["VALIDATION_APPROVAL_DB"] = str(tmp / "gate.db")
+        os.environ.pop("OPERATOR_APPROVAL_TOKEN_FILE", None)
+        auto_trader._VB_CFG = None
+        auto_trader._VB_BUDGET = None
+        try:
+            yield
+        finally:
+            auto_trader._VB_CFG, auto_trader._VB_BUDGET = saved
+            auto_trader.STATE_DIR, auto_trader.BLACKLIST_FILE = old_dir, old_bl
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def setUp(self):
+        super().setUp()
+        import io
+        import logging
+        self._buf = io.StringIO()
+        self._h = logging.StreamHandler(self._buf)
+        auto_trader.log.addHandler(self._h)
+
+    def tearDown(self):
+        auto_trader.log.removeHandler(self._h)
+        super().tearDown()
+
+    def test_sinyal_pencerede_postu_dururur_hak_iade(self):
+        with self._vb():
+            binance, hb = FakeBinance(), FakeHB()
+            cc, _ = _coordinator(binance, hb, self.db)
+            orig = auto_trader._operator_gate_check
+
+            def seam():                       # POST'tan bir önceki son adım
+                auto_trader._SHUTTING_DOWN[0] = True
+                return orig()
+            with mock.patch.object(auto_trader, "_operator_gate_check", seam):
+                res = auto_trader.open_coin(binance, hb, dict(self._coin()),
+                                            dry_run=False, risk=_RiskOK(),
+                                            reserver=None, coordinator=cc)
+            self.assertIs(res, False)
+            self.assertEqual(hb.created, [])  # POST YOK
+            # reserve OLMUŞTU; iade geri saymalı (istek hiç gitmedi):
+            self.assertEqual(
+                auto_trader._VB_BUDGET.status()["trades_used"], 0)
+            self.assertIn("create_executor ÖNCESİ shutdown",
+                          self._buf.getvalue())
+
+    def test_sinyal_yoksa_negatif_kontrol_post_kosar(self):
+        with self._vb():
+            binance, hb = FakeBinance(), FakeHB()
+            cc, _ = _coordinator(binance, hb, self.db)
+            res = auto_trader.open_coin(binance, hb, dict(self._coin()),
+                                        dry_run=False, risk=_RiskOK(),
+                                        reserver=None, coordinator=cc)
+            self.assertTrue(res)
+            self.assertEqual(len(hb.created), 1)
 
 
 if __name__ == "__main__":
