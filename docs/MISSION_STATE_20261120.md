@@ -506,3 +506,102 @@ korundu (açık pozisyonda alternatif korumasızlık; giriş yolu F-C ile kapal�
 **Sıradaki tek yasal adım:** operatör incelemesi. Deploy, HALTED kaldırma, H5, canlı
 bütçe açılması (`CONTROLLED_LIVE_VALIDATION=true` seti dahil) — HER BİRİ AYRI onay.
 Hüküm: **READY FOR OPERATOR REVIEW — NOT DEPLOYED.**
+
+---
+
+# BLOK 11 DEVİR (2026-11-21) — §2 doğrulama + N1/N2/§6.2 onarımları + H5 ÖNSONUÇ altyapısı
+
+**Dal/SHA:** `fix/deploy-candidate-security-20261120`; zincir fde51d8 → **81a8c88** (N2) →
+**b226590** (N1) → **012200f** (§6.2 close CID) → BLOK11-H5/§9 commit'i (bu dosyayla aynı).
+Üretim `108002c` DOKUNULMADI; HALTED; canlıya tek istek/emir YOK (koşum günlükleri rapor
+§6). Üç BLOK11 commit'i PUSH EDİLMEDİ (operatör inceleme kapısı BLOK10 ile aynı).
+
+## 1) §2 — ÜÇ REVIEW'UN BAĞIMSIZ DOĞRULAMASI (yanlışlama-önce)
+
+Merkez bulgu: reviewer'ların dosya satır referansları (runner.py, heartbeat_writer.py,
+watchdog.py, h5/h5_runner.py, config_h5_50.json, ENV_DB validation_budget.py:15...)
+HİÇBİR ağaçta/git geçmişinde YOK — reviewer'lar FAZ18-öncesi/hayalî bir ağaç okumuş.
+
+| ID | Bulgu (iddia) | Kök neden | Doğrulama | Karar |
+|----|---|---|---|---|
+| R1-F1 | "SL girişi TAKİP EDER; pencere açık" | FAZ18 `_finalize_open` SL'yi AYNI finalizasyonda clientAlgoId+3×3s doğrulama ile koyar; doğrulanamazsa acil koordineli kapanış + `is_halted=True` | auto_trader.py `_finalize_open`/`ensure_sl_coverage` okundu; pre-entry SL fiziken imkânsız (reduceOnly pozisyonsuz -2022) | **REFUTED** |
+| R2-F1 | "ACK kaybı telafisi yok" | FAZ18 `find_algo_by_client_id` FOUND/ABSENT/UNKNOWN; UNKNOWN→PENDING korunur, kör retry yok | verify_sl_ack sözleşmesi + testler | **REFUTED** |
+| R2-F2 | "restart'ta tehlikeli kayıt silinir" | `_recover_pending_records` (FAZ15b v5) tehlikeli kayıtları KORUR; ilk tick exchange ile reconcile | kod okundu | **REFUTED** |
+| R2-F3 | "kapanış ACK'siz kör re-POST" | CloseCoordinator: mark_sent(POST öncesi)→FLAT-confirm→mark_closed; REVERSED/PARTIAL muhafızları | close_coordinator.py tam okundu | **REFUTED** |
+| R3 | "client order id hiç yok" | SL algo FAZ18'den beri clientAlgoId; query/cancel orig_client_order_id destekler | kod okundu | **KISMEN YANLIŞ** → gerçek boşluk = kapanış POST'u (§6.2, onarıldı) |
+| N1 | "orphan_killer hiç planlanmamış" | crontab boş, unit yok, üretimde çağıran grep=0, süreç yok | üç bağımsız yokluk kanıtı | **CONFIRMED P1 → onarıldı (b226590)** |
+| N2 | "bütçe kapalıyken pass-through" | §10.3 "kontrol kapalıysa hiçbir işlem açılmasın" der; kod bayrak-kapalıyken serbest bırakıyordu | kod + test | **CONFIRMED P1 → onarıldı (81a8c88)** |
+| §6.2 | "kapanış POST'unda newClientOrderId yok" | close_adapter.close_reduce_only parametresizdi | kod okundu | **CONFIRMED → onarıldı (012200f)** |
+
+## 2) Onarımların kanıt özeti
+
+- **N2 (81a8c88):** `_validation_reserve` DISABLED→RED ("BÜTÇE-KAPALI…"); DB yolu
+  `VALIDATION_BUDGET_DB` env override (test yalıtımı); conftest autouse her teste taze
+  bütçe+DB. Pozitif/negatif kontrol çifti AYNI harneste: bütçe açık→`create_executor`
+  1 çağrı; kapalı→False + 0 çağrı + DB dosyası yok. Eski "bayrak kapalı = akış değişmez"
+  BLOK10 satırı ARTIK GEÇERSİZDİR (bu bölüm onu RESMEN İPTAL eder); §10.3 semantiği:
+  bayrak-kapalı = GİRİŞ YOK. 2 test bilinçli güncellendi (mod-off sözleşmesi; c6 200 USDT
+  harness bypass'ı + per-trade 50.01 RED testi eklendi).
+- **N1 (b226590):** `tools/orphan_watchdog.py` (flock+exit-code: 0 tur/1 scan istisnası/
+  2 kilit-anahtar yok; anahtar yokluğunda TEK İSTEK YOK), 8 test (kaynak taraması dahil:
+  emir token'ı yasağı), `deploy/orphan_watchdog_faz9_live.{service,timer}.example` +
+  cron alternatifi — **KURULMADI** (operatör kararı; HOME'un live servisle birebir
+  aynı olması şart — farklı HOME = sessiz körlük).
+- **§6.2 (012200f):** `fz9c<SYMBOL><ms>` ≤36 karakter newClientOrderId; ONEWAY+HEDGE
+  dalları; ms tabanlı tekil; red→FAILED_SAFE (bilinçli güvenli taraf).
+
+## 3) §3 H5 — altyapı KURULDU; ÖNSONUÇ (PRELIMINARY) koşuldu; ana karar OPERATörde
+
+Motor `tools/h5_engine.py` (faz5_harness cc0f1010 + faz7 c8877b45 BİREBİR kopyalar +
+run_round_ex kimlik-testli genişletme) + `tools/h5_runner.py` (10 gard, 23 test
+GREEN). Sinyal makinesi = FAZ3'ün kendisi (`faz3_backtest.SymbolData/scan_symbol_decisions`,
+cfg_base={}, geçiren = veto-değil ∧ fams≥1 — canlı `CONFIRM_MIN_FAMILIES=1`);
+bariyerler `sizing_policy.SIZING_DEFAULTS` (canlı ile aynı: 1.5/3.0×ATR bantlı).
+Etiketler (dürüstlük): **PRELIMINARY + PARTIAL + üreticiye-in-sample** — B.2'nin birincil
+OOS'u 2020-23'tür; 2025 FAZ3 keşif penceresi İÇİNDE; B.5 dört-kapısı 2025'e UYGULANMAZ
+(B.8); BCH/GALA 2025 verisi YOK (indirme OPERATÖR ONAYI gerektirir, §3.1).
+
+H5 koşum sayıları (ETHUSDT 15m; işlem başına net %, cm-v1-pess-v1 kötümser):
+FULL2025 (n=33 981 olay): ileri −0,3657 / **TERS −0,3390**; iid boot lo5(ters)
+−0,3469; çeyrek-lo5 −0,3545; DSR(N=20)≈0. EXACT KAS-ARA (n=5 854): ileri
+−0,3669 / **TERS −0,3758**; iid lo5 −0,3939 (çeyrek-lo5 2 blokte tanımsız).
+base senaryoda da iki pencerede de ortalamalar negatif (−0,09…−0,13).
+SONUÇ (ÖNSONUÇ): iki kol × iki senaryo × iki pencerenin TAMAMINDA net<0 —
+2025 ETHUSDT'de ters kural maliyeti karşılayacak kenar ÜRET MİYOR; FAZ3
+"EDGE YOK" ile yönsel tutarlı; üretici in-sample olduğundan KEŞİF DEĞİL,
+teyit önsonucu. 2026 girişi YOK (1 sınır olayı elendi+sayıldı; G-runtime
+sıfır ihlal); çıkış sızması ≤15 işlemdir (≤4 h). Kaçış dağılımı kötümserde
+ağırlıklı SL (~%67) — bariyerler SL tarafında çalışıyor.
+Yöntem notu (B.5-1 sapması): sembol-kümeleri tanımsız olduğundan tek-sembol
+koşusunda küme-iid uygulanır; alt-uç barındırma-korelasyonuna KÖR kalır —
+sayı yalnız PARTIAL bağlamda anlam taşır.
+Sonuç dizini: /home/reisfurkan/faz9-audit/h5_runs/ (Git-dışı; trades.csv+summary.json).
+
+## 4) §9 testnet smoke — ARAÇ HAZIR, KOŞULMADI (blokaj)
+
+`tools/testnet_smoke.py`: base URL KODDA SABİT testnet; üretim anahtarı ortamda varsa
+RED; TESTNET_* anahtarı yoksa RED (exit 2). 7 test GREEN, ağa tek istek YOK.
+**TESTNET_API_KEY/TESTNET_API_SECRET bu makinede YOK → §13 blokajı: smoke yapılamadı.**
+Not: G09 (h5_runner) ilk denemede ÜRETİM ANAHTARI ortamda görüldüğü için koşuyu RED'ledi —
+gard çalıştı; koşular yalnız kimlik-temiz alt-ortamda (`env -u BINANCE_KEY -u BINANCE_SECRET`)
+koşar; kimlik değerleri hiçbir çıktıya yazılmadı.
+
+## 5) Test/gardi durumu
+
+Full `tests/`: H5+smoke modülleriyle **1186 passed, 9 subtests, exit 0**
+(son tam koşum, BLOK11 commit'iyle aynı ağaç). Root pytest: 8 ÖNCEDEN-VAR
+FAILED (BLOK10 §6 ile aynı küme; yeni dosya etkisi yok). Canlı Binance'e TEK
+İSTEK YOK (tüm BLOK11 boyunca; H5 turları yalnız yerel CSV okuması).
+
+**BLOK10 satırıyla çelişki DÜRÜSTÇE KAYITLI:** "bayrak kapalı = akış BİREBİR
+değişmez" (yukarıda, BLOK10 §Bağımsız limitler) N2 ile GEÇERSİZDİR; yeni
+sözleşme: bayrak kapalı/bozuk → tüm canlı girişler RED (`BÜTÇE-KAPALI:`).
+Eski semantiğe dayanan iki test bilinçli olarak yeni sözleşmeye güncellendi.
+
+## 6) Sıradaki yasal adımlar (HER BİRİ AYRI OPERATÖR ONAYI)
+
+1. BCH/GALA 2025 kline indirme onayı (production/vision arşiv = "production kline
+   download") → tam-üniversite H5; 2. B.2 2020-23 birincil OOS kararı (asıl kapı);
+3. watchdog kurulumu (unit örnekleri hazır); 4. testnet anahtarları verilirse smoke;
+5. push/deploy/HALTED — BLOK10 kapıları AYNEN duruyor.
+Hüküm: **READY FOR OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.**

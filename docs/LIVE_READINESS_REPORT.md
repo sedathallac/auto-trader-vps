@@ -186,7 +186,30 @@ Artık riskler — **kod değişikliği YAPILMADI, gerekçeli**; durum etiketler
 kapısıyla belgelendi (test silinmedi, `evidence/` arşivine `git mv` ile tarihçe korundu).
 
 ---
-## HÜKÜM
+
+## 9. BLOK11 ekleri (2026-11-21) — semantik değişimler ve yeni operatör adımları
+
+1. **BÜTÇE SEMANTİĞİ DEĞİŞTİ (N2, §10.3 — BLOK10 §8.3 satırı geçersiz):**
+   `CONTROLLED_LIVE_VALIDATION` kapalı/bozuk iken artık GİRİŞ YOK (eski davranış:
+   akış değişmezdi). Açılış sırası: bayrak doğru-`true` → limitler geçerli → DB
+   açılabilir → rezerv. Kapalı ortamda canlı giriş denemesi logda
+   `BÜTÇE-KAPALI:` ile RED edilir; doğrulama bütçesi DB yolu
+   `VALIDATION_BUDGET_DB` ile taşınabilir (test/izolasyon; varsayılan STATE_DIR).
+2. **YETİM-SL WATCHDOG PLANLANABİLİR (N1):** `tools/orphan_watchdog.py --once`
+   (flock, exit 0/1/2; anahtar yoksa TEK İSTEK YOK). Kurulum ÖRNEKLERDEN
+   (deploy/orphan_watchdog_faz9_live.{service,timer}.example veya cron) —
+   OPERATÖR kararı; `Environment=HOME` canlı servisle BİREBİR aynı olmalı.
+3. **KAPANIŞ CID (012200f):** her kapanış POST'u `fz9c<SYMBOL><ms>` taşır; ACK
+   kaybı emir query ile telaf edilebilir kimlik verir. Retry aynı CID'yi
+   üretmez; Binance red verirse FAILED_SAFE (bilinçli güvenli taraf).
+4. **H5 ÖNSONUÇ:** koşucu/gard/motor BLOK11'de kuruldu (tools/h5_*); yalnız
+   PRELIMINARY/PARTIAL etiketli ETHUSDT 2025 önsonucu üretildi — B.5 kapı hükmü
+   DEĞİL (detaylar MISSION_STATE BLOK11 §3 ve audit `h5_runs/` özetleri).
+   BCH/GALA verisi ve 2020-23 birincil OOS kararı OPERATÖR onayı bekliyor.
+5. **TESTNET SMOKE:** `tools/testnet_smoke.py` hazır/koşulmadı — TESTNET_*
+   anahtarı yok; üretim anahtarı ortamda iken kendini RED'ler (kanıtlı).
+
+## HÜKÜM — BLOK10 (BLOK11 §9 ekleriyle geçerli)
 
 **READY FOR OPERATOR REVIEW — NOT DEPLOYED.** Altı bağımsız doğrulanmış P1 onarıldı ve
 testlendi; 2×50/100 bütçesi bağımsız fail-closed kontrol olarak üretim giriş zincirine

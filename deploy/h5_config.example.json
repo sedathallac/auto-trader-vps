@@ -1,0 +1,11 @@
+{
+  "_comment": "BLOK11 §3 H5 ÖN-KOŞU ÖRNEĞİ — KURULUM DEĞİL. base_url yalnız boş veya testnet olabilir (üretim → G02 RED). halt=true, üretim HALTED doğrulamasından sonra operatör tarafından yazılır. out_dir TAZE olmalı. symbols TAM misyon kümesi; eksik veri PARTIAL yalnız --allow-partial ile.",
+  "base_url": "https://testnet.binancefuture.com",
+  "halt": true,
+  "symbols": ["ETHUSDT", "BCHUSDT", "GALAUSDT"],
+  "timeframe": "15m",
+  "window": {"from": "2025-01-01", "to": "2025-12-31"},
+  "data_root": "/path/to/raw/klines",
+  "faz3_root": "/path/to/faz9-faz3",
+  "out_dir": "/path/to/audit/h5_runs/H5_FULL2025_PRELIM_YEKTANIMA"
+}
