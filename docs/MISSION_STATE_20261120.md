@@ -705,3 +705,17 @@ Kanıt: RED 11 failed/12 passed (HEAD worktree; 12 = cooldown doğrulama +
 katman/KADER pinleri, kasıtlı yeşil) → YEŞİL BLOK12 süitleri 74 passed;
 tam tests/ ve preflight aşağıda. Canlı istek/emir YOK; üretim 108002c
 dokunulmadı.
+
+## 7) BLOK12 DEVAM F — SON KAPANIŞ GÖREVİ (2026-11-21): E1 gerçekleşen tavan, E2 süreç-desti gard, E3 crash testi
+
+| Madde | Yapılan | Kırmızı→Yeşil |
+|---|---|---|
+| E1 (§2) | Canlı imaj kanıtıyla `open_order_type 1`=MARKET doğrulandı; doğrulama girişi LIMIT PIN (type 2 + top-level `entry_price`, sabit fiyat, anında); P_cap tick-floor, Decimal A×P_cap≤50 BİREBİR; aşan plan RED (kırpma YOK); LONG = matematiksel tavan (BUY limit üstü dolmaz); SHORT = garanti üretilemez → varsayılan RED, env yalnız garanti-DRİFT zarfı izni; eski MARKET yolu AÇIK zaf olarak testli (sahte garanti yok); pending: entry_price_cap + max_realized_quote + worst=TAM A×P_cap (drift 0) | HEAD'de 13 RED → 15 GREEN (test_blok12_e1_limit_cap) |
+| E2 (§3) | GERÇEK kusur bulundu ve kapatıldı: api_guard bellek-içiydi → restart ban'ı sıfırlıyor + orphan_watchdog ban'dan habersiz istek atabiliyordu; STATE_DIR/api_guard.json (sır Yok) → blocked()=bellek∨dosya; watchdog tur-öncesi gard → aktifse exit 2, istek YOK; yetim SL belirsizde otomatik iptal YOK (mevcut korundu); stop(keep_position)=POSITION_HOLD dil denetimi temiz | 7 RED → 7 GREEN (test_blok12_guard_file_crossproc); ilgili süitler 86 passed |
+| E3 (§4) | Üretim kodu yazılmadı; restart simülasyonlu hedef test: POST gitmiş+consume'lanmamış → restart → aynı intent POST ÜRETEMEZ (bariyer bütçe/intent+pending; kalıntı token yetki taşımaz); kalıntı pencere belgeli | TestCrashWindowRestart dahil 8 passed |
+| §5–§7 | Kod tarafı uygun (load_hb_auth env/0600 fail-closed; testnet_smoke yalnız TESTNET+0600 işaret+"ÜRETİM KANITI DEĞİLDİR"; h5_runner ağ-KAPALI, indirme operatör onayı). Runtime rotasyonu/testnet/OOS/ watchdog kurulumu = DIŞSAL kapılar → HÜKÜM BLOCKED | — |
+| §8 | Salt-okunur env sayımı: HALTED nedeni kayıtlı; birim/süreç YOK; 6 worktree temiz; miras pending E1 target_notional 153.0 (BLOK12-öncesi 50-üstü boyut kanıtı) — dokunulmadı; kimlik dizinleri 0775 (rotasyon 0600'e taşır) | handoff §6 |
+
+Hüküm: **BLOCKED** — kapılar FINAL_RELEASE_HANDOFF.md §8 (rotasyon, watchdog
+kurulumu, testnet, BCH/GALA OOS). Final tam-koşum/preflight/secret-scan nihai
+SHA'da TEK kere koşulur; ham çıktıları devir raporundadır.
