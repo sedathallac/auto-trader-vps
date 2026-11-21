@@ -203,9 +203,12 @@ kapısıyla belgelendi (test silinmedi, `evidence/` arşivine `git mv` ile tarih
    kaybı emir query ile telaf edilebilir kimlik verir. Retry aynı CID'yi
    üretmez; Binance red verirse FAILED_SAFE (bilinçli güvenli taraf).
 4. **H5 ÖNSONUÇ:** koşucu/gard/motor BLOK11'de kuruldu (tools/h5_*); yalnız
-   PRELIMINARY/PARTIAL etiketli ETHUSDT 2025 önsonucu üretildi — B.5 kapı hükmü
-   DEĞİL (detaylar MISSION_STATE BLOK11 §3 ve audit `h5_runs/` özetleri).
-   BCH/GALA verisi ve 2020-23 birincil OOS kararı OPERATÖR onayı bekliyor.
+   PRELIMINARY/PARTIAL etiketli ETHUSDT 2025 önsonucu üretildi. BLOK12 §9
+   hükmü: bu sayılar **yalnız OOS-OLMAYAN ÖN-GÖZLEM**dir — B.5 OOS kapısı
+   hükmü YERİNE GEÇMEZ, KÂRLILIK KANITI OLARAK ALINTILANAMAZ, ve H5 bu
+   etiketle YENİDEN KOŞULMAZ (detaylar MISSION_STATE BLOK11 §3 ve audit
+   `h5_runs/` özetleri). BCH/GALA verisi ve 2020-23 birincil OOS kararı
+   OPERATÖR onayı bekliyor.
 5. **TESTNET SMOKE:** `tools/testnet_smoke.py` hazır/koşulmadı — TESTNET_*
    anahtarı yok; üretim anahtarı ortamda iken kendini RED'ler (kanıtlı).
 

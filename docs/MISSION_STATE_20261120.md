@@ -561,6 +561,13 @@ Etiketler (dürüstlük): **PRELIMINARY + PARTIAL + üreticiye-in-sample** — B
 OOS'u 2020-23'tür; 2025 FAZ3 keşif penceresi İÇİNDE; B.5 dört-kapısı 2025'e UYGULANMAZ
 (B.8); BCH/GALA 2025 verisi YOK (indirme OPERATÖR ONAYI gerektirir, §3.1).
 
+BLOK12 §9 ETİKET HÜKMÜ (bağlayıcı): aşağıdaki ETHUSDT 2025 sayıları **yalnız
+OOS-OLMAYAN ÖN-GÖZLEM**dir. (i) B.5 OOS kapısı hükmü yerine GEÇİRİLEMEZ;
+(ii) kârlılık/kârsızlık KANITI olarak alıntılamaz — yönsel gözlemdir;
+(iii) H5 bu sayılar için YENİDEN KOŞULMAZ (koşum maliyeti/blokaj gerekçesiyle
+etiket gevşetilemez). Birincil OOS kararı yalnız OPERATÖR onaylı BCH/GALA
+indirmesi + 2020-23 penceresiyle verilir.
+
 H5 koşum sayıları (ETHUSDT 15m; işlem başına net %, cm-v1-pess-v1 kötümser):
 FULL2025 (n=33 981 olay): ileri −0,3657 / **TERS −0,3390**; iid boot lo5(ters)
 −0,3469; çeyrek-lo5 −0,3545; DSR(N=20)≈0. EXACT KAS-ARA (n=5 854): ileri
