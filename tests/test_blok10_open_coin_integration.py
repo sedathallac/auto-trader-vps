@@ -65,8 +65,12 @@ class TestControlledBudgetIntegration(LiveWiringBase):
                 else:
                     os.environ[k] = v
 
-    def _open(self, binance, hb, cc, risk=None):
-        return auto_trader.open_coin(binance, hb, self._coin(), dry_run=False,
+    def _open(self, binance, hb, cc, risk=None, price=None):
+        coin = dict(self._coin())
+        if price is not None:
+            # BLOK12 §2: farklı fiyat = farklı piyasa kararı = farklı intent.
+            coin["lastPrice"] = str(price)
+        return auto_trader.open_coin(binance, hb, coin, dry_run=False,
                                      risk=risk or _RiskOK(), reserver=None,
                                      coordinator=cc)
 
@@ -87,12 +91,28 @@ class TestControlledBudgetIntegration(LiveWiringBase):
         with self._vb():
             binance, hb = FakeBinance(), FakeHB()
             cc, _ = _coordinator(binance, hb, self.db)
-            self.assertIs(self._open(binance, hb, cc), True)
-            self.assertIs(self._open(binance, hb, cc), True)
+            # BLOK12 §2: üçü de AYNI mantıksal giriş olsaydı intent tekrarı
+            # engellenirdi; ayrı fiyatlarla üç AYRI karar simüle edilir.
+            self.assertIs(self._open(binance, hb, cc, price="80"), True)
+            self.assertIs(self._open(binance, hb, cc, price="80.5"), True)
             self.assertEqual(len(hb.created), 2)
-            self.assertIs(self._open(binance, hb, cc), False)
+            self.assertIs(self._open(binance, hb, cc, price="81"), False)
             self.assertEqual(len(hb.created), 2)
             self.assertEqual(auto_trader._VB_BUDGET.status()["trades_used"], 2)
+
+    # BLOK12 §2 — AYNI mantıksal giriş (aynı coin, aynı fiyat) iki kez
+    # çağrılırsa İKİNCİSİ gönderilmez: create_executor TEK kalır, bütçe hakkı
+    # TEK tüketilir. Hangi katmanın (pending/bütçe-intent) blokladığı önemsiz;
+    # garanti uçtan uca "tekrar gönderim YOK"tur.
+    def test_same_logical_entry_is_not_resent(self):
+        with self._vb():
+            binance, hb = FakeBinance(), FakeHB()
+            cc, _ = _coordinator(binance, hb, self.db)
+            self.assertIs(self._open(binance, hb, cc), True)
+            self.assertIs(self._open(binance, hb, cc), False)
+            self.assertEqual(len(hb.created), 1)
+            self.assertEqual(
+                auto_trader._VB_BUDGET.status()["trades_used"], 1)
 
     # §3 (BLOK10) → BLOK11 §10.3 ÇEVRİMİ: ESKİ varsayım ("bayrak KAPALI iken
     # normal akış birebir devam eder") misyonla GEÇERSİZ kılındı: "bütçe kontrolü

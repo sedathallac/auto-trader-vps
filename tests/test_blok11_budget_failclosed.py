@@ -1,8 +1,11 @@
-"""BLOK11 §10.3 — bütçe kapısı fail-closed: bütçe KAPALI iken canlı giriş YOK.
+"""BLOK11 §10.3 + BLOK12 §2 — bütçe kapısı fail-closed + deterministik intent: bütçe KAPALI iken canlı giriş YOK.
 
 BLOK10 doğrulanmış durumu: DISABLED modda bütçe pas-through idi
 (ok=True, "DISABLED"). Misyon artık emrediyor: "Bütçe kontrolü kapalıysa
 hiçbir işlem açılmasın." Bu dosya çevrimin KIRMIZI kanıtıdır.
+
+BLOK12 §2 imza değişikliği: reserve artık DETERMİNİSTİK intent alır
+(uuid4 yerine); intent=None → RED (fail-closed).
 
 dry_run kapsam dışıdır: open_coin "[DRY] emir yok" noktasından (auto_trader.py
 ~3677) bu kapıya ulaşmadan döner; bütçe hakkı yalnız GERÇEK yolun
@@ -43,7 +46,7 @@ class TestBudgetGateFailClosed(unittest.TestCase):
     # ---- helper düzeyi ------------------------------------------------------
     def test_disabled_mod_reddedilir(self):
         """BAYRAK KAPALI (varsayılan üretim hali) → RED + DB dosyası YARATILMAZ."""
-        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0)
+        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0, "val:ETHUSDT:1:40:100")
         self.assertFalse(ok)
         self.assertIsNone(rid)
         self.assertIn("BÜTÇE-KAPALI", why)
@@ -53,14 +56,14 @@ class TestBudgetGateFailClosed(unittest.TestCase):
         os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
         os.environ["MAX_VALIDATION_TRADES"] = "99"  # HARD_MAX_TRADES=2'den büyük
         _reset_vb()
-        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0)
+        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0, "val:ETHUSDT:1:40:100")
         self.assertFalse(ok)
         self.assertIn("geçersiz", why)
 
     def test_acik_ve_gecerli_izin_verir(self):
         os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
         _reset_vb()
-        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0)
+        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0, "val:ETHUSDT:1:40:100")
         self.assertTrue(ok, msg=why)
         self.assertIsNotNone(rid)
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "vb.db")))
@@ -68,9 +71,9 @@ class TestBudgetGateFailClosed(unittest.TestCase):
     def test_ucuncu_islem_reddedilir(self):
         os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
         _reset_vb()
-        r1 = auto_trader._validation_reserve("ETHUSDT", 40.0)
-        r2 = auto_trader._validation_reserve("BCHUSDT", 15.0)
-        r3 = auto_trader._validation_reserve("GALAUSDT", 10.0)
+        r1 = auto_trader._validation_reserve("ETHUSDT", 40.0, "val:ETHUSDT:1:40:100")
+        r2 = auto_trader._validation_reserve("BCHUSDT", 15.0, "val:BCHUSDT:1:15:100")
+        r3 = auto_trader._validation_reserve("GALAUSDT", 10.0, "val:GALAUSDT:1:10:100")
         self.assertTrue(r1[0], msg=r1[2])
         self.assertTrue(r2[0], msg=r2[2])
         self.assertFalse(r3[0])
@@ -80,11 +83,11 @@ class TestBudgetGateFailClosed(unittest.TestCase):
         """§13 tablosu: >50 USDT/emir meşru RED (c6 harness bypass'ının gerekçesi)."""
         os.environ["CONTROLLED_LIVE_VALIDATION"] = "true"
         _reset_vb()
-        ok, rid, why = auto_trader._validation_reserve("NEARUSDT", 50.01)
+        ok, rid, why = auto_trader._validation_reserve("NEARUSDT", 50.01, "val:NEARUSDT:1:50.01:100")
         self.assertFalse(ok)
         self.assertIsNone(rid)
         self.assertIn("PER_TRADE_CAP", why)
-        ok2, rid2, _ = auto_trader._validation_reserve("NEARUSDT", 50.0)
+        ok2, rid2, _ = auto_trader._validation_reserve("NEARUSDT", 50.0, "val:NEARUSDT:1:50:100")
         self.assertTrue(ok2, msg="tam 50 kabul (≤ tavan)")
 
     def test_db_acilamazsa_fail_closed(self):
@@ -92,7 +95,7 @@ class TestBudgetGateFailClosed(unittest.TestCase):
         os.environ["VALIDATION_BUDGET_DB"] = os.path.join(
             self.tmp, "yok-boyle-bir-dizin", "vb.db")
         _reset_vb()
-        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0)
+        ok, rid, why = auto_trader._validation_reserve("ETHUSDT", 40.0, "val:ETHUSDT:1:40:100")
         self.assertFalse(ok)
         # Hata açılışta ("açılamadı") ya da reserve'da (BudgetError) yakalanabilir;
         # ikisi de fail-closed RED'dir — önemli olan RED + rid YOK.

@@ -3349,12 +3349,80 @@ def _validation_control():
         return True, True, _VB_BUDGET, "OK"
 
 
-def _validation_reserve(symbol, notional):
+def entry_intent(symbol, side, notional, decision_price):
+    """BLOK12 §2: mantıksal emir girişinin DETERMİNİSTİK kimliği.
+
+    Eski `_validation_reserve` her çağrıda uuid4 üretiyordu — AYNI mantıksal
+    giriş yeniden çağrıldığında yeni intent sayılıyor, gerçek retry'da ikinci
+    bütçe hakkı tüketilebiliyordu. Intent = (sembol, yön, planlanan notional,
+    karar fiyatı): aynı karar tekrarında aynı kimlik → bütçe modülü IDEMPOTENT
+    tanır, hak yeniden TÜKETİLMEZ ve POST yeniden GÖNDERİLMEZ.
+    Fiyat karar-anının kimliktir: farklı piyasa durumu ayrı denemedir."""
+    try:
+        n = round(float(notional), 6)
+        p = round(float(decision_price), 6)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or not (-10**12 < p < 10**12):
+        return None
+    s = int(side)
+    if s != 1:
+        s = 2                       # HB sözleşmesi: 1=LONG, 2=SHORT (üretim)
+    return f"val:{symbol}:{s}:{n:.6f}:{p:.6f}"
+
+
+def _validation_fill_guard(final_notional, slippage_pct):
+    """(ok, why) — BLOK12 §2 ÖN koruma: en-kötü-doluş notional'ı işlem-başı
+    tavanını aşacaksa giriş POST'A GİTMEDEN reddedilir (market fiyat kayması
+    nedeniyle 50 USDT sınırının sonradan aşılmasını raporlamak yetmez)."""
+    enabled, valid, budget, why = _validation_control()
+    if not enabled:
+        return True, "N/A (bütçe kapalı — reserve zaten RED verecek)"
+    if not valid or budget is None:
+        return False, why
+    try:
+        cap = float(budget.status()["max_per_trade_usdt"])
+    except validation_budget_mod.BudgetError as e:
+        return False, f"bütçe deposu hatası (fail-closed): {e}"
+    drift = max(float(slippage_pct or 0.0),
+                _env_float("VALIDATION_WORST_FILL_DRIFT_PCT", 0.005))
+    if validation_budget_mod.worst_case_fill_ok(final_notional, cap, drift):
+        return True, f"worst-fill={final_notional * (1 + drift):.4f} ≤ {cap}"
+    return False, (f"WORST-FILL-TAVAN: plan={final_notional:.2f} × (1+drift "
+                   f"{drift:.4f}) > {cap:.2f} — miktar/fiyat ÖNDEN korunur")
+
+
+def _validation_fill_exceeded(symbol, actual_quote_filled):
+    """BLOK12 §2 SONRADAN denetim (ön korumanin kaniti): HB filled_amount_quote
+    gerçek gerçekleşen notional'dır; tavan aşıldıysa CRITICAL + yeni giriş
+    sağlığı kapatılır (gelecek girişler fail-closed)."""
+    enabled, valid, budget, _ = _validation_control()
+    if not enabled or not valid or budget is None:
+        return None
+    try:
+        cap = float(budget.status()["max_per_trade_usdt"])
+    except validation_budget_mod.BudgetError:
+        return "bütçe deposu okunamadı (fill denetimi)"
+    try:
+        got = float(actual_quote_filled)
+    except (TypeError, ValueError):
+        return "fill notional çözümlenemedi"
+    if got > cap + validation_budget_mod._EPS:
+        return (f"{symbol}: GERÇEK fill notional {got:.2f} > tavan {cap:.2f}")
+    return None
+
+
+def _validation_reserve(symbol, notional, intent):
     """(ok, rid, why). BLOK11 §10.3 FAIL-CLOSED ÇEVRİM: bayrak KAPALI iken de
     RED — "bütçe kontrolü kapalıysa hiçbir işlem açılmasın". Eski davranış
     (kapalı → pas-through) yalnız dry_run/compare yollarında anlamlıydı ve
     orada kalır: dry_run open_coin'i ([DRY] emir yok) bu kapıya ulaşmadan
-    döner, hak tüketmez. Yan etki YOK (red DB dosyası bile yaratmaz)."""
+    döner, hak tüketmez. Yan etki YOK (red DB dosyası bile yaratmaz).
+
+    BLOK12 §2: intent DETERMİNİSTİKTİR (entry_intent). Aynı intent tekrarı
+    hak tüketmez VE tekrar gönderimdir → ok=False, rid=None (çağıran POST'a
+    gitmez; mevcut rezervasyon KORUNUR, iade edilmez). Payload farklıysa
+    INTENT_PAYLOAD_MISMATCH RED. intent=None → RED (fail-closed)."""
     enabled, valid, budget, why = _validation_control()
     if not enabled:
         return False, None, ("BÜTÇE-KAPALI: CONTROLLED_LIVE_VALIDATION doğru "
@@ -3362,24 +3430,31 @@ def _validation_reserve(symbol, notional):
                              "YOK (BLOK11 §10.3)")
     if not valid or budget is None:
         return False, None, why
+    if not intent:
+        return False, None, "INTENT-YOK: mantıksal giriş kimliği türetilemedi (fail-closed)"
     try:
-        r = budget.reserve(symbol, float(notional),
-                           idem_key=f"val:{symbol}:{uuid.uuid4().hex}")
+        r = budget.reserve(symbol, float(notional), idem_key=intent)
     except validation_budget_mod.BudgetError as e:
         return False, None, f"bütçe deposu hatası (fail-closed): {e}"
     if not r.ok:
         return False, None, (f"{r.reason} — kullanım {r.trades_used} işlem / "
                              f"{r.notional_used:.2f} USDT")
+    if not r.first_use:
+        return False, None, ("INTENT-TEKRAR: aynı mantıksal giriş zaten "
+                             "rezerve/teyitli — tekrar gönderim RED, hak KORUNUR")
     return True, r.rid, r.reason
 
 
-def _validation_confirm(rid):
-    """POST başarılı → CONSUMED. Hata olursa rezervasyon KALIR (güvenli taraf)."""
+def _validation_confirm(rid, executor_id=None, op_period=None):
+    """POST başarılı → CONSUMED. Hata olursa rezervasyon KALIR (güvenli taraf).
+
+    BLOK12 §2: executor_id/op_period aynı atomik geçişte bağlanır — bütçe
+    hakkı ile emir kimliği aynı işlem döneminde kayıtlı olur."""
     if rid is None:
         return
     try:
         if _VB_BUDGET is not None:
-            _VB_BUDGET.confirm(rid)
+            _VB_BUDGET.confirm(rid, executor_id=executor_id, op_period=op_period)
     except Exception as e:
         log.critical(f"🚨 doğrulama bütçe teyidi başarısız (rid={rid}): {e} — "
                      f"rezervasyon KORUNUYOR (konservatif)")
@@ -3823,10 +3898,25 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             reserver.release(_res_id, reason="no_risk_engine")
         return False
 
+    # BLOK12 §2: ÖN doluş-koruma — en-kötü-doluş (1+drift) işlem-başı tavanını
+    # aşacaksa POST'a gidilmez (miktar/fiyat önceden korunur; sonradan rapor
+    # yeterli değil). Bayrak kapalıyken N/A'dir (reserve zaten RED verir).
+    _fg_ok, _fg_why = _validation_fill_guard(final_notional, slippage_pct)
+    if not _fg_ok:
+        log.warning(f"  atlandı: doluş tavanı ön-koruması ({_fg_why})")
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="fill_cap_guard")
+        return False
+
     # BLOK10 §3: doğrulama modu AÇIK ise bağımsız bütçe hakkı POST'TAN ÖNCE
     # ayrılır (SQLite, atomik). Ret/depo-hatası → emir YOK. UNKNOWN → hak kalır;
     # teyitli başarısızlık → iade; executor oluştu → CONSUMED (aşağıda).
-    _vb_ok, _vb_rid, _vb_why = _validation_reserve(symbol, final_notional)
+    # BLOK12 §2: intent deterministiktir — aynı mantıksal giriş tanınır, hak
+    # yeniden tüketilmez ve UNKNOWN/teyit edilmiş giriş tekrar GÖNDERİLMEZ.
+    _vb_intent = entry_intent(symbol, side, final_notional,
+                              coin.get("lastPrice"))
+    _vb_ok, _vb_rid, _vb_why = _validation_reserve(symbol, final_notional,
+                                                   _vb_intent)
     if not _vb_ok:
         log.warning(f"  atlandı: doğrulama bütçesi ({_vb_why})")
         if reserver is not None and _res_id is not None:
@@ -3860,7 +3950,9 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.error(f"  executor açılamadı: {er}")
         return False
     log.info(f"  executor={eid}")
-    _validation_confirm(_vb_rid)  # BLOK10 §3: hak tüketildi (CONSUMED, kalıcı)
+    # BLOK10 §3: hak tüketildi (CONSUMED, kalıcı); BLOK12 §2: emir kimliği ve
+    # işlem dönemi (intent) aynı geçişte bağlanır.
+    _validation_confirm(_vb_rid, executor_id=str(eid), op_period=_vb_intent)
 
     # FAZ14p: dolum beklemesi artık TICK'LER ARASINDA ilerler. Eski hâli ana thread'i
     # FILL_WAIT_S (300s) boyunca time.sleep ile kilitliyordu: tarama, SL denetimi ve
@@ -4988,6 +5080,13 @@ def _process_pending_fills(binance, hb, risk, coordinator, reserver):
         # C — dolum tespit edildi: pending KORUNARAK finalize -> persist -> confirm -> drop
         if filled >= 1:
             log.info(f"  ✅ doldu: {filled:.2f} USDT ({symbol}, executor={eid})")
+            # BLOK12 §2: GERÇEK gerçekleşen notional (HB filled_amount_quote)
+            # tavanı aştıysa CRITICAL + gelecek girişler fail-closed kilit.
+            _fx = _validation_fill_exceeded(symbol, filled)
+            if _fx:
+                log.critical(f"  🚨 BLOK12 §2 fill-tavan: {_fx} — yeni girişler "
+                             f"sağlık kapısıyla KAPALI (inceleme gerekli)")
+                _entry_health_set("validation_fill_cap", _fx)
             _finalize_and_confirm(binance, hb, eid, ctx, symbol, risk, coordinator,
                                   reserver, out, "filled")
             continue

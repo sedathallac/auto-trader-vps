@@ -114,6 +114,27 @@ class Reservation:
     reason: str
     trades_used: int = 0
     notional_used: float = 0.0
+    # BLOK12 §2: first_use=True YALNIZ hakkın bu çağrıda tüketildiği yolda.
+    # IDEMPOTENT tekrar (ACK-belirsiz retry) first_use=False döner: çağıran
+    # POST'u YENİDEN GÖNDERMEZ (UNKNOWN sonrası aynı giriş tekrarlanamaz),
+    # fakat hak da yeniden tüketilmez.
+    first_use: bool = False
+
+
+def worst_case_fill_ok(planned_notional: float, cap_usdt: float,
+                       worst_drift_pct: float) -> bool:
+    """BLOK12 §2: MARKET emrin planlanan notional'ı en-kötü-doluş fiyatıyla
+    (1+drift) işlem-başı tavanını AŞMIYORSA True. ÖN korumadır — sonradan
+    aşımı raporlamak tek başına yeterli değildir. drift NEGATİF olamaz."""
+    try:
+        p = float(planned_notional)
+        c = float(cap_usdt)
+        d = float(worst_drift_pct)
+    except (TypeError, ValueError):
+        return False
+    if not all(x == x for x in (p, c, d)) or d < 0.0 or p <= 0.0 or c <= 0.0:
+        return False
+    return p * (1.0 + d) <= c + _EPS
 
 
 _SCHEMA = """
@@ -133,9 +154,14 @@ CREATE TABLE IF NOT EXISTS validation_reservations (
     status TEXT NOT NULL CHECK (status IN ('RESERVED','CONSUMED','RELEASED')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    reason TEXT
+    reason TEXT,
+    executor_id TEXT,
+    op_period TEXT
 );
 """
+
+# BLOK12 §2: eski depolarda eksik olabilecek sütunlar (idempotent migration).
+_ADDED_COLUMNS = (("executor_id", "TEXT"), ("op_period", "TEXT"))
 
 
 class ValidationBudget:
@@ -170,6 +196,14 @@ class ValidationBudget:
                 return
             try:
                 con.executescript(_SCHEMA)
+                cols = {r[1] for r in
+                        con.execute("PRAGMA table_info(validation_reservations)")}
+                if not cols:
+                    raise BudgetError("validation_reservations tablosu yok")
+                for name, typ in _ADDED_COLUMNS:
+                    if name not in cols:
+                        con.execute("ALTER TABLE validation_reservations "
+                                    f"ADD COLUMN {name} {typ}")
             except sqlite3.Error as e:
                 raise BudgetError(f"bütçe deposu başlatılamadı: {e}") from e
             self._initialized = True
@@ -220,16 +254,26 @@ class ValidationBudget:
             con.execute("BEGIN IMMEDIATE")
             try:
                 # 1) İdempotency: aynı anahtar varsa YENİ tüketim yok.
+                #    BLOK12 §2: aynı intent anahtarı FARKLI payload (sembol/
+                #    notional) ile gelirse RED — intent kimliği payload'a
+                #    bağlıdır; sessiz güncelleme yan hak tüketimin önü olurdu.
                 existing = con.execute(
-                    "SELECT rid, status FROM validation_reservations "
-                    "WHERE idem_key=?", (idem_key,)).fetchone()
+                    "SELECT rid, status, symbol, notional "
+                    "FROM validation_reservations WHERE idem_key=?",
+                    (idem_key,)).fetchone()
+                if existing is not None:
+                    if (str(existing[2]) != str(symbol)
+                            or abs(float(existing[3]) - notional) > _EPS):
+                        con.execute("ROLLBACK")
+                        return Reservation(False, None, "INTENT_PAYLOAD_MISMATCH")
                 if existing is not None and existing[1] != "RELEASED":
                     used = con.execute(
                         "SELECT trades_used, notional_used FROM validation_state "
                         "WHERE id=1").fetchone()
                     con.execute("COMMIT")
                     return Reservation(True, existing[0], "IDEMPOTENT",
-                                       int(used[0]), float(used[1]))
+                                       int(used[0]), float(used[1]),
+                                       first_use=False)
                 # 2) Tavan kontrolleri (sıra: başına → adet → toplam).
                 if notional > lim.max_per_trade_usdt + _EPS:
                     con.execute("ROLLBACK")
@@ -272,7 +316,7 @@ class ValidationBudget:
                     "WHERE id=1").fetchone()
                 con.execute("COMMIT")
                 return Reservation(True, rid, "RESERVED",
-                                   int(used[0]), float(used[1]))
+                                   int(used[0]), float(used[1]), first_use=True)
             except BaseException:
                 try:
                     con.execute("ROLLBACK")
@@ -285,17 +329,26 @@ class ValidationBudget:
             con.close()
 
     # ---------------------------------------------------------------- confirm
-    def confirm(self, rid: str) -> bool:
-        """POST başarılı (executor oluştu) → RESERVED→CONSUMED. İade hakkı kalmaz."""
+    def confirm(self, rid: str, executor_id: Optional[str] = None,
+                op_period: Optional[str] = None) -> bool:
+        """POST başarılı (executor oluştu) → RESERVED→CONSUMED. İade hakkı kalmaz.
+
+        BLOK12 §2: executor_id/op_period aynı atomik geçişte rezervasyona
+        BAĞLANIR — bütçe hakkı ile emir kimliği aynı işlem dönemine ait olur.
+        Bağlama hatası girişi geri almaz (executor oluşmuştur); geçiş yine
+        döner, bağlama best-effort ama tek tx içindedir.
+        """
         return self._transition(rid, "RESERVED", "CONSUMED", None,
-                                refund=False)
+                                refund=False,
+                                executor_id=executor_id, op_period=op_period)
 
     # ---------------------------------------------------------------- release
     def release(self, rid: str, reason: str = "") -> bool:
         """Yalnız RESERVED iade edilir (teyitli başarısızlık). CONSUMED ASLA."""
         return self._transition(rid, "RESERVED", "RELEASED", reason, refund=True)
 
-    def _transition(self, rid, frm, to, reason, refund) -> bool:
+    def _transition(self, rid, frm, to, reason, refund,
+                    executor_id=None, op_period=None) -> bool:
         try:
             con = self._conn()
         except sqlite3.Error as e:
@@ -313,7 +366,10 @@ class ValidationBudget:
                 now = self._now()
                 con.execute(
                     "UPDATE validation_reservations SET status=?, updated_at=?, "
-                    "reason=COALESCE(?, reason) WHERE rid=?", (to, now, reason, rid))
+                    "reason=COALESCE(?, reason), "
+                    "executor_id=COALESCE(?, executor_id), "
+                    "op_period=COALESCE(?, op_period) WHERE rid=?",
+                    (to, now, reason, executor_id, op_period, rid))
                 if refund:
                     con.execute(
                         "UPDATE validation_state SET trades_used="
