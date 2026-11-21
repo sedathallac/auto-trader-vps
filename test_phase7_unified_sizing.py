@@ -192,6 +192,12 @@ class _FakeBinance:
     def get_available_balance(self, asset):
         return 100.0
 
+    def account_snapshot(self):
+        # BLOK12 §3: FAZ16 gerçek giriş yolu TEK snapshot kaynağı ister
+        # (fallback YOK — fail-closed); fixture bu sözleşmeyi uygulamıyordu.
+        return auto_trader.AccountSnapshot(equity=100.0, available_balance=100.0,
+                                           can_trade=True, raw={})
+
     def order_book(self, symbol, limit=20):
         return {"bids": [["99.99", "1000"]], "asks": [["100.01", "1000"]]}
 

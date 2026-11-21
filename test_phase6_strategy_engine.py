@@ -484,11 +484,22 @@ class _FakeBinance:
     def get_available_balance(self, asset):
         return 1000.0
 
+    def account_snapshot(self):
+        # BLOK12 §3: FAZ16 gerçek giriş yolu TEK snapshot kaynağı ister
+        # (fallback YOK — fail-closed); fixture bu sözleşmeyi uygulamıyordu.
+        return auto_trader.AccountSnapshot(equity=1000.0, available_balance=1000.0,
+                                           can_trade=True, raw={})
+
 
 def _patch_open_coin(monkeypatch, tmp_path):
     monkeypatch.setattr(auto_trader, "HB_OFFLINE", True)
     monkeypatch.setattr(auto_trader, "SCIENTIFIC_SIZING", "off")
     monkeypatch.setattr(auto_trader, "WHALE_HUNTING", "off")
+    # BLOK12 §3: env'siz test ortamında MAX_OPEN_POSITIONS varsayılanı 0
+    # (EMERGENCY — yeni giriş durdu). Bu bir ÜRETİM topoloji ayarıdır; harness
+    # tarama/sizing yolunun koşabilmesi için açık limit verir (FAZ17 öncesi
+    # eski varsayılan >0 idi, test o varsayıma dayanıyordu).
+    monkeypatch.setattr(auto_trader, "MAX_OPEN_POSITIONS", 3)
     monkeypatch.setattr(auto_trader, "check_liquidity", lambda b, s: (True, "ok"))
     monkeypatch.setattr(auto_trader, "check_correlation_limit", lambda s, b: True)
     monkeypatch.setattr(auto_trader, "calculate_atr", lambda *a, **k: 0.01)

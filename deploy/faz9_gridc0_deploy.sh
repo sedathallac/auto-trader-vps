@@ -96,9 +96,10 @@ git fetch -q origin feature/futures-release-blockers
 NEW=$(git rev-parse FETCH_HEAD); echo "$NEW" > /root/.faz9_deploy_target
 echo "faz9 mevcut $(git rev-parse --short HEAD) -> hedef ${NEW:0:7}"
 rm -rf /tmp/faz9-wt; git worktree prune; git worktree add -q --detach /tmp/faz9-wt "$NEW"
-cd /tmp/faz9-wt
-HOME=$(mktemp -d) /opt/auto_trader_faz9/venv/bin/python -m pytest -q -p no:cacheprovider \
-   --ignore=test_c3.py --ignore=test_fixes.py --ignore=test_c6.py 2>&1 | tail -4
+# BLOK12 §3: gerçek preflight — hedef REV geçici worktree'de, geçici HOME'da,
+# İGNORESIZ tam paket + secret_scan; herhangi bir kırmızı deploy'u durdurur.
+# (Eski komut var olmayan dosyaları --ignore ediyordu; o dosyalar ağaçta yok.)
+PYTHON=/opt/auto_trader_faz9/venv/bin/python bash /tmp/faz9-wt/deploy/faz9_preflight.sh /tmp/faz9-wt HEAD
 cd /opt/auto_trader_faz9/app && git worktree remove --force /tmp/faz9-wt
 REMOTE
 

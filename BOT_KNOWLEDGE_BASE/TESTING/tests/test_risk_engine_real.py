@@ -39,24 +39,16 @@ CONFIG_KEYS = {
 
 @pytest.fixture
 def engine(tmp_path):
+    # BLOK12 §3: ELLE yazılmış şema yerine ÜRETİM bootstrap'ı — risk_engine'ın
+    # kendi DDL'i + risk_migration.apply (FAZ16 closed_at_epoch kolonu dahil).
+    # Eski fixture'ın trade_ledger'ında closed_at_epoch YOKTU; üretim
+    # record_trade 7 kolon INSERT ediyor → OperationalError → idempotency
+    # testi yanlış nedenle kırmızıydı.
+    import risk_migration
     db = tmp_path / "risk_ledger.db"
-    conn = sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE risk_state (id INTEGER PRIMARY KEY, peak_equity REAL, "
-        "consecutive_losses INTEGER, daily_trades INTEGER, daily_pnl REAL, "
-        "last_reset_date TEXT, is_halted INTEGER, halt_reason TEXT, updated_at TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE trade_ledger (executor_id TEXT PRIMARY KEY, trading_pair TEXT, "
-        "net_pnl_quote REAL, closed_at TEXT, recorded_at TEXT, source TEXT)"
-    )
-    conn.execute(
-        "INSERT INTO risk_state (id, peak_equity, consecutive_losses, daily_trades, "
-        "daily_pnl, last_reset_date, is_halted, halt_reason, updated_at) "
-        "VALUES (1, 0, 0, 0, 0, NULL, 0, NULL, NULL)"
-    )
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(risk_engine._DD_SELFTEST_BOOTSTRAP_DDL)
+    risk_migration.apply(str(db), do_backup=False)
     cfg = dict(CONFIG_KEYS, db_file=str(db))
     return risk_engine.RiskEngine(cfg)
 

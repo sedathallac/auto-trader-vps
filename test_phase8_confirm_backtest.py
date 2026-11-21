@@ -231,7 +231,14 @@ def test_fit_signal_table_respects_min_events():
 
 
 def test_green_walk_forward_finds_planted_edge_out_of_sample():
-    wf = cb.walk_forward(planted_events(), n_folds=4, min_events=100, n_perm=400, seed=0)
+    # BLOK12 §3: FAZ14j üretim varsayılanını confirm_min_families 2→1 çekti
+    # (bilinçli; strategy_engine.py:31). Bu testin EKTİĞİ SENARYO ORTAK (A∧B)
+    # KENARDIR: tek-aile kabulü açıkken tek başına A/B olayları kabulü
+    # seyreltir ve ölçülen boşluk 0.102'ye düşer (hüküm yine PASS, yalnız
+    # büyüklük iddiası zayıflar). Test hedeflediği çok-aile birleşik
+    # anlamlılığı ölçmek için min_families=2'yi SABİTLER.
+    wf = cb.walk_forward(planted_events(), n_folds=4, min_events=100,
+                         n_perm=400, seed=0, cfg={"confirm_min_families": 2})
     assert wf["verdict"] == "PASS"
     assert wf["accepted_real_rate"] > wf["base_real_rate"] + 0.15
     assert wf["accepted_expectancy"] > wf["base_expectancy"]

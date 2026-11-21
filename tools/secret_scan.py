@@ -28,8 +28,13 @@ KNOWN_CRED_DIGESTS = {
     "75e9700b440462f77c2d6668d77074bbdadd9634e51b589552a870d765b8d166",
 }
 
+# BLOK12 §3: belgegeçer (belge/test) bağlamları — YAPIŞTIRMA ŞABLONU ve BOŞ
+# sağ-taraf, gerçek kimlik İÇERMEZ: `%s`/`%d` format şablonu, `(user, pass)`
+# sözlüğü, `= ""`/`= ")` boş alıtek. Değer-digest eşleşmesi bundan ETKİLENMEZ
+# (KNOWN_CRED_DIGESTS ayrıca ve her satırda çalışır).
 _PLACEHOLDER = re.compile(
-    r"(<[^>]+>|CHANGE_?ME|xxx+|YOUR_|\$\{|\$[A-Z_]+|example|user:pass)",
+    r"(<[^>]+>|CHANGE_?ME|xxx+|YOUR_|\$\{|\$[A-Z_]+|example|user:pass"
+    r"|\(user, pass\)|%[sd]\b|=\s*[\"']\s*[,)])",
     re.IGNORECASE)
 
 _PATTERNS = [

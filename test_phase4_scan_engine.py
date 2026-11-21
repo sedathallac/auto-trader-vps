@@ -135,8 +135,12 @@ class FakeBinance:
 
     def order_book(self, symbol, limit=20):
         self.calls["order_book"] += 1
-        return {"bids": [["100", "10"], ["99.9", "5"]],
-                "asks": [["100.1", "10"], ["100.2", "5"]]}
+        # BLOK12 §3: eski sahte defter ~3002 USDT derinlik üretiyordu; üretim
+        # coin_quality kapısının depth_usdt_min=5000 vetosu havuzu boşaltıyordu
+        # (kapı ÜRETİM gerçeği — fixture bayattı, kapı değil). Derinlik artık
+        # eşik üstü (~10k); spread aynı.
+        return {"bids": [["100", "30"], ["99.9", "20"]],
+                "asks": [["100.1", "30"], ["100.2", "20"]]}
 
     def _get(self, path, params=None, signed=False):
         if "klines" in path:
