@@ -250,3 +250,14 @@ subtests exit 0; preflight (worktree@HEAD, secret scan + bare pytest) exit
 0. Her canlı adım (watchdog kurulumu, onay token'ı, testnet anahtarları,
 rotasyon, BCH/GALA OOS, deploy/HALTED) AYRI operatör onayına muhtaçtır;
 kimlikler sohbet yerine korumalı env/secret store ile verilir.
+
+### 10.1 Devam A–D (182a0bd) — gönderim-anı sertleştirmesi
+
+429/418 gardı artık GÖNDERİM ANINDA (transport yoklanmaz; POST/GET/DELETE
+local_block), SIGTERM kontrolü create_executor'un hemen öncesinde (yarış
+testiyle), 50 USDT sınırı gerçek `filled_amount_quote` ile denetlenir ve
+garanti sınırı (worst=plan×(1+drift)) pending kayda yazılır — tavan-içi/en-
+kötü-üstü doluş da yeni girişleri kilitler; ikinci onay token dosyasının
+izinleri kodda doğrulanır (0600 dışı RED, token harcanmaz). Kanıt zinciri
+MISSION_STATE "BLOK12 DEVAM A–D". Hüküm değişmedi: **READY FOR FINAL
+OPERATOR REVIEW — NOT DEPLOYED.**

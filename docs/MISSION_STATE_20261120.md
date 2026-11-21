@@ -672,4 +672,20 @@ döngüden çıkarır; in-flight emir sorgulanmadan iptal EDİLMEZ, pending/büt
 onay diskte korunur. systemd `TimeoutStopSec` verili değilse varsayılan
 90s >> 1s — risk yok.
 
-Hüküm: **READY FOR FINAL OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.**
+Hüküm: **READY FOR FINAL OPERATOR REVIEW — NOT DEPLOYED; HALTED KORUNDU.** (Devam A–D maddeleri 182a0bd ile kapandı; son push noktası bu bölümdedir.)
+
+## 5) BLOK12 DEVAM A–D (2026-11-21, operatör takviye maddeleri) — commit 182a0bd
+
+| Madde | Kök neden | Kızıl→Yeşil |
+|---|---|---|
+| A | 429/418 gardı yalnız open_coin başında; tur içinde beliren cooldown'da istekler gidiyordu | test_blok12_sendtime_gates.py: sentry transport (tek ağ denemesi patlar) — GET/POST/DELETE local_block; tur-içi 429 → POST YOK + hak iade (trades_used 0'a döner); _reservation_should_keep(local_block)=False |
+| B | SIGTERM yalnız fonksiyon başında; POST öncesi pencere yarışı | TestShutdownRaceAtCreateExecutor: sinyal dikişi onay kapısı↔POST arasında; hb.created==[], iade, "create_executor ÖNCESİ shutdown"; negatif kontrol POST koşar |
+| C | worst-fill zarfı pending'e taşınmıyordu; tavan-içi/en-kötü-üstü doluş "temiz"di | test_blok12_fill_guarantee.py (8): zarf (cap,drift,worst) kayda yazılır; GERÇEK filled_amount_quote hem tavan hem en-kötüyle kıyas; GARANTİ-SINIRI aşımı / TAVAN İHLALİ / bozuk zarf fail-closed → giriş kilidi |
+| D | OPERATOR_APPROVAL_TOKEN_FILE 0644 okunabiliyordu | TestTokenFilePermissions: fstat (TOCTOU'suz) mod&0o077 → RED, token HARCANMAZ (state APPROVED_AWAITING_USE); 0600 geçer |
+
+C'nin dürüst sınırı: tavan ancak gerçek doluş kayması ≤ drift (worst zarfı)
+ise garanti; garanti-dışı kalan tek şey tespit gecikmesi — en fazla bir
+dolum-sonraki tick, sonra yeni girişler kilitli.
+
+Kanıt: RED 14 failed → GREEN 51/51; tam tests/ **1315 passed + 9 subtests
+exit 0**; secret scan TEMİZ; canlı istek/emir YOK.
