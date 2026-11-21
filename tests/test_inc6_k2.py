@@ -87,9 +87,14 @@ class TestSyncRiskEngineK2Gate(unittest.TestCase):
                           "trading_pair": "SOL-USDT"}]}
 
         def _post(url, json=None, **kw):
-            # FAZ9 post-audit: sayfalama offset'e uyar; offset>0 → boş sayfa.
-            off = int((json or {}).get("offset") or 0)
-            return _FakeResp({"data": [] if off else term["data"]})
+            # BLOK13 kök-2: kurulu hummingbot-api (20260922) offset TANIYOR
+            # DEĞİL — tek-sayfa gerçeği pagination bloğuyla kanıtlanır
+            # (has_more=False, total_count=len(data)); offset/cursor alanı
+            # istekte hiç aranmaz.
+            _rows = term["data"]
+            return _FakeResp({"data": _rows, "pagination": {
+                "limit": 200, "has_more": False, "next_cursor": None,
+                "total_count": len(_rows)}})
 
         at.requests.post = _post
 

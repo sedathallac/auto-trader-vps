@@ -529,9 +529,20 @@ class TestRiskNoneFailClosed(unittest.TestCase):
 
 
 class TestExecutorPagination(unittest.TestCase):
+    """BLOK13 kök-2 — POST /executors/search GERÇEK sözleşmesi.
+
+    Kurulu hummingbot-api (20260922) request modelinde `offset` YOKTUR
+    (models/pagination.py: yalnız limit+cursor; offset pydantic'te sessizce
+    düşer). Kanıt: VPS 2026-11-21 canlı tekrar-üretim — offset=0 ve offset=55
+    BİREBİR aynı 55 kaydı döndürdü; eski offset yürüyüşü bu yüzden kalıcı
+    PARTIAL üretiyordu. Tamamlanma kanıtı routers/executors.py'deki
+    pagination{limit,has_more,next_cursor,total_count} bloğudur. Sahteler bu
+    gerçeği taklit eder."""
+
     def setUp(self):
         self._orig = auto_trader.requests.post
         self.addCleanup(setattr, auto_trader.requests, "post", self._orig)
+        self.sent = []
 
     @staticmethod
     def _hb():
@@ -541,40 +552,131 @@ class TestExecutorPagination(unittest.TestCase):
         return _HB()
 
     @staticmethod
-    def _resp(data, status=200):
+    def _resp(data, status=200, pagination=None):
         class _R:
             status_code = status
 
             def json(self):
-                return {"data": data}
+                body = {"data": data}
+                if pagination is not None:
+                    body["pagination"] = pagination
+                return body
 
         return _R()
 
+    def _server(self, rows):
+        """Kurulu API'nin cursor davranışının birebir sahtesi:
+        sıralı tam liste, cursor='son-id', limit kadar dilim, pagination bloğu.
+        offset GÖNDERİLSE de yok sayılır (gerçek API gibi)."""
+        def _post(url, json=None, auth=None, timeout=None):
+            body = json or {}
+            self.sent.append(dict(body))
+            limit = int(body.get("limit") or 100)
+            start = 0
+            cur = body.get("cursor")
+            if cur:
+                for i, r in enumerate(rows):
+                    if r["executor_id"] == cur:
+                        start = i + 1
+                        break
+            page = rows[start:start + limit]
+            end = start + len(page)
+            has_more = end < len(rows)
+            return self._resp(
+                page,
+                pagination={"limit": limit, "has_more": has_more,
+                            "next_cursor": page[-1]["executor_id"] if has_more else None,
+                            "total_count": len(rows)})
+        return _post
+
+    def test_offset_never_sent_single_page_completes(self):
+        rows = [{"executor_id": f"E{i}", "status": "TERMINATED"} for i in range(3)]
+        auto_trader.requests.post = self._server(rows)
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=10)
+        self.assertIsNone(err)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(self.sent)
+        for b in self.sent:
+            self.assertNotIn("offset", b, "offset asla gönderilmemeli (API tanımıyor)")
+
+    def test_cursor_walk_multi_page_complete(self):
+        rows = [{"executor_id": f"E{i}", "status": "TERMINATED"} for i in range(7)]
+        auto_trader.requests.post = self._server(rows)
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=3, max_pages=10)
+        self.assertIsNone(err)
+        self.assertEqual([e["executor_id"] for e in out],
+                         [f"E{i}" for i in range(7)])
+        self.assertEqual(self.sent[0].get("cursor"), None)
+        self.assertEqual(self.sent[1].get("cursor"), "E2")
+        self.assertEqual(self.sent[2].get("cursor"), "E5")
+
     def test_repeated_page_is_incomplete(self):
-        page = [{"executor_id": "E1", "status": "TERMINATED"}]
-        auto_trader.requests.post = lambda *a, **k: self._resp(page)
-        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=2, max_pages=5)
+        # Sunucu cursor'ı YOK SAYSAYDI (gerçek kurulu hatanın taklidi): aynı
+        # sayfa tekrar döner → cursor tekrarlanmadan executor_id tekrarı yakalanır.
+        calls = {"n": 0}
+
+        def _post(url, json=None, auth=None, timeout=None):
+            calls["n"] += 1
+            return self._resp(
+                [{"executor_id": "E1", "status": "TERMINATED"}],
+                pagination={"limit": 1, "has_more": True,
+                            "next_cursor": "c1", "total_count": 2})
+        auto_trader.requests.post = _post
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=1, max_pages=5)
         self.assertTrue(err and err.startswith("incomplete:"), err)
         self.assertEqual([e["executor_id"] for e in out], ["E1"])
 
-    def test_short_pages_advance_by_returned_size(self):
-        rows = [{"executor_id": f"E{i}", "status": "TERMINATED"} for i in range(4)]
+    def test_pagination_block_missing_is_incomplete(self):
+        auto_trader.requests.post = lambda *a, **k: self._resp(
+            [{"executor_id": "E1", "status": "TERMINATED"}])
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=2, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete:"), err)
 
-        def _post(url, json=None, **k):
-            off = int((json or {}).get("offset") or 0)
-            return self._resp(rows[off:off + 2])
-
+    def test_total_count_mismatch_is_incomplete(self):
+        # "sayfa bitti" tek başına kanıt değildir: total_count tutmalı.
+        def _post(url, json=None, auth=None, timeout=None):
+            return self._resp(
+                [{"executor_id": "E1", "status": "TERMINATED"}],
+                pagination={"limit": 200, "has_more": False,
+                            "next_cursor": None, "total_count": 5})
         auto_trader.requests.post = _post
-        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=10)
-        self.assertIsNone(err)
-        self.assertEqual(len(out), 4)
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete:"), err)
+
+    def test_has_more_false_with_next_cursor_is_incomplete(self):
+        def _post(url, json=None, auth=None, timeout=None):
+            return self._resp(
+                [], pagination={"limit": 200, "has_more": False,
+                                "next_cursor": "c1", "total_count": 0})
+        auto_trader.requests.post = _post
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=200, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete:"), err)
 
     def test_missing_executor_id_is_incomplete(self):
-        auto_trader.requests.post = lambda *a, **k: self._resp(
-            [{"status": "TERMINATED"}])
+        def _post(url, json=None, auth=None, timeout=None):
+            return self._resp(
+                [{"status": "TERMINATED"}],
+                pagination={"limit": 2, "has_more": True,
+                            "next_cursor": "c1", "total_count": 9})
+        auto_trader.requests.post = _post
         out, err = auto_trader._hb_executors_all(self._hb(), page_limit=2, max_pages=5)
         self.assertTrue(err and err.startswith("incomplete:"), err)
         self.assertEqual(len(out), 1, "çözümlenmemiş kayıt atılmamalı")
+
+    def test_max_pages_guard_is_incomplete(self):
+        n = {"i": 0}
+
+        def _post(url, json=None, auth=None, timeout=None):
+            n["i"] += 1
+            eid = f"E{n['i']}"
+            return self._resp(
+                [{"executor_id": eid, "status": "TERMINATED"}],
+                pagination={"limit": 1, "has_more": True,
+                            "next_cursor": eid, "total_count": 10_000})
+        auto_trader.requests.post = _post
+        out, err = auto_trader._hb_executors_all(self._hb(), page_limit=1, max_pages=5)
+        self.assertTrue(err and err.startswith("incomplete: sayfalama güvenlik"), err)
+        self.assertEqual(len(out), 5)
 
 
 class TestSyncIncompleteBlocksEntries(Base):

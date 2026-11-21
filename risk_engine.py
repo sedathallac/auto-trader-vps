@@ -164,8 +164,12 @@ def bootstrap_sync_meta(conn):
 
 
 class RiskEngine:
-    def __init__(self, config):
+    def __init__(self, config, logger=None):
         self.cfg = config
+        # BLOK13 kök-3: logger enjekte edilebilir — atılabilir scratch motorların
+        # (F25 öz-testi) CRITICAL satırları üretim günlüğüne "gerçek olay" gibi
+        # düşmesin. Varsayılan modül logger'ı: üretim davranışı AYNEN.
+        self.log = logger if logger is not None else log
         self.db_file = Path(config.get("db_file", str(DEFAULT_DB_FILE)))
         self.peak_equity = 0.0
         self.current_equity = 0.0
@@ -214,7 +218,7 @@ class RiskEngine:
     def _block(self, reason):
         self.health_ok = False
         self.health_reason = reason
-        log.critical(f"🚨 C3: risk store sağlıksız — yeni giriş kapalı: {reason}")
+        self.log.critical(f"🚨 C3: risk store sağlıksız — yeni giriş kapalı: {reason}")
 
     @contextmanager
     def _db(self):
@@ -259,7 +263,7 @@ class RiskEngine:
             # risk_state id=1 yok: satır UYDURULMAZ. Bellekte varsayılanlarla devam
             # edilir; merkezi kapı migration_required ile yeni girişi kapatır.
             self.migration_required = True
-            log.critical("🚨 C3: risk_state id=1 satırı YOK — yeni giriş kapalı "
+            self.log.critical("🚨 C3: risk_state id=1 satırı YOK — yeni giriş kapalı "
                          "(risk_migration.py ile onarılmalı)")
             return
         self.peak_equity = float(row[0] or 0)
@@ -476,10 +480,10 @@ class RiskEngine:
             if unresolved:
                 self._block(f"ledger: {unresolved} satırın kapanış zamanı çözümlenemedi")
             if streak >= int(self.cfg["max_consecutive_losses"]):
-                log.warning(f"⚠️  Ardışık zarar limitine ({self.cfg['max_consecutive_losses']}) ulaşıldı")
+                self.log.warning(f"⚠️  Ardışık zarar limitine ({self.cfg['max_consecutive_losses']}) ulaşıldı")
             return True, f"pnl={pnl:+.4f}"
         except Exception as e:
-            log.critical(f"🚨 C3: record_trade HATA (rollback): {e}")
+            self.log.critical(f"🚨 C3: record_trade HATA (rollback): {e}")
             return False, f"error: {e}"
 
     def register_trade_result(self, pnl_quote, executor_id=None, trading_pair=None,
@@ -487,7 +491,7 @@ class RiskEngine:
         """Backward-compat. executor_id yoksa idempotency YOK — üretimde kullanma."""
         if executor_id:
             return self.record_trade(executor_id, trading_pair, pnl_quote, closed_at_iso)
-        log.warning("register_trade_result without executor_id — no idempotency")
+        self.log.warning("register_trade_result without executor_id — no idempotency")
         self.daily_pnl += pnl_quote
         self.consecutive_losses = self.consecutive_losses + 1 if pnl_quote < 0 else 0
         self._save_state()
@@ -508,7 +512,7 @@ class RiskEngine:
                                 f"{self._bad_equity_streak} geçersiz equity "
                                 f"okuması (son bilinen eq={self.current_equity:.2f}, "
                                 f"peak={self.peak_equity:.2f})")
-            log.critical(f"🚨 DEVRE KESİCİ: {self.halt_reason}")
+            self.log.critical(f"🚨 DEVRE KESİCİ: {self.halt_reason}")
             self._save_state()
 
     def update_equity(self, current_equity):
@@ -558,12 +562,12 @@ class RiskEngine:
                 self.is_halted = True
                 self.halt_reason = (f"daily_loss_pct %{day_loss*100:.2f} "
                                     f"(limit %{limit*100:.0f}% = {_limit_usdt:.2f} USDT)")
-                log.critical(f"🚨 GÜNLÜK EQUITY KESİCİ: {self.halt_reason}")
+                self.log.critical(f"🚨 GÜNLÜK EQUITY KESİCİ: {self.halt_reason}")
         if self.current_drawdown >= self.cfg["max_drawdown_pct"] and not self.is_halted:
             self.is_halted = True
             self.halt_reason = (f"Drawdown %{self.current_drawdown*100:.1f} "
                                 f"(limit %{self.cfg['max_drawdown_pct']*100:.0f}%)")
-            log.critical(f"🚨 DEVRE KESİCİ: {self.halt_reason}")
+            self.log.critical(f"🚨 DEVRE KESİCİ: {self.halt_reason}")
         return self._save_state()
 
     def update_exposure(self, balance, positions):
@@ -589,12 +593,12 @@ class RiskEngine:
                 return False
         usage = total_margin / bal
         self.margin_usage_pct = usage
-        log.info(f"📊 Marjin kullanımı: %{usage*100:.1f} "
+        self.log.info(f"📊 Marjin kullanımı: %{usage*100:.1f} "
                  f"(limit: %{self.cfg.get('max_total_margin_pct', 0.4)*100:.0f})")
         if usage > self.cfg.get("max_total_margin_pct", 0.4):
             self.is_halted = True
             self.halt_reason = f"Exposure limit aşıldı (%{usage*100:.1})"
-            log.critical(f"🚨 {self.halt_reason} — yeni pozisyon açılmayacak")
+            self.log.critical(f"🚨 {self.halt_reason} — yeni pozisyon açılmayacak")
             return self._save_state()
         return True
 
@@ -622,7 +626,7 @@ class RiskEngine:
             self.halt_reason = f"daily_loss {_dpnl:.2f} <= -{abs(float(_dl)):.2f} USDT"
             if hasattr(self, "_save_state"):
                 self._save_state()
-            log.critical(f"🚨 Günlük zarar limiti: {self.halt_reason}")
+            self.log.critical(f"🚨 Günlük zarar limiti: {self.halt_reason}")
             return None, f"daily_loss_limit ({_dpnl:.2f})"
         if stop_distance_pct is None or stop_distance_pct <= 0:
             return None, "invalid_stop"
@@ -637,7 +641,7 @@ class RiskEngine:
             min_rr = float(self.cfg.get("min_net_reward_risk",
                                         edge_engine.EDGE_DEFAULTS["min_net_reward_risk"]))
             if not rr_ok or rr < min_rr:
-                log.warning(f"  RiskEngine net R/R reddi: rr={rr:.2f} < {min_rr:.2f} ({detail})")
+                self.log.warning(f"  RiskEngine net R/R reddi: rr={rr:.2f} < {min_rr:.2f} ({detail})")
                 return None, f"net_rr ({rr:.2f} < {min_rr:.2f})"
 
         notional, reason = edge_engine.risk_notional(
@@ -652,7 +656,7 @@ class RiskEngine:
             policy=str(self.cfg.get("min_notional_policy", "refuse")),
         )
         if notional is None:
-            log.warning(f"  RiskEngine boyut reddi: {reason}")
+            self.log.warning(f"  RiskEngine boyut reddi: {reason}")
             return None, reason
 
         pct = max_position_pct if max_position_pct is not None \
@@ -663,7 +667,7 @@ class RiskEngine:
             except (TypeError, ValueError):
                 return None, "invalid_equity_cap"
             if cap > 0 and notional > cap:
-                log.info(f"  RiskEngine yüzde tavanı: {notional:.2f} → {cap:.2f} "
+                self.log.info(f"  RiskEngine yüzde tavanı: {notional:.2f} → {cap:.2f} "
                          f"(equity={float(equity):.2f} × %{float(pct):.1f})")
                 notional = cap
                 if notional < float(self.cfg["min_notional"]):
@@ -710,7 +714,7 @@ class RiskEngine:
                         self.daily_trades = db_trades
                         self._open_keys = db_keys
                         self.state["daily_trades"] = db_trades
-                        log.info(f"  register_open: {key} zaten sayıldı "
+                        self.log.info(f"  register_open: {key} zaten sayıldı "
                                  f"(idempotent, DB)")
                         return True
                     if db_day != day:
@@ -762,7 +766,7 @@ class RiskEngine:
         self.state["day_start_equity_date"] = self.day_start_equity_date
         self.state["day_start_equity_at"] = None
         ok = self._save_state()
-        log.info(f"🌅 Günlük sayaçlar sıfırlandı ({self.last_reset_date}) "
+        self.log.info(f"🌅 Günlük sayaçlar sıfırlandı ({self.last_reset_date}) "
                  f"halted={self.is_halted} streak={self.consecutive_losses}")
         return ok
 
@@ -808,19 +812,46 @@ def _bootstrap_scratch_db(db_file):
     risk_migration.apply(db_file, do_backup=False)
 
 
-def dd_selftest():
+# BLOK13 kök-3: öz-testin üretime enjekte edeceği limit anahtarları — yalnız
+# hesaplayıcıyı ilgilendiren sınırlar; db yolu/kimlik anahtarları ASLA geçmez.
+_SELFTEST_CFG_KEYS = ("max_drawdown_pct", "max_daily_loss_pct",
+                      "max_daily_loss_usdt", "bad_equity_streak",
+                      "max_consecutive_losses")
+
+
+def dd_selftest(risk_cfg=None):
     """(ok: bool, detail: str) — açılış DD-hesaplayıcı öz-testi.
 
     Beklenen sabitlerden herhangi bir sapma → (False, neden). Çağıran taraf
     False gördüğünde YENİ GİRİŞ KAPISINI kapatmalı ve alarm loglamalıdır;
-    is_halted veya kalıcı risk kayıtları DEĞİŞTİRİLMEZ (M-2)."""
+    is_halted veya kalıcı risk kayıtları DEĞİŞTİRİLMEZ (M-2).
+
+    BLOK13 kök-3 (iki düzeltme):
+      * `risk_cfg` verilirse SAYAÇ-LİMİT anahtarları öz-teste enjekte edilir —
+        öz-test üretimin ETKİLİ günlük zarar limitiyle koşar (canlı 2% iken
+        scratch'ın sessiz 5% varsayılanı "limit %5%" hayaleti üretiyordu).
+        Beklenen DD sabitleri limitlerden bağımsızdır; hüküm değişmez.
+      * Scratch motorun logları ÜRETİM günlüğüne YAZILMAZ (yalnız-ca test
+        logger'ı, propagate=False). Kanıt: 21-Kas journal — her turda
+        `GÜNLÜK EQUITY KESİCİ ... (limit %5% = 5.00 USDT)` ve
+        `equity geçersiz (0.0)` CRITICAL satırları scratch serisinin
+        (100/120/90/96 + 0.0 sentinel; day_start=100×%5=5.00 USDT)
+        yan ürünüydü; gerçek store okumaları (eq=3491.46) sağlıklıydı.
+    """
     import tempfile
     scratch = Path(tempfile.mkdtemp(prefix="f25_dd_selftest_")) / "risk_selftest.db"
     _bootstrap_scratch_db(scratch)
     cfg = {"db_file": str(scratch),
            "db_create": True, "max_drawdown_pct": 0.20}
+    if risk_cfg:
+        for k in _SELFTEST_CFG_KEYS:
+            if k in risk_cfg and risk_cfg[k] is not None:
+                cfg[k] = risk_cfg[k]
+    _slog = logging.getLogger("risk_engine.dd_selftest")
+    _slog.propagate = False
+    _slog.setLevel(logging.CRITICAL + 1)
     try:
-        eng = RiskEngine(cfg)
+        eng = RiskEngine(cfg, logger=_slog)
         dds = []
         for e in _DD_SELFTEST_SERIES:
             if not eng.update_equity(e):

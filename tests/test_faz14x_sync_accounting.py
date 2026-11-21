@@ -99,14 +99,19 @@ class SyncHarness(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _post(self, url, json=None, **k):
-        # 79bed1d sayfalama sözleşmesi: tamamlanma yalnız geçerli BOŞ sayfa ile
-        # kanıtlanır; aynı sayfanın tekrarı KISMİ demektir (fail-closed). Fixture
-        # tek-sayfa gerçeğini temsil eder: offset>0 -> boş sayfa. (Aynı uyarlama
-        # 79bed1d'nin kendi test_inc6_k2.py'sinde de yapıldı; assert değişmez.)
-        off = int((json or {}).get("offset") or 0)
-        if off:
-            return _Resp({"data": []}, self.search_status)
-        return _Resp(self.search_payload, self.search_status)
+        # BLOK13 kök-2: kurulu hummingbot-api (20260922) /executors/search
+        # yanıtının HER geçerli sayfasında `pagination` bloğu vardır ve
+        # `offset` alanı request modelinde YOKTUR (canlı tekrar-üretim
+        # 2026-11-21: offset yok sayılıyor). Fixture tek-sayfa gerçeğini
+        # pagination bloğuyla temsil eder; data-şekli bozuk/hata gövdeleri
+        # olduğu gibi geçer (istemci fail-closed). Assert'ler değişmez.
+        body = self.search_payload
+        if isinstance(body, dict) and isinstance(body.get("data"), list):
+            body = dict(body)
+            body.setdefault("pagination", {
+                "limit": 200, "has_more": False, "next_cursor": None,
+                "total_count": len(body["data"])})
+        return _Resp(body, self.search_status)
 
     def run_sync(self):
         # Fixture uyarlamasi: 120sn recovery-throttle testler arasinda sifirlanir

@@ -1303,26 +1303,41 @@ def _mark_sl_epoch_closed(symbol, max_gen=None):
 
 
 def _hb_executors_all(hb, page_limit=200, max_pages=50):
-    """POST /executors/search — tüm sayfalar. Dönüş: (list|None, error|None).
+    """POST /executors/search — TÜM cursor zinciri. Dönüş: (list|None, error|None).
 
-    FAZ9 post-audit: sayfalama SÖZLEŞMESİ doğrulanamıyor (authoritative total/cursor
-    yok). Bu yüzden tamamlanma yalnız GEÇERLİ BOŞ SAYFA ile kanıtlanır:
-      * HTTP status, JSON, gövde ve `data` listesi doğrulanır.
-      * Offset, istenen `limit` ile değil API'nin DÖNDÜRDÜĞÜ sayfa boyuyla ilerler
-        (API page size'ı kırpabilir).
-      * Kısa ama boş olmayan sayfa tamamlanma kanıtı SAYILMAZ; sonraki sayfa beklenir.
-      * Aynı sayfa tekrar dönerse / yeni executor ID gelmezse `incomplete` döner.
-      * Geçersiz/eksik executor_id "çözümlenmemiş veri"dir; sessizce atılmaz.
-      * Güvenlik sınırına ulaşılırken sonuç `incomplete` döner.
-    `error` "incomplete:" ile başlıyorsa liste KISMİdir; çağıran girişi kapatmalıdır.
+    BLOK13 kök-2: kurulu hummingbot-api (20260922) `offset` alanını TANIMIYOR
+    — request modeli yalnız `limit`+`cursor` (models/pagination.py); gönderilen
+    offset pydantic tarafından sessizce düşürülüyordu. Kanıt (VPS 2026-11-21,
+    canlı tekrar-üretim): offset=0 ve offset=55 AYNI 55 kaydı döndürdü → eski
+    offset yürüyüşü sonsuza dek "incomplete: offset ilerlemiyor" (PARTIAL)
+    üretiyordu. Gerçek sözleşme routers/executors.py:88-152: `pagination
+    {limit,has_more,next_cursor,total_count}`; cursor = "created_at:executor_id".
+    Bu, FAZ15 Stage2b'deki HBAPI._search_all_status sözleşmesiyle AYNI
+    doğrulama kurallarını kullanır (offset ASLA gönderilmez — semantik tahmin yok).
+
+    Fail-closed kurallar (error "incomplete:" ile başlarsa liste KISMİdir;
+    çağıran girişi kapatır, watermark İLERLEMEZ):
+      * `pagination` bloğu yok/bozuk (has_more bool değil; total_count int
+        değil veya negatif) → tamamlanma kanıtı YOK → incomplete.
+      * has_more=True → next_cursor boş olmayan, daha önce GÖRÜLMEMİŞ string.
+      * has_more=False → next_cursor None olmalı VE toplanan kayıt sayısı
+        total_count'a EŞİT olmalı (sayfa bitti tek başına kanıt değildir).
+      * total_count zincir boyunca değişirse sonuç güvenilmez.
+      * Sayfada tekrar eden executor_id → cursor ilerlemesi bozuk.
+      * Geçersiz/eksik executor_id çözümlenmemiş veridir; atılmaz, incomplete.
+      * max_pages güvenlik sınırı aşılsa sonuç incomplete.
     """
     out, seen = [], set()
-    offset = 0
+    cursor = None
+    seen_cursors = set()
+    total_count = None
     for _page in range(max_pages):
+        req = {"limit": page_limit}
+        if cursor is not None:
+            req["cursor"] = cursor
         try:
             resp = requests.post(f"{HB_API}/executors/search",
-                                 json={"limit": page_limit, "offset": offset},
-                                 auth=hb.auth, timeout=15)
+                                 json=req, auth=hb.auth, timeout=15)
         except Exception as e:
             return None, f"request: {type(e).__name__}: {e}"
         if getattr(resp, "status_code", 200) != 200:
@@ -1336,25 +1351,53 @@ def _hb_executors_all(hb, page_limit=200, max_pages=50):
         data = body.get("data")
         if not isinstance(data, list):
             return None, "data missing/not a list"
-        if not data:
-            return out, None
-        new = 0
+        pg = body.get("pagination")
+        _hm = pg.get("has_more") if isinstance(pg, dict) else None
+        _tc = pg.get("total_count") if isinstance(pg, dict) else None
+        if (not isinstance(pg, dict) or not isinstance(_hm, bool)
+                or isinstance(_tc, bool) or not isinstance(_tc, int) or _tc < 0):
+            return out, ("incomplete: pagination bloğu yok/bozuk — "
+                         "tamamlanma kanıtı yok")
+        if total_count is None:
+            total_count = _tc
+        elif _tc != total_count:
+            return out, (f"incomplete: total_count zincir boyunca değişti "
+                         f"({total_count} → {_tc})")
+        if len(data) > page_limit:
+            return out, (f"incomplete: sayfa boyu {len(data)} > istenen limit "
+                         f"{page_limit}")
         for e in data:
             eid = e.get("executor_id") if isinstance(e, dict) else None
             if not isinstance(eid, str) or not eid:
                 # Çözümlenmemiş kayıt: atılmaz, listeye eklenir ve sonuç KISMİ olur.
                 out.append(e)
                 return out, (f"incomplete: geçersiz/eksik executor_id "
-                             f"(offset={offset})")
-            if eid not in seen:
-                seen.add(eid)
-                out.append(e)
-                new += 1
-        if new == 0:
-            return out, (f"incomplete: offset ilerlemiyor / yeni kayıt yok "
-                         f"(offset={offset}, {len(data)} kayıt)")
-        offset += len(data)
+                             f"(cursor={cursor!r})")
+            if eid in seen:
+                return out, (f"incomplete: tekrar eden executor_id {eid[:12]} "
+                             "— cursor ilerlemesi bozuk")
+            seen.add(eid)
+            out.append(e)
+        if len(out) > total_count:
+            return out, (f"incomplete: toplanan {len(out)} kayıt total_count "
+                         f"{total_count} aştı")
+        if _hm is False:
+            _nc = pg.get("next_cursor")
+            if _nc is not None:
+                return out, (f"incomplete: has_more=False ama next_cursor "
+                             f"{_nc!r} — bozuk pagination")
+            if len(out) != total_count:
+                return out, (f"incomplete: zincir bitti, {len(out)} kayıt != "
+                             f"total_count {total_count}")
+            return out, None
+        nxt = pg.get("next_cursor")
+        if not isinstance(nxt, str) or not nxt or nxt in seen_cursors:
+            return out, ("incomplete: has_more=True ama next_cursor geçersiz/"
+                         "tekrar eden — cursor semantiği kanıtsız")
+        seen_cursors.add(nxt)
+        cursor = nxt
     return out, f"incomplete: sayfalama güvenlik sınırı ({max_pages} sayfa) aşıldı"
+
 
 
 def sync_risk_engine(risk, hb, binance=None):
@@ -4444,6 +4487,14 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             reserver.release(_res_id, reason="rate_limit_pre_order")
         return False
 
+    # BLOK13 §7: GERÇEK giriş izni logu — sürecin TÜM kapıları (risk store
+    # health, HALTED, equity, ONEWAY/pending/rezervasyon, merkezi risk kapısı,
+    # fill-cap, doğrulama bütçesi, operatör onayı, shutdown ve rate-limit ön
+    # kontrolleri) burada geçildi. Buradan ÖNCE yazılmış hiçbir "koruma
+    # denetimi" satırı ENTRY_ALLOWED anlamına gelmez.
+    log.info(f"  ✅ ENTRY_ALLOWED: tüm kapılar geçti; create_executor çağrılıyor "
+             f"({symbol} {'LONG' if side == 1 else 'SHORT'} "
+             f"notional={final_notional:.2f})")
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct,
                             TIME_LIMIT_SEC, side=side,
                             # E1: pin varsa yalnız kwargs olarak eklenir —
@@ -5961,7 +6012,10 @@ def run_once(dry_run=False):
     # F25 açılış öz-testi: DD kapısı kendi doğruluğunu HER açılışta bilinen seride
     # kanıtlamadan o kapıya güvenilmez. Atılabilir DB'de koşar; is_halted ve kalıcı
     # risk kayıtlarına dokunmaz. Başarısızlık → yeni giriş kapısı kapalı + alarm.
-    _dd_ok, _dd_detail = risk_engine_mod.dd_selftest()
+    # BLOK13 kök-3: öz-test artık ÜRETİMİN ETKİLİ config'iyle koşar
+    # (max_daily_loss_pct dâhil). Canlı 2% iken öz-testin sessiz 5%
+    # varsayılanıyla üretilmesi loglarda "limit %5%" hayaleti yaratıyordu.
+    _dd_ok, _dd_detail = risk_engine_mod.dd_selftest(_risk_cfg)
     global _DD_SELFTEST_FAILED
     _DD_SELFTEST_FAILED = not _dd_ok
     if _dd_ok:
@@ -5974,6 +6028,12 @@ def run_once(dry_run=False):
              f"daily_pnl={getattr(risk, 'daily_pnl', None)} "
              f"day_start={getattr(risk, 'day_start_equity', None)}"
              f"@{getattr(risk, 'day_start_equity_date', None)}")
+    # BLOK13 kök-3: etkili günlük zarar limiti ve kaynağı HER turda görünür —
+    # canlı config 2% ile RISK_CONFIG 5% varsayılanı arasında gizli ayrım kalmaz.
+    _eff_dl = float(_risk_cfg.get("max_daily_loss_pct", 0.05))
+    log.info(f"[RISK] etkili max_daily_loss_pct=%{_eff_dl*100:.2f} "
+             f"(kaynak: {'LIVE config risk_overrides' if _cfg.is_live else 'RISK_CONFIG varsayılanı (canlı değil)'})"
+             f"; F25 öz-testi de bu limitle koştu")
     reserver = PositionReserver(risk.db_file, _max_positions)
     try:
         reserver.init_schema()
@@ -6078,7 +6138,12 @@ def run_once(dry_run=False):
             log.critical(f"🚨 OPEN_UNPROTECTED {sorted(_OPEN_UNPROTECTED)} — yeni giriş "
                          f"engellendi (borsa SL doğrulanana dek alarm açık)")
         return
-    log.info("  ✅ Koruma denetimi çalıştı; mod ONEWAY; yeni giriş izni var")
+    # BLOK13 §7: BU BİR GİRİŞ İZNİ DEĞİLDİR. Burası yalnız koruma denetimlerinin
+    # (drift/stale/pending/ONEWAY/OPEN_UNPROTECTED) geçtiğini söyler; ardından
+    # CloseCoordinator, F25, HB-auth, slot, equity/HALTED, bütçe, operatör ve
+    # sembol-bazlı RiskEngine kapıları ayrıca doğrulanır. Gerçek ENTRY_ALLOWED
+    # yalnız open_coin'de SON kapıdan sonra yazılır.
+    log.info("  ✅ Koruma denetimleri geçti; nihai giriş uygunluğu henüz doğrulanmadı.")
 
     # B-1: the central close authority is mandatory for new entries. If the
     # CloseCoordinator/CloseIntentStore could not be built, block NEW entries
@@ -6128,10 +6193,12 @@ def run_once(dry_run=False):
             risk.update_exposure(eq, positions_for_exposure)
 
         if risk.is_halted:
-            # F25: dondurulmuş halt_reason her tick'te CANLI bağlamla yazılır —
-            # "Drawdown %100" ile "DD=%1.0" yan yana görünce kimse hangisinin
-            # şimdi-gerçeği olduğunu bilemiyordu.
-            log.critical(f"🚨 Sistem DURDU: {risk.halt_reason} | canlı: eq="
+            # F25 + BLOK13 §6: halt_reason GEÇMİŞ bir olayın dondurulmuş
+            # KAYITLI nedenidir; güncel DD DEĞİLDİR. Etiket açıkça ayrıştırılır
+            # ki "Drawdown %100" ile "dd_pct=1.01" yan yana kimseyi yanıltmasın.
+            # Kayıtlı neden otomatik silinmez/değiştirilmez (kalıcı HALTED).
+            log.critical(f"🚨 Sistem DURDU — yeni giriş kapalı | KAYITLI halt "
+                         f"nedeni (geçmiş olay): {risk.halt_reason} | ŞU-AN: eq="
                          f"{risk.current_equity:.2f} dd_pct={risk.dd_pct:.2f} "
                          f"daily_dd_ratio={risk.daily_dd_ratio:.4f} "
                          f"peak={risk.peak_equity:.2f}")
