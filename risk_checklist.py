@@ -100,6 +100,12 @@ class Snapshot:
     # per-position mark/entry notional override when positionRisk rows lack
     # markPrice: symbol -> notional (signed)
     position_notionals: Optional[dict] = None
+    # True when the target REPLACES the existing position on the same symbol
+    # (a strategy flip: close + reopen in one action). Such a target is not a
+    # duplicate on the symbol, and the closed leg releases its margin. (Added
+    # in BLOK25 Bölüm 3 for the H1 flip-only design; default False keeps the
+    # Bölüm 2 entry-path behavior unchanged.)
+    target_replaces_existing: bool = False
 
 
 def portfolio_vol(contribs: list, corr: float) -> Optional[float]:
@@ -132,6 +138,18 @@ class PretradeChecklist:
         self.cfg = getattr(risk_engine, "cfg", {}) or {}
 
     # ---- helpers -------------------------------------------------------
+    def _effective_balance(self, snap) -> Optional[float]:
+        """Available balance for the target. A flip (target_replaces_existing)
+        CLOSES the existing slot first: at <=1x gross the released margin ~
+        the replaced notional (same approximation as margin_usage). An
+        unverifiable book credits no release."""
+        bal = snap.available_balance
+        if snap.target_replaces_existing and bal is not None:
+            book = self._book_notionals(snap)
+            if book is not None:
+                bal = bal + abs(book.get(snap.target_symbol, 0.0))
+        return bal
+
     def _book_notionals(self, snap) -> Optional[dict]:
         """symbol -> signed notional for the CURRENT book. None when the
         position data is unavailable (fail-closed upstream)."""
@@ -332,17 +350,18 @@ class PretradeChecklist:
                            f"net {net:+.2f}x (directional exposure reported)")
 
     def _check_available_balance(self, snap):
-        if snap.available_balance is None:
-            return CheckResult("available_balance", UNKNOWN,
-                               "balance read unavailable")
         # at <= 1x gross the target's margin requirement is ~ its notional
         # (cross-margin optimum); require the balance to cover it
-        if snap.available_balance < snap.target_notional:
+        bal = self._effective_balance(snap)
+        if bal is None:
+            return CheckResult("available_balance", UNKNOWN,
+                               "balance read unavailable")
+        if bal < snap.target_notional:
             return CheckResult("available_balance", FAIL,
-                               f"balance {snap.available_balance:.2f} < target "
+                               f"balance {bal:.2f} < target "
                                f"notional {snap.target_notional:.2f}")
         return CheckResult("available_balance", PASS,
-                           f"balance {snap.available_balance:.2f} >= notional "
+                           f"balance {bal:.2f} >= notional "
                            f"{snap.target_notional:.2f}")
 
     def _check_margin_usage(self, snap):
@@ -365,17 +384,19 @@ class PretradeChecklist:
     def _check_max_leverage(self, snap):
         # account-level leverage: total notional / available balance. The
         # prereg-documented aggregate cap is 1.0x (8 slots x w=1/8 x 1x slot).
+        # A flip uses the post-release balance (see _effective_balance).
         book = self._book_notionals(snap)
-        if book is None or snap.available_balance is None:
+        bal = self._effective_balance(snap)
+        if book is None or bal is None:
             return CheckResult("max_leverage", UNKNOWN,
                                "leverage inputs unavailable")
         total = (sum(abs(n) for n in book.values())
                  - abs(book.get(snap.target_symbol, 0.0))
                  + abs(snap.target_notional))
-        lev = total / snap.available_balance if snap.available_balance > 0 else None
+        lev = total / bal if bal > 0 else None
         if lev is None:
             return CheckResult("max_leverage", FAIL,
-                               f"non-positive balance {snap.available_balance}")
+                               f"non-positive balance {bal}")
         if lev > MAX_GROSS_LEVERAGE * 1.0000001:
             return CheckResult("max_leverage", FAIL,
                                f"account leverage {lev:.2f}x > "
@@ -431,11 +452,15 @@ class PretradeChecklist:
 
     def _check_duplicate_executor(self, snap):
         reasons = []
+        replaced = []
         if snap.open_symbols is None:
             return CheckResult("duplicate_executor", UNKNOWN,
                                "open symbols unavailable")
         if snap.target_symbol in snap.open_symbols:
-            reasons.append("position already open")
+            if snap.target_replaces_existing:
+                replaced.append("flip replaces the existing position on symbol")
+            else:
+                reasons.append("position already open")
         if snap.active_executor_pairs is not None:
             pair = snap.target_symbol.replace("USDT", "-USDT")
             if pair in snap.active_executor_pairs:
@@ -446,6 +471,9 @@ class PretradeChecklist:
         if reasons:
             return CheckResult("duplicate_executor", FAIL,
                                "; ".join(reasons))
+        if replaced:
+            return CheckResult("duplicate_executor", PASS,
+                               "; ".join(replaced))
         if snap.active_executor_pairs is None or snap.reserved_symbols is None:
             return CheckResult("duplicate_executor", UNKNOWN,
                                "executor/reservation state unavailable")
