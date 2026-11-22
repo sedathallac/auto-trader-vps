@@ -42,6 +42,12 @@ class MockEx:
             raise self._mode
         return self._mode
 
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        # F-b (BLOK25): compliant fake — stop POST succeeds and the executor is
+        # verifiably TERMINATED afterwards (models a healthy HB API).
+        self.stop_executor(eid)
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
+
     def stop_executor(self, s):
         if self._stop_raises:
             raise RuntimeError("stop failed")
@@ -121,6 +127,12 @@ class TestMigration(unittest.TestCase):
             def __init__(self): self.pos = {"SOLUSDT": "-0.3", "ETHUSDT": "0"}
             def position_amt(self, s): return Decimal(self.pos[s])
             def position_mode(self): return ONEWAY
+            def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+                # F-b (BLOK25): compliant fake — stop POST succeeds and the
+                # executor is verifiably TERMINATED afterwards.
+                self.stop_executor(eid)
+                return {"status": "TERMINATED", "outcome": "STOPPED"}
+
             def stop_executor(self, s): pass
             def protective_orders(self, s): return []
             def order_terminal(self, o): return True

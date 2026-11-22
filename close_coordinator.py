@@ -72,6 +72,8 @@ class CloseCoordinator:
         cancel_order(order) -> bool            # request cancel; returns terminal?
         stop_executor(symbol) -> None          # stop HB executor keep_position=True
         close_reduce_only(symbol, qty, position_side=None) -> Decimal  # filled qty
+        protective_algo_orders(symbol) -> list[dict]  # F-a: live STOP algo orders
+        cancel_algo_order_verified(o) -> bool  # F-a: cancel + confirm algo SL gone
     """
 
     def __init__(self, exchange, intent_store=None):
@@ -94,6 +96,32 @@ class CloseCoordinator:
         if symbol in self._closed:
             return CloseState.CLOSED
         return self._state.get(symbol, CloseState.HANDOFF_PENDING)
+
+    def _resolve_leftover_algo(self, symbol: str):
+        """F-a (BLOK25): after the exchange confirms FLAT, NO live STOP algo order
+        may survive on this symbol. A leftover SL from THIS position epoch could
+        fire on a FUTURE position (duplicate / wrong-epoch exit — the
+        SOLUSDT-class reverse risk when the leftover stop is not reduceOnly).
+        Cancel + verify every live algo SL (fail-closed). Returns None when fully
+        resolved, else a FAILED_SAFE CloseResult (critical)."""
+        try:
+            leftovers = self.ex.protective_algo_orders(symbol)
+        except Exception as e:
+            return CloseResult(False, CloseState.FAILED_SAFE, "ALGO_QUERY_FAILED",
+                               reason=f"leftover algo SL query failed: {e}",
+                               critical=True)
+        for o in leftovers:
+            try:
+                ok = self.ex.cancel_algo_order_verified(o)
+            except Exception:
+                ok = False
+            if not ok:
+                return CloseResult(False, CloseState.FAILED_SAFE,
+                                   "ALGO_LEFTOVER_UNRESOLVED",
+                                   reason="position flat but a leftover algo SL "
+                                          "could not be confirmed cancelled",
+                                   critical=True, detail={"order": o})
+        return None
 
     # ---- TP / time-limit routed through the SINGLE close authority ----------
     # HB's autonomous TP/time-limit closes are disabled (build_executor_config).
@@ -163,7 +191,12 @@ class CloseCoordinator:
         amt = Decimal(amt)
         self._state[symbol] = CloseState.EXCHANGE_STATE_VERIFIED
         if amt == 0:
-            # Already flat -> nothing to close; hand over cleanly.
+            # Already flat -> nothing to close; hand over cleanly. F-a: still
+            # resolve leftover algo SLs so they can never fire on a future position.
+            bad = self._resolve_leftover_algo(symbol)
+            if bad is not None:
+                self._state[symbol] = CloseState.FAILED_SAFE
+                return bad
             self._closed.add(symbol)
             return CloseResult(True, CloseState.CLOSED, "ALREADY_FLAT",
                                reason="exchange flat before close")
@@ -229,6 +262,12 @@ class CloseCoordinator:
                                reason=f"close reversed position {amt} -> {after}",
                                critical=True, detail={"before": str(amt), "after": str(after)})
         if after == 0:
+            # F-a: flat-confirmed — but the close is only CLEAN when no live STOP
+            # algo order survives on the symbol (wrong-epoch exit / reverse risk).
+            bad = self._resolve_leftover_algo(symbol)
+            if bad is not None:
+                self._state[symbol] = CloseState.FAILED_SAFE
+                return bad
             self._state[symbol] = CloseState.EXTERNAL_AUTHORITY_ACTIVE
             self._closed.add(symbol)
             if self.intent is not None:

@@ -42,6 +42,16 @@ class MockExchange:
     def stop_executor(self, symbol):
         self.stop_called += 1
 
+    # F-a (BLOK25): the coordinator now also resolves leftover algo SLs after a
+    # flat confirmation; the mock models an exchange with none unless configured.
+    def protective_algo_orders(self, symbol):
+        return list(getattr(self, "_algo_leftovers", []))
+
+    def cancel_algo_order_verified(self, o):
+        self._algo_leftovers = [x for x in getattr(self, "_algo_leftovers", [])
+                                if x.get("algoId") != o.get("algoId")]
+        return True
+
     def close_reduce_only(self, symbol, qty, position_side=None):
         self.close_calls.append((Decimal(str(qty)), position_side))
         q = Decimal(str(qty))

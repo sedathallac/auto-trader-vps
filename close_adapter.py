@@ -56,6 +56,13 @@ class BinanceHBCloseAdapter:
     def __init__(self, binance, hb):
         self.binance = binance
         self.hb = hb
+        # F-b (BLOK25): order ids tracked by executors THIS adapter stopped. A
+        # verified stop TERMINATES the executor, which then disappears from the
+        # is_active list — but its tracked orders may still be live on the
+        # exchange and MUST remain resolvable in the handoff (step 2). Captured
+        # BEFORE the stop POST; keyed by symbol: set of ids (a symbol present
+        # with an EMPTY set = an executor we stopped that tracked no orders).
+        self._stopped_ids = {}
 
     # ---- exchange truth (RAISE on failure -> coordinator fails closed) ----
     def position_amt(self, symbol) -> Decimal:
@@ -116,9 +123,16 @@ class BinanceHBCloseAdapter:
         if not isinstance(execs, list):
             raise CloseAdapterError(f"active_executors [HB] unavailable: {execs}")
         matched = [e for e in execs if e.get("trading_pair") == pair]
-        if not matched:
+        # F-b (BLOK25): executors this adapter already stopped (step 1 of the
+        # handoff) are TERMINATED, hence absent from the is_active list — but
+        # their tracked orders are still live on the exchange and belong to THIS
+        # handoff. Merge the ids captured at stop time so step 2 can resolve
+        # them; without this, a verified stop made every subsequent close fail
+        # with ORDERS_QUERY_FAILED (attribution lost -> UNKNOWN).
+        stopped_here = self._stopped_ids.get(symbol)
+        if not matched and stopped_here is None:
             return None
-        ids = set()
+        ids = set(stopped_here) if stopped_here else set()
         for e in matched:
             info = e.get("custom_info")
             oids = info.get("order_ids") if isinstance(info, dict) else None
@@ -311,6 +325,70 @@ class BinanceHBCloseAdapter:
                 continue
         return SL_ABSENT
 
+    def protective_algo_orders(self, symbol) -> list:
+        """F-a (BLOK25): the LIVE STOP algo orders for `symbol` — the exchange SL
+        authority's orders. RAISES on any outage / API error dict / malformed
+        payload / wrong-symbol element (fail-closed): an outage must NEVER be
+        mistaken for 'no algo SL'. Only LIVE STOP-type algo orders are returned."""
+        try:
+            r = self.binance.open_algo_orders_raw(symbol)
+        except Exception as e:
+            raise CloseAdapterError(f"openAlgoOrders unavailable for {symbol}: {e}")
+        if isinstance(r, dict):
+            orders = r.get("orders")
+            if not isinstance(orders, list):
+                raise CloseAdapterError(
+                    f"openAlgoOrders error for {symbol}: code={r.get('code')}")
+            r = orders
+        if not isinstance(r, list):
+            raise CloseAdapterError(f"openAlgoOrders malformed for {symbol}")
+        out = []
+        for o in r:
+            if not isinstance(o, dict):
+                raise CloseAdapterError(
+                    f"openAlgoOrders malformed element for {symbol}")
+            osym = str(o.get("symbol") or "").upper()
+            if osym and osym != symbol.upper():
+                # wrong symbol -> the match is unverifiable -> UNKNOWN, fail-closed
+                raise CloseAdapterError(
+                    f"openAlgoOrders wrong symbol for {symbol}: {osym}")
+            typ = str(o.get("orderType") or o.get("type")
+                      or o.get("algoType") or "").upper()
+            st = str(o.get("algoStatus") or o.get("status") or "").upper()
+            if "STOP" in typ and st in _SL_LIVE:
+                d = dict(o)
+                d.setdefault("symbol", symbol)
+                out.append(d)
+        return out
+
+    def cancel_algo_order_verified(self, o) -> bool:
+        """F-a (BLOK25): cancel an ALGO (STOP) order and CONFIRM with a fresh
+        openAlgoOrders read that it is no longer live. True ONLY on confirmed
+        resolution; a cancel error, an outage, or the order still being live ->
+        False (UNKNOWN, fail-closed)."""
+        aid = o.get("algoId")
+        symbol = o.get("symbol")
+        if aid is None or not symbol:
+            return False
+        try:
+            self.binance.cancel_algo_order(aid)
+        except Exception:
+            return False
+        try:
+            r = self.binance.open_algo_orders_raw(symbol)
+        except Exception:
+            return False
+        if isinstance(r, dict):
+            r = r.get("orders")
+        if not isinstance(r, list):
+            return False
+        for q in r:
+            if isinstance(q, dict) and str(q.get("algoId")) == str(aid):
+                st = str(q.get("algoStatus") or q.get("status") or "").upper()
+                if st in _SL_LIVE:
+                    return False
+        return True
+
     def stop_executor(self, symbol):
         pair = symbol.replace("USDT", "-USDT")
         execs = self.hb.active_executors()
@@ -320,7 +398,27 @@ class BinanceHBCloseAdapter:
             if e.get("trading_pair") == pair and e.get("status") == "RUNNING":
                 eid = e.get("executor_id")
                 if eid:
-                    self.hb.stop_executor(eid, keep_position=True)
+                    # F-b (BLOK25): capture the tracked order ids BEFORE the stop —
+                    # a verified stop TERMINATES the executor and removes it from
+                    # the is_active list, so _hb_order_ids could no longer
+                    # attribute/resolve its orders afterwards (step 2 of the
+                    # handoff). A missing/not-a-list mapping is recorded as an
+                    # EMPTY capture here; _hb_order_ids still raises UNKNOWN for
+                    # any executor it can see with a bad mapping.
+                    info = e.get("custom_info")
+                    oids = info.get("order_ids") if isinstance(info, dict) else None
+                    cap = ({o for o in oids if o is not None and o != ""}
+                           if isinstance(oids, list) else set())
+                    # F-b (BLOK25): never trust the stop POST response alone —
+                    # verify the executor is really non-RUNNING; UNKNOWN -> raise
+                    # so the coordinator fails closed (a half-stopped executor can
+                    # still place its own close and race the reduce-only POST).
+                    r = self.hb.stop_executor_verified(eid, keep_position=True)
+                    if not isinstance(r, dict) or r.get("outcome") != "STOPPED":
+                        out = r.get("outcome") if isinstance(r, dict) else r
+                        raise CloseAdapterError(
+                            f"stop_executor {eid} unverified (outcome={out})")
+                    self._stopped_ids.setdefault(symbol, set()).update(cap)
         # no RUNNING executor -> nothing to stop; the exchange position (if any)
         # is still handled by the reduce-only close below.
 

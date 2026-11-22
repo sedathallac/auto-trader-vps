@@ -49,7 +49,19 @@ class _MockEx:
     def protective_orders(self, s): return list(self._protective)
     def order_terminal(self, o): return bool(o.get("terminal", False))
     def cancel_order(self, o): return bool(o.get("cancel_terminal", True))
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        # F-b (BLOK25): compliant fake — stop POST succeeds and the executor is
+        # verifiably TERMINATED afterwards (models a healthy HB API).
+        self.stop_executor(eid)
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
+
     def stop_executor(self, s): self.stopped += 1
+    def protective_algo_orders(self, s):
+        # F-a (BLOK25): no leftover algo SL in this fake's world
+        return []
+    def cancel_algo_order_verified(self, o):
+        return True
+
     def close_reduce_only(self, s, q, position_side=None):
         self.close_calls.append((Decimal(str(q)), position_side))
         if self._pos > 0: self._pos = max(Decimal("0"), self._pos - Decimal(str(q)))

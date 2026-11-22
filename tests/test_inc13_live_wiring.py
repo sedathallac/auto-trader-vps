@@ -56,6 +56,11 @@ class FakeBinance:
     def open_algo_orders_for(self, symbol):
         return []
 
+    def open_algo_orders_raw(self, symbol):
+        # F-a (BLOK25): no leftover algo SL in this fake's world (raw response:
+        # [] = verifiably NO algo orders, not an outage)
+        return []
+
     # --- used by the CloseCoordinator / adapter ---
     def position_risk(self):
         return [{"symbol": SYM, "positionAmt": str(self.amt), "entryPrice": self.entry}]
@@ -95,6 +100,12 @@ class FakeHB:
 
     def get_executor(self, eid):
         return {"filled_amount_quote": 100.0, "error_count": 0}
+
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        # F-b (BLOK25): compliant fake — stop POST succeeds and the executor is
+        # verifiably TERMINATED afterwards (models a healthy HB API).
+        self.stop_executor(eid, keep_position=keep_position)
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
 
     def stop_executor(self, eid, keep_position=True):
         self.stopped.append((eid, keep_position))

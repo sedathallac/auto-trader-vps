@@ -139,6 +139,12 @@ class FakeExchange:
             return {"data": list(self.executors)}
         if "/executors/" in path and path.endswith("/stop"):
             self.stops.append((path, body))
+            # F-b (BLOK25): a healthy HB terminates the executor on stop, so the
+            # verified-stop poll (get_executor) observes a non-RUNNING status.
+            eid = path.split("/executors/")[1].rsplit("/stop", 1)[0]
+            for e in self.executors:
+                if e.get("executor_id") == eid:
+                    e["status"] = "TERMINATED"
             return {"status": "ok"}
         if path == "/fapi/v1/order":
             return self._place_order(_params(url))

@@ -69,6 +69,9 @@ class FakeExchange:
             return {"dualSidePosition": self.dual}
         if path == "/fapi/v1/openOrders":
             return []
+        if path == "/fapi/v1/openAlgoOrders":
+            # F-a (BLOK25): no leftover algo SL in this fake's world
+            return []
         return {"code": -1121}
 
     def handle_post(self, url, body):

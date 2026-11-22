@@ -39,6 +39,11 @@ class FakeBinance:
     def open_algo_orders_for(self, symbol):
         return self._algo
 
+    def open_algo_orders_raw(self, symbol):
+        # F-a (BLOK25): raw response — the configured _algo list, or an error
+        # dict if _algo was set to one (outage modelling).
+        return self._algo
+
     def open_orders(self, symbol):
         return getattr(self, "_open_orders", [])
 
@@ -70,6 +75,12 @@ class FakeHB:
     def stop_executor(self, eid, keep_position=True):
         self.stopped.append((eid, keep_position))
         return {"status": "ok"}
+
+    def stop_executor_verified(self, eid, keep_position=True):
+        # F-b (BLOK25): a compliant fake — the stop POST succeeds and the executor
+        # is verifiably non-RUNNING afterwards.
+        self.stopped.append((eid, keep_position))
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
 
 
 class TestAdapterMapping(unittest.TestCase):

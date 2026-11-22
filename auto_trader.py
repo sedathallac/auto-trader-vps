@@ -398,7 +398,10 @@ class HBAPI:
         return r.json().get("data", [])
 
     def get_executor(self, eid):
-        r = requests.post(f"{self.base}/executors/search",
+        # F-b (BLOK25): route through the swappable _session seam like every
+        # other HBAPI call (a direct requests.post here bypassed the HTTP
+        # boundary the tests — and any future transport change — rely on).
+        r = _session.post(f"{self.base}/executors/search",
                           json={}, auth=self.auth, timeout=15)
         for e in r.json().get("data", []):
             if e.get("executor_id") == eid:
@@ -413,6 +416,38 @@ class HBAPI:
             f"{self.base}/executors/{eid}/stop",
             json={"close_type": "EARLY_STOP", "keep_position": bool(keep_position)},
             auth=self.auth, timeout=15).json()
+
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        """F-b (BLOK25): stop an executor AND VERIFY it actually stopped.
+
+        The bare stop_executor response was previously never checked by ANY
+        caller (open_coin not-filled path, reconcile auto-heal, the close
+        adapter) — a failed/errored stop left a RUNNING executor that could
+        still place its own close order. This polls get_executor until the
+        status is verifiably non-RUNNING.
+
+        Returns {"status": <final status>, "outcome": "STOPPED"|"UNKNOWN",
+        "response": <last stop response>}. UNKNOWN = the POST failed or the
+        executor could not be confirmed stopped after `attempts` polls — the
+        caller MUST treat the executor as possibly-alive (fail-closed: keep the
+        slot reservation, raise the alarm, never assume a clean stop)."""
+        last = None
+        ex = None
+        for _ in range(max(1, attempts)):
+            try:
+                last = self.stop_executor(eid, keep_position=keep_position)
+            except Exception as e:
+                last = {"error": f"{type(e).__name__}: {e}"}
+            try:
+                ex = self.get_executor(eid)
+            except Exception:
+                ex = None
+            if ex is not None and str(ex.get("status")) != "RUNNING":
+                return {"status": ex.get("status"), "outcome": "STOPPED",
+                        "response": last}
+            time.sleep(delay)
+        return {"status": (ex.get("status") if isinstance(ex, dict) else None),
+                "outcome": "UNKNOWN", "response": last}
 
 
 def heartbeat_tick():
@@ -586,10 +621,18 @@ def reconcile_positions(binance, hb):
                 if e["trading_pair"].replace("-", "") == sym and e.get("status") == "RUNNING":
                     eid = e.get("executor_id")
                     try:
-                        r = requests.post(f"{HB_API}/executors/{eid}/stop", json={"close_type": "EARLY_STOP", "keep_position": True}, auth=hb.auth, timeout=15).json()
-                        log.warning("  AUTO-HEAL " + sym + " -> " + str(r.get("status")))
-                        heal_state[sym] = now_ts
-                        heal_state_file.write_text(json.dumps(heal_state, indent=2))
+                        # F-b (BLOK25): verified stop — an unconfirmed stop keeps
+                        # the drift alarm up (drift already blocks new entries).
+                        r = hb.stop_executor_verified(eid, keep_position=True)
+                        if r.get("outcome") == "STOPPED":
+                            log.warning("  AUTO-HEAL " + sym + " -> " + str(r.get("status")))
+                            heal_state[sym] = now_ts
+                            heal_state_file.write_text(json.dumps(heal_state, indent=2))
+                        else:
+                            log.critical("  🚨 F-b AUTO-HEAL " + sym + ": executor "
+                                         f"{eid} durdurulamadı/doğrulanamadı "
+                                         f"(outcome={r.get('outcome')}) — drift alarmı "
+                                         f"açık kalıyor (fail-closed)")
                     except Exception as ex:
                         log.error("  AUTO-HEAL HATA " + sym + ": " + str(ex))
                     break
@@ -642,6 +685,14 @@ def cleanup_orphan_sl(binance):
 # procedures.
 _OPEN_UNPROTECTED = {}  # symbol -> Binance error code (or None)
 
+# F-c (BLOK25): True when SL coverage for OPEN positions could not be VERIFIED
+# (e.g. a positionRisk outage inside ensure_sl_coverage). Previously that path
+# only logged a WARNING and returned, leaving _OPEN_UNPROTECTED empty -> new
+# entries stayed ALLOWED while open positions were effectively unverified
+# (fail-open). While this flag is set, new entries are blocked (fail-closed);
+# it is cleared only by a subsequent RELIABLE coverage check.
+_PROTECTION_UNVERIFIED = False
+
 
 def sl_placement_outcome(result):
     """Classify a place_algo_sl result. ("PROTECTED", None) when accepted (has
@@ -669,10 +720,13 @@ def note_sl_outcome(unprotected, symbol, result):
     return (m, "UNPROTECTED_2021" if code == -2021 else "UNPROTECTED_OTHER")
 
 
-def should_block_new_entries(unprotected=None):
-    """True while any position is OPEN_UNPROTECTED (SL not confirmed on exchange)."""
+def should_block_new_entries(unprotected=None, protection_unverified=None):
+    """True while any position is OPEN_UNPROTECTED (SL not confirmed on exchange)
+    OR while SL coverage itself is UNVERIFIABLE (F-c: positionRisk outage inside
+    ensure_sl_coverage). Explicit args keep this pure/testable; None -> globals."""
     u = _OPEN_UNPROTECTED if unprotected is None else unprotected
-    return len(u) > 0
+    p = _PROTECTION_UNVERIFIED if protection_unverified is None else protection_unverified
+    return len(u) > 0 or bool(p)
 
 
 def new_entry_allowed(drift, stale, mode_ok, unprotected):
@@ -708,7 +762,8 @@ def protect_then_gate(binance, reserver, drift, stale):
     allow = new_entry_allowed(drift=drift, stale=stale, mode_ok=mode_ok,
                               unprotected=unprotected)
     return allow, {"drift": drift, "stale": stale, "mode": mode,
-                   "mode_ok": mode_ok, "unprotected": unprotected}
+                   "mode_ok": mode_ok, "unprotected": unprotected,
+                   "protection_unverified": _PROTECTION_UNVERIFIED}
 
 
 # K-3: shared ledger path for the cross-process SL-placement intent (same db as the
@@ -748,12 +803,70 @@ def _dedupe_algo_sl(binance, symbol):
     return cancelled
 
 
+def cancel_symbol_algo_sl_verified(binance, symbol, attempts=2):
+    """F-a (BLOK25): cancel ALL live STOP algo orders for `symbol` and VERIFY each
+    one is really gone.
+
+    Root cause this fixes: the open_coin pre-open reconciliation fired
+    cancel_algo_order() and IGNORED the response, and read orders via
+    open_algo_orders_for() which maps an OUTAGE to [] — so a failed cancel (or an
+    unreadable order book) silently proceeded to place a NEW SL next to a surviving
+    old one (duplicate SL / wrong-epoch SL on the new position).
+
+    Returns True ONLY when a reliable openAlgoOrders read confirms NO live STOP
+    algo order remains for the symbol. Returns False on ANY unverifiable step
+    (outage, cancel failure, order still live after retries) — the caller must
+    then NOT place a new SL (fail-closed): a duplicate/leftover SL is worse than
+    a missing one, which the sl_status verification + emergency-close path
+    already owns."""
+    for _ in range(max(1, attempts)):
+        try:
+            raw = binance.open_algo_orders_raw(symbol)
+        except Exception:
+            return False
+        if isinstance(raw, dict):
+            raw = raw.get("orders")
+        if not isinstance(raw, list):
+            return False  # error dict / malformed -> UNKNOWN
+        live = []
+        for o in raw:
+            if not isinstance(o, dict):
+                return False
+            typ = str(o.get("orderType") or o.get("type")
+                      or o.get("algoType") or "").upper()
+            st = str(o.get("algoStatus") or o.get("status") or "").upper()
+            if "STOP" in typ and st in ("", "NEW", "WORKING", "ACTIVE", "LIVE"):
+                if o.get("algoId") is None:
+                    return False  # live STOP we cannot address -> unverifiable
+                live.append(o)
+        if not live:
+            return True
+        unresolved = False
+        for o in live:
+            try:
+                binance.cancel_algo_order(o["algoId"])
+            except Exception:
+                unresolved = True
+        if unresolved:
+            return False
+        # loop: re-query and confirm the cancels actually took effect
+    return False
+
+
 def ensure_sl_coverage(binance):
+    global _PROTECTION_UNVERIFIED
     try:
         positions = binance.position_risk()
         if not isinstance(positions, list):
-            log.warning(f"positionRisk hata: {positions}")
+            # F-c: an unreadable positionRisk means SL coverage for open positions
+            # is UNVERIFIABLE — that must BLOCK new entries (fail-closed), not just
+            # warn. The flag is cleared only by a later reliable check.
+            _PROTECTION_UNVERIFIED = True
+            log.critical(f"🚨 F-c: SL kapsamı DOĞRULANAMADI (positionRisk hata: "
+                         f"{positions}) — açık pozisyonlar korumasız sayılır; yeni "
+                         f"giriş engellendi (fail-closed)")
             return
+        _PROTECTION_UNVERIFIED = False
         open_pos = {p["symbol"]: p for p in positions if float(p["positionAmt"]) != 0}
         # K-3 deterministic dedupe backstop: clean any duplicate SL on every open
         # position (both processes run this; deterministic keep-max never cancels both).
@@ -840,6 +953,38 @@ def ensure_sl_coverage(binance):
                 entry = float(p["entryPrice"])
                 is_long = float(p["positionAmt"]) > 0
                 side = 1 if is_long else 2
+                # F-g (BLOK25): re-read THIS symbol's live position immediately
+                # before placing — the open_pos snapshot at the top of this
+                # function can be stale (flip / partial close / drift since that
+                # read). Placing with a stale side/qty/entry leaves a mis-sized SL
+                # on a position that no longer matches the snapshot (TOCTOU). Fresh
+                # read unavailable or side changed -> do NOT place (fail-closed);
+                # the next cycle / emergency path owns the outcome.
+                try:
+                    _fg_pr = binance.position_risk()
+                    _fg_p = next((q for q in _fg_pr if q.get("symbol") == sym), None) \
+                        if isinstance(_fg_pr, list) else None
+                except Exception:
+                    _fg_p = None
+                if _fg_p is None:
+                    log.warning(f"  F-g {sym}: güncel pozisyon okunamadı — SL "
+                                f"GÖNDERİLMEDİ (fail-closed)")
+                    continue
+                try:
+                    _fg_amt = float(_fg_p["positionAmt"])
+                    _fg_entry = float(_fg_p["entryPrice"])
+                except (TypeError, ValueError, KeyError):
+                    log.warning(f"  F-g {sym}: güncel pozisyon alanları okunamadı — "
+                                f"SL GÖNDERİLMEDİ (fail-closed)")
+                    continue
+                if _fg_amt == 0 or \
+                        ("LONG" if _fg_amt > 0 else "SHORT") != ("LONG" if is_long else "SHORT"):
+                    log.warning(f"  F-g {sym}: pozisyon snapshot ile güncel durum "
+                                f"uyumsuz (amt={_fg_amt}) — SL GÖNDERİLMEDİ; "
+                                f"sonraki döngü çözecek")
+                    continue
+                qty = abs(_fg_amt)
+                entry = _fg_entry
                 filt = binance.filters(sym)
                 tick = float(filt["PRICE_FILTER"]["tickSize"]) if filt else 0.01
                 # FAZ 2.3: ATR bazli SL (open_coin ile tutarli)
@@ -853,7 +998,9 @@ def ensure_sl_coverage(binance):
                     trig = round(round((entry * (1 + sl_pct)) / tick) * tick, 8)
                 # K-3: only ONE process places this (symbol, position-epoch) SL; a
                 # concurrent ensure_sl_coverage (orphan_killer) sees BUSY and skips.
-                _tok = ("LONG" if is_long else "SHORT") + ":" + str(p.get("entryPrice"))
+                # F-g: the token comes from the FRESH position read above (not the
+                # possibly-stale snapshot), so the epoch id matches what is placed.
+                _tok = ("LONG" if is_long else "SHORT") + ":" + str(_fg_p.get("entryPrice"))
                 if _sl_store is not None and _sl_store.acquire(sym, _tok) != _SL_ACQ:
                     log.info(f"  ⏸️ {sym} SL yerleştirme başka process'te (BUSY) — atlandı")
                     continue
@@ -883,7 +1030,11 @@ def ensure_sl_coverage(binance):
             except Exception as e:
                 log.exception(f"  {sym} SL istisna: {e}")
     except Exception as e:
-        log.exception(f"ensure_sl_coverage: {e}")
+        # F-c: any unexpected failure inside the coverage check is also an
+        # unverified-protection state -> block new entries until resolved.
+        _PROTECTION_UNVERIFIED = True
+        log.exception(f"🚨 F-c: ensure_sl_coverage istisna — koruma doğrulanamadı; "
+                      f"yeni giriş engellendi (fail-closed): {e}")
 
 
 def check_correlation_limit(symbol, binance):
@@ -1564,6 +1715,18 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         _res_id = _rr.reservation_id
         log.info(f"  🔒 slot rezerve (id={_res_id}, kullanım={_rr.used}/{MAX_OPEN_POSITIONS})")
 
+    # F-g (BLOK25): post-reservation correlation re-check. check_correlation_limit
+    # ran earlier against a position snapshot; between that read and the create
+    # POST another candidate/process may have opened a same-sector position (the
+    # slot reservation is atomic for the COUNT, not for the sector mix). This
+    # re-read narrows the TOCTOU window; a rejection releases the just-taken slot.
+    if not check_correlation_limit(symbol, binance):
+        if reserver is not None and _res_id is not None:
+            reserver.release(_res_id, reason="correlation_recheck")
+            log.info(f"  🔓 rezervasyon serbest (id={_res_id}): korelasyon yeniden kontrol")
+        log.info("  atlandı: korelasyon limiti (rezervasyon sonrası yeniden kontrol)")
+        return False
+
     er = hb.create_executor(symbol, amount, dyn_lev, sl_pct, tp_pct, TIME_LIMIT_SEC, side=side)
     eid = er.get("executor_id")
     if not eid:
@@ -1590,13 +1753,22 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         # slot. Exchange positions are always counted in the cap (used = exchange ∪
         # reservations), so releasing never under-counts; this prevents a leaked
         # PENDING reservation from starving MAX_OPEN_POSITIONS until reconcile's TTL.
+        # F-b (BLOK25): the stop is now VERIFIED. On UNKNOWN (stop POST failed or
+        # the executor cannot be confirmed non-RUNNING) the reservation is KEPT —
+        # a partial fill may be a live position — and a CRITICAL alarm is raised;
+        # reconcile resolves the slot against exchange truth later.
         try:
-            hb.stop_executor(eid, keep_position=True)
+            _sv = hb.stop_executor_verified(eid, keep_position=True)
         except Exception as e:
-            log.warning(f"  executor durdurma hatası (dolmadı): {e}")
+            _sv = {"outcome": "UNKNOWN", "response": {"error": f"{type(e).__name__}: {e}"}}
+        if _sv.get("outcome") != "STOPPED":
+            log.critical(f"  🚨 F-b: executor {eid} durdurulamadı/doğrulanamadı "
+                         f"(outcome={_sv.get('outcome')}) — rezervasyon KORUNUYOR "
+                         f"(kısmi dolgu canlı pozisyon olabilir); reconcile çözecek")
         if reserver is not None and _res_id is not None:
-            reserver.release(_res_id, reason="not_filled")
-            log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
+            if _sv.get("outcome") == "STOPPED":
+                reserver.release(_res_id, reason="not_filled")
+                log.info(f"  🔓 rezervasyon serbest (id={_res_id}): dolmadı")
         add_blacklist(symbol, "dolmadı")
         return False
     log.info(f"  ✅ doldu: {filled:.2f} USDT")
@@ -1624,17 +1796,32 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         _oc_store = None
         _SL_ACQ = "ACQUIRED"
     _oc_tok = None
-    if _oc_store is not None:
-        try:
-            _oc_pr = binance.position_risk()
+    # F-g (BLOK25): read the LIVE exchange position for this symbol NOW. The SL
+    # below must be sized / priced / sided against exchange truth, NOT the
+    # entry-time snapshot — a partial fill or a flip since then would otherwise
+    # leave a mis-sized or wrong-side SL (the open_coin TOCTOU residue).
+    _oc_p = None
+    try:
+        _oc_pr = binance.position_risk()
+        if isinstance(_oc_pr, list):
             _oc_p = next((q for q in _oc_pr if q.get("symbol") == symbol
-                          and float(q["positionAmt"]) != 0), None) \
-                if isinstance(_oc_pr, list) else None
-            if _oc_p is not None:
-                _oc_tok = ("LONG" if side == 1 else "SHORT") + ":" + str(_oc_p.get("entryPrice"))
-        except Exception as _e:
-            log.warning(f"K-4 intent token alinamadi (positionRisk): {_e}")
-            _oc_tok = None
+                          and float(q["positionAmt"]) != 0), None)
+    except Exception as _e:
+        log.warning(f"F-g güncel pozisyon okunamadi (positionRisk): {_e}")
+        _oc_p = None
+    _oc_fresh_qty = None
+    _oc_fresh_entry = None
+    _oc_fresh_side = None
+    if _oc_p is not None:
+        try:
+            _oc_amt = float(_oc_p["positionAmt"])
+            _oc_fresh_entry = float(_oc_p["entryPrice"])
+        except (TypeError, ValueError, KeyError):
+            _oc_p = None
+        else:
+            _oc_fresh_side = 1 if _oc_amt > 0 else 2
+            _oc_fresh_qty = abs(_oc_amt)
+            _oc_tok = ("LONG" if _oc_fresh_side == 1 else "SHORT") + ":" + str(_oc_p.get("entryPrice"))
     _oc_owned = (_oc_store is None or _oc_tok is None
                  or _oc_store.acquire(symbol, _oc_tok) == _SL_ACQ)
 
@@ -1642,21 +1829,52 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         log.info(f"  BUSY: {symbol} SL yerlestirme baska process'te - open_coin atladi, dogrulamaya birakildi")
         sr = None
         algo_id = None
+    elif _oc_fresh_qty is None or _oc_fresh_entry is None or _oc_fresh_entry <= 0:
+        # F-g: no VERIFIABLE live position -> never place a blind SL. The sl_status
+        # verification below (ABSENT/UNKNOWN) routes to the emergency close.
+        log.critical(f"  🚨 F-g: {symbol} SL için güncel pozisyon DOĞRULANAMADI — "
+                     f"kör SL GÖNDERİLMEDİ; sl_status doğrulaması + acil kapanış "
+                     f"yolu devralıyor")
+        _OPEN_UNPROTECTED[symbol] = _OPEN_UNPROTECTED.get(symbol)
+        sr = None
+        algo_id = None
+    elif not cancel_symbol_algo_sl_verified(binance, symbol):
+        # F-a (BLOK25): pre-open cleanup of leftover algo SLs is now VERIFIED —
+        # every live STOP algo order must be confirmed gone BEFORE the new SL is
+        # placed. An unverifiable cancel (outage / failed cancel / order still
+        # live) means NO new SL (fail-closed): a duplicate or wrong-epoch SL is
+        # worse than a missing one, which the verification path already owns.
+        log.critical(f"  🚨 F-a: {symbol} eski algo SL iptali DOĞRULANAMADI — yeni "
+                     f"SL GÖNDERİLMEDİ (çift/yanlış-epoch SL riski); sl_status "
+                     f"doğrulaması ve acil kapanış yolu devralıyor")
+        _OPEN_UNPROTECTED[symbol] = _OPEN_UNPROTECTED.get(symbol)
+        if _oc_store is not None and _oc_tok is not None:
+            _oc_store.release(symbol, _oc_tok)   # nothing placed -> free the intent
+        sr = None
+        algo_id = None
     else:
-        # Faz2.1 (K-1/K-2) pre-open reconciliation: cancel any leftover algo SL for this
-        # symbol (orphan from a prior/closed position) BEFORE placing the new one, so a
-        # freshly opened position can never end up with a DUPLICATE SL.
-        try:
-            for _o in binance.open_algo_orders_for(symbol):
-                _aid = _o.get("algoId")
-                if _aid:
-                    binance.cancel_algo_order(_aid)
-                    log.info(f"  pre-open: eski algo SL iptal (algoId={_aid}) - tek SL garantisi")
-        except Exception as e:
-            log.warning(f"  pre-open SL reconciliation hatasi: {e}")
-
-        sr = binance.place_algo_sl(symbol, trig, amount, side)
+        # Faz2.1 (K-1/K-2) pre-open reconciliation: verified above (F-a).
+        if _oc_fresh_side != side:
+            log.warning(f"  F-g: pozisyon yönü giriş anından farklı (giriş={side}, "
+                        f"güncel={_oc_fresh_side}) — GÜNCEL yön kullanılıyor")
+        # F-g: trigger from the FRESH entry price, qty from the FRESH position.
+        if _oc_fresh_side == 1:
+            trig = round(round((_oc_fresh_entry * (1 - sl_pct)) / tick) * tick, 8)
+        else:
+            trig = round(round((_oc_fresh_entry * (1 + sl_pct)) / tick) * tick, 8)
+        sr = binance.place_algo_sl(symbol, trig, _oc_fresh_qty, _oc_fresh_side)
         algo_id = sr.get("algoId") if isinstance(sr, dict) else None
+        # F-e (BLOK25): classify the placement result with the SAME -2021 machine
+        # as ensure_sl_coverage (note_sl_outcome). Root cause: place_algo_sl's
+        # result was never classified on the open_coin path, so a -2021 rejection
+        # could be silently treated as protected while the position sat unarmed.
+        _new_oc, _action_oc = note_sl_outcome(_OPEN_UNPROTECTED, symbol, sr)
+        _OPEN_UNPROTECTED.clear()
+        _OPEN_UNPROTECTED.update(_new_oc)
+        if _action_oc != "PROTECTED":
+            log.critical(f"  🚨 F-e: {symbol} SL yerleştirilemedi (action={_action_oc}, "
+                         f"code={_OPEN_UNPROTECTED.get(symbol)}) — OPEN_UNPROTECTED; "
+                         f"yeni giriş durduruldu")
         if _oc_store is not None and _oc_tok is not None:
             if isinstance(sr, dict) and sr.get("algoId"):
                 _oc_store.mark_placed(symbol, _oc_tok)
@@ -1673,7 +1891,12 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
     from close_adapter import BinanceHBCloseAdapter, SL_PRESENT, SL_UNKNOWN
     _sl_adapter = BinanceHBCloseAdapter(binance, None)
     _mode_ok, _mode = _verify_oneway(binance)
-    _side_str = "LONG" if side == 1 else "SHORT"
+    # F-g: verify / close against the FRESH position (side + qty), falling back to
+    # the entry-time values only when no fresh read exists (the emergency-close
+    # path still queries position_amt itself before sending anything).
+    _verify_side = _oc_fresh_side if _oc_fresh_side is not None else side
+    _verify_qty = _oc_fresh_qty if _oc_fresh_qty is not None else amount
+    _side_str = "LONG" if _verify_side == 1 else "SHORT"
     sl_verified = False
     sl_state = None
     log.info(f"  ⏳ SL emri gonderildi (algoId={algo_id}), sl_status ile dogrulaniyor...")
@@ -1681,7 +1904,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
         time.sleep(3)
         try:
             sl_state = _sl_adapter.sl_status(symbol, _side_str, mode=_mode,
-                                             position_amt=amount)
+                                             position_amt=_verify_qty)
         except Exception as e:
             log.error(f"  SL durum sorgu hatasi (API): {e}")
             sl_state = SL_UNKNOWN
@@ -1697,7 +1920,7 @@ def open_coin(binance, hb, coin, dry_run=False, risk=None, reserver=None, coordi
             # Single close authority (inc13): coordinated reduce-only close, not a
             # raw market POST — idempotent + flat-confirmed + cross-process guarded.
             coordinate_close(coordinator, binance, symbol, "SL_UNVERIFIED",
-                             side=side, amount=amount)
+                             side=_verify_side, amount=_verify_qty)
         except Exception as e:
             log.critical(f"  🚨🚨 ACIL KAPATMA BASARISIZ: {e} !!! MANUEL MUDAHALE GEREKLI !!!")
         

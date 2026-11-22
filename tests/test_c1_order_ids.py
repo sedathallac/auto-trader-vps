@@ -39,6 +39,11 @@ class FakeBinance:
     def open_orders(self, symbol):
         return list(self._open_orders)
 
+
+    def open_algo_orders_raw(self, symbol):
+        # F-a (BLOK25): no leftover algo SL in this fake's world (raw response:
+        # [] = verifiably NO algo orders, not an outage)
+        return []
     def query_order(self, symbol, order_id=None, orig_client_order_id=None):
         key = orig_client_order_id if orig_client_order_id is not None else order_id
         return dict(self._orders.get(key, {"code": -2013, "msg": "Order does not exist."}))
@@ -66,6 +71,12 @@ class FakeHB:
             return []
         return [{"trading_pair": PAIR, "status": "RUNNING", "executor_id": "E1",
                  "custom_info": {"order_ids": self._order_ids}}]
+
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        # F-b (BLOK25): compliant fake — stop POST succeeds and the executor is
+        # verifiably TERMINATED afterwards (models a healthy HB API).
+        self.stop_executor(eid, keep_position=keep_position)
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
 
     def stop_executor(self, eid, keep_position=True):
         self.stopped.append((eid, keep_position))

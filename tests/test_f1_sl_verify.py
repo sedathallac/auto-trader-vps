@@ -96,6 +96,12 @@ class FakeHB:
     def get_executor(self, eid):
         return {"filled_amount_quote": 100.0, "error_count": 0}
 
+    def stop_executor_verified(self, eid, keep_position=True, attempts=3, delay=2.0):
+        # F-b (BLOK25): compliant fake — stop POST succeeds and the executor is
+        # verifiably TERMINATED afterwards (models a healthy HB API).
+        self.stop_executor(eid, keep_position=keep_position)
+        return {"status": "TERMINATED", "outcome": "STOPPED"}
+
     def stop_executor(self, eid, keep_position=True):
         self.stopped.append((eid, keep_position))
         return {"status": "ok"}
