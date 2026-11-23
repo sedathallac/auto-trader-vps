@@ -321,7 +321,12 @@ def main():
     p.add_argument("--monitor", default=str(DEFAULT_MONITOR))
     p.add_argument("--interval", type=float, default=300.0)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--verify", action="store_true",
+                   help="gözlem zincirini doğrula ve çık")
     args = p.parse_args()
+    if args.verify:
+        print(json.dumps(verify_chain(args.monitor), indent=1, default=str))
+        return
     if args.once:
         rec = append_record(args.monitor, observe(args.results))
         print(json.dumps({"seq": rec["seq"], "hash": rec["hash"][:16]},
