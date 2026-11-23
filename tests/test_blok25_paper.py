@@ -302,11 +302,12 @@ def _mk_bars(n, start=100.0, step=1.0, ts0=T0, qv=1e7):
 
 
 class TestRunner(unittest.TestCase):
-    def _runner(self, fetcher, clock, db=None, results=None):
+    def _runner(self, fetcher, clock, db=None, results=None, **kw):
         db = db or os.path.join(tempfile.mkdtemp(), "paper.db")
         results = results or tempfile.mkdtemp()
         return PaperRunner(db, results, symbols=[SYM, OTHER],
-                           equity_start=1000.0, fetcher=fetcher, clock=clock)
+                           equity_start=1000.0, fetcher=fetcher, clock=clock,
+                           **kw)
 
     def test_first_cycle_warmup_freezes_manifest(self):
         fetcher = FakeFetcher({SYM: _mk_bars(402), OTHER: _mk_bars(402)})
@@ -382,8 +383,17 @@ class TestRunner(unittest.TestCase):
         fall = [(T0 + (402 + i) * BAR, 502.0 - i, 502.0 - i, 1e7)
                 for i in range(181)]
         fetcher._klines[OTHER] = fetcher._klines[OTHER] + fall
+        # SYM feed must stay FRESH too (production: dead feed = CRITICAL
+        # HALT). Rising bars -> SYM target stays long, no flip interference.
+        fetcher._klines[SYM] = fetcher._klines[SYM] + [
+            (T0 + (402 + i) * BAR, 502.0 + i, 502.0 + i, 1e7)
+            for i in range(181)]
         now2 = T0 + 583 * BAR + 1000
-        r2 = self._runner(fetcher, lambda: now2, db=db, results=results)
+        # backlog scenario: production default (2 bars) would rightly skip
+        # these as STALE; this test exercises flip MECHANICS over a
+        # scripted 30-day backlog, so the staleness gate is widened here.
+        r2 = self._runner(fetcher, lambda: now2, db=db, results=results,
+                          stale_bar_ms=10 ** 15)
         status = r2.cycle()
         # exactly ONE live execution, with a realistic (adverse) fill
         executed = [j for j in r2.broker.journal_rows()
@@ -418,8 +428,15 @@ class TestRunner(unittest.TestCase):
         fall = [(T0 + (402 + i) * BAR, 502.0 - i, 502.0 - i, 1e7)
                 for i in range(181)]
         fetcher._klines[OTHER] = fetcher._klines[OTHER] + fall
+        # SYM feed must stay FRESH too (production: dead feed = CRITICAL
+        # HALT). Rising bars -> SYM target stays long, no flip interference.
+        fetcher._klines[SYM] = fetcher._klines[SYM] + [
+            (T0 + (402 + i) * BAR, 502.0 + i, 502.0 + i, 1e7)
+            for i in range(181)]
         now2 = T0 + 583 * BAR + 1000
-        r2 = self._runner(fetcher, lambda: now2, db=db)
+        # backlog scenario: staleness gate widened (see live-flip test)
+        r2 = self._runner(fetcher, lambda: now2, db=db,
+                          stale_bar_ms=10 ** 15)
         r2.cycle()                                  # the flip executes
         pos_before = r2.broker._position(OTHER)
         # RESTART: a fresh process over the same ledger
@@ -447,8 +464,15 @@ class TestRunner(unittest.TestCase):
         fall = [(T0 + (402 + i) * BAR, 502.0 - i, 502.0 - i, 1e7)
                 for i in range(181)]
         fetcher._klines[OTHER] = fetcher._klines[OTHER] + fall
+        # SYM feed must stay FRESH too (production: dead feed = CRITICAL
+        # HALT). Rising bars -> SYM target stays long, no flip interference.
+        fetcher._klines[SYM] = fetcher._klines[SYM] + [
+            (T0 + (402 + i) * BAR, 502.0 + i, 502.0 + i, 1e7)
+            for i in range(181)]
         now2 = T0 + 583 * BAR + 1000
-        r2 = self._runner(fetcher, lambda: now2, db=db)
+        # backlog scenario: staleness gate widened (see live-flip test)
+        r2 = self._runner(fetcher, lambda: now2, db=db,
+                          stale_bar_ms=10 ** 15)
         r2.cycle()
         # the SHORT position received the positive funding rate
         rows = r2.broker.funding_rows()
