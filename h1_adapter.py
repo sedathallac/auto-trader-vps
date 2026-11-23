@@ -100,6 +100,7 @@ class H1Decision:
     notional: Optional[float] = None   # filled by the risk layer (§9 sizing)
     execution_ts: Optional[int] = None  # the bar whose OPEN executed it
     ref_price: Optional[float] = None   # that open (the reference order price)
+    signal_price: Optional[float] = None  # the DECISION bar close
 
 
 def h1_target_notional(equity: Optional[float],
@@ -126,7 +127,8 @@ class H1SignalEngine:
       dir        CURRENT target direction (advances when a pending flip is
                  popped by begin_bar — the target state, independent of
                  whether the executor actually moved the book)
-      pend/pend_vol/pend_bar_ts  the flip scheduled for the next bar open
+      pend/pend_vol/pend_bar_ts/pend_price  the flip scheduled for the next
+                                            bar open (price = decision close)
       closes     close history (indexing mirrors h1_engine's data[s][i-N])
       n          bars seen (h1_engine's bidx)
       target_notional  last §9 notional the router sized for this symbol
@@ -137,6 +139,7 @@ class H1SignalEngine:
         self.lookback = LOOKBACK
         self._st = {s: {"var": None, "prev_close": None, "dir": 0,
                         "pend": 0, "pend_vol": 0.0, "pend_bar_ts": None,
+                        "pend_price": None,
                         "closes": [], "n": 0, "target_notional": None}
                     for s in self.symbols}
 
@@ -183,6 +186,7 @@ class H1SignalEngine:
             d = H1Decision(symbol=symbol, bar_ts=S["pend_bar_ts"],
                            direction=S["pend"],
                            sigma_i=S["pend_vol"],
+                           signal_price=S["pend_price"],
                            signal_hash=h1_signal_hash(symbol, S["pend_bar_ts"],
                                                       S["pend"], S["pend_vol"]))
             S["dir"] = S["pend"]
@@ -214,8 +218,9 @@ class H1SignalEngine:
                 S["pend"] = sig
                 S["pend_vol"] = math.sqrt(S["var"]) * ANN
                 S["pend_bar_ts"] = bar_ts
+                S["pend_price"] = close_px
                 return H1Decision(symbol=symbol, bar_ts=bar_ts, direction=sig,
-                                  sigma_i=S["pend_vol"],
+                                  sigma_i=S["pend_vol"], signal_price=close_px,
                                   signal_hash=h1_signal_hash(symbol, bar_ts,
                                                              sig, S["pend_vol"]))
             S["pend"] = 0
@@ -340,7 +345,7 @@ class H1Router:
 
     def __init__(self, engine: H1SignalEngine, checklist, executor, world,
                  reconciler=None, require_reconciliation: bool = True,
-                 execute: bool = True):
+                 execute: bool = True, journal_sink=None):
         self.engine = engine
         self.checklist = checklist
         self.executor = executor
@@ -348,6 +353,9 @@ class H1Router:
         self.reconciler = reconciler or H1Reconciler()
         self.require_reconciliation = require_reconciliation
         self.execute = execute
+        # optional durable sink (e.g. the paper ledger): every journal entry
+        # is forwarded so measurement items survive restarts
+        self.journal_sink = journal_sink
         # symbols whose target/actual divergence is EXPLAINED by a journaled
         # BLOCKED/MISSED decision (reported by recon, does not gate new trades)
         self._explained_drift = set()
@@ -435,6 +443,7 @@ class H1Router:
             "label": STRATEGY_LABEL,
             "symbol": decision.symbol,
             "bar_ts": decision.bar_ts,          # signal (decision) time
+            "signal_price": decision.signal_price,   # the decision bar close
             "execution_ts": decision.execution_ts,   # execution bar open time
             "ref_price": decision.ref_price,    # the execution open price
             "direction": decision.direction,
@@ -452,6 +461,11 @@ class H1Router:
                              if d is not None else None),
             "executor_result": result,
         })
+        if self.journal_sink is not None:
+            try:
+                self.journal_sink(self.journal[-1])
+            except Exception:
+                pass               # a sink failure must never break trading
 
     # ---- the bar -----------------------------------------------------------
     def run_bar(self, symbol, bar_ts, open_px, close_px, execute=None):
@@ -471,6 +485,10 @@ class H1Router:
             if execute:
                 self._execute(pend, open_px)
             else:
+                # history replay: the target advances but the paper book does
+                # not — mark the divergence EXPLAINED so the recon gate does
+                # not treat the warmup book as unexplained drift
+                self._explained_drift.add(pend.symbol)
                 self._record(pend, None, "WARMUP_SKIPPED",
                              "history replay: no execution, no dedup "
                              "consumption")
