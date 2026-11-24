@@ -42,7 +42,7 @@ class LoopTests(unittest.TestCase):
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.05)
+        self.ex.set_mark("ETHUSDT", 95.05)
         cyc = self.lc.risk_tick()                 # TEK risk tick yeter
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -54,7 +54,7 @@ class LoopTests(unittest.TestCase):
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.05, ts=self.clock() - 5_000)
+        self.ex.set_mark("ETHUSDT", 95.05, ts=self.clock() - 5_000)
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -63,15 +63,17 @@ class LoopTests(unittest.TestCase):
         """30s eşiği (PROVIZYONEL): 29s → hesap yapılır; 31s → fail-closed."""
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
-        # 29s: eşik içi → loss hesaplanır (90.05 → SAFE_EXIT)
-        self.ex.set_mark("ETHUSDT", 90.05, ts=self.clock() - 29_000)
+        # 29s: eşik içi → loss hesaplanır (95.05 → -5.00 → SAFE_EXIT)
+        self.ex.set_mark("ETHUSDT", 95.05, ts=self.clock() - 29_000)
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
-        # yeni pozisyon + 31s: eşik dışı → FAIL_CLOSED_NO_DATA
+        self.assertEqual(self.lc.rm._pos(rec["pos_id"])["status"], "CLOSED")
+        # BLOK29.1 (100/100): ETH kapandı → bütçe boşaldı → yeni pozisyon
+        # açılabilir; 31s: eşik dışı → FAIL_CLOSED_NO_DATA
         rec2 = open_one(self.lc, "SOLUSDT", 1, bar_ts=T0 + 2 * BAR)
         self.ex.algos["C281P2"]["status"] = "CANCELED"
-        self.ex.set_mark("SOLUSDT", 90.05, ts=self.clock() - 31_000)
+        self.ex.set_mark("SOLUSDT", 95.05, ts=self.clock() - 31_000)
         cyc2 = self.lc.risk_tick()
         self.assertIn({"pos_id": rec2["pos_id"],
                        "action": "FAIL_CLOSED_NO_DATA"}, cyc2["risk_actions"])
@@ -134,6 +136,13 @@ class LoopTests(unittest.TestCase):
         rec = lc2.startup_reconcile()
         self.assertEqual(rec["result"], "OK")
         lc2.risk_tick()
+        # BLOK29.1 (100/100): ETH long açıkken ikinci tam-boyut giriş toplam
+        # kapısına takılır — ETH'yi borsa stop'uyla kapat (mark 95.05 <
+        # stop 95.10), bütçe boşalınca giriş SERBEST
+        self.clock.advance(10_000)
+        self.ex.set_mark("ETHUSDT", 95.05)
+        lc2.risk_tick()
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         out2 = lc2.try_entry("SOLUSDT", 1, 100.0, T0 + 3 * BAR,
                              self.clock())
         self.assertEqual(out2[0]["result"], "FILLED")

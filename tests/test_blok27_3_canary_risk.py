@@ -2,7 +2,7 @@
 
 Görev §5'in istediği testler:
   - 0, 1, 2 ve 3. pozisyon sınırları
-  - 50 USDT pozisyon notional sınırı
+  - 100 USDT pozisyon notional sınırı (BLOK29.1: eski 50)
   - 100 USDT toplam notional sınırı
   - -5 USDT pozisyon zarar tetiklemesi (SAFE_EXIT, yeni risk yok)
   - -10 USDT toplam zarar HALT tetiklemesi (kalıcı)
@@ -67,14 +67,15 @@ class TestPositionCountLimits(unittest.TestCase):
 
 
 class TestNotionalLimits(unittest.TestCase):
-    def test_position_notional_50_usdt(self):
-        """50.00 izin; 50.01 reddedilir (notional, marjin değil)."""
+    def test_position_notional_100_usdt(self):
+        """BLOK29.1 (2026-11-25): 100.00 izin; 100.01 reddedilir (notional,
+        marjin değil — eski sınır 50 idi)."""
         rm = _rm()
         _fresh(rm)
-        r = rm.check_order(SYM, 1, 50.0, now_ms=T0)
+        r = rm.check_order(SYM, 1, 100.0, now_ms=T0)
         self.assertTrue(r["allowed"])
         with self.assertRaises(OrderRejected) as cm:
-            rm.check_order(SYM, 1, 50.01, now_ms=T0)
+            rm.check_order(SYM, 1, 100.01, now_ms=T0)
         self.assertIn("pozisyon notional", str(cm.exception))
 
     def test_total_notional_100_usdt_current_price(self):
@@ -92,7 +93,7 @@ class TestNotionalLimits(unittest.TestCase):
         self.assertIn("toplam notional", str(cm.exception))
 
     def test_leverage_cannot_bypass_notional(self):
-        """Kaldıraç 50 USDT notional sınırını AŞAMAZ: kontrol notional
+        """Kaldıraç pozisyon notional sınırını AŞAMAZ: kontrol notional
         üzerinden yapılır (marjin kavramı yok)."""
         rm = _rm()
         _fresh(rm)

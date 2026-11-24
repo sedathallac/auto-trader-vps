@@ -116,10 +116,14 @@ class OutageTests(unittest.TestCase):
             "SELECT kind FROM risk_events WHERE kind='FEED_RECOVERED'"
         ).fetchall()]
         self.assertGreaterEqual(len(evs), 1)
-        # mutabakat tamamlandı → giriş serbest
+        # mutabakat tamamlandı → kesinti/mutabakat blocker'ı KALKTI: giriş
+        # blocker'lardan geçer. BLOK29.1 (100/100): ETH tam bütçeyi tuttuğu
+        # için ikinci giriş artık toplam-notional kapısından reddedilir —
+        # REJECTED (BLOCKED değil) = outage/reconcile kapısının açıldığının
+        # kanıtı.
         out = self.lc.try_entry("SOLUSDT", 1, 100.0, T0 + 2 * BAR,
                                 self.clock())
-        self.assertEqual(out[0]["result"], "FILLED")
+        self.assertTrue(out[0]["result"].startswith("REJECTED: toplam notional"))
 
     def test_recovery_positionrisk_still_down_entries_blocked(self):
         """Feed döndü ama positionRisk hâlâ okunamıyor → mutabakat
@@ -145,9 +149,12 @@ class OutageTests(unittest.TestCase):
         self.assertIn("mutabakat bekleniyor", " ".join(out[0]["blockers"]))
         self.ex.position_risk = orig
         self.lc.risk_tick()                          # mutabakat tamam
+        # BLOK29.1 (100/100): mutabakat blocker'ı kalktı → giriş blocker'ları
+        # geçer; reddi artık yalnız toplam-notional kapısından gelir
         out2 = self.lc.try_entry("SOLUSDT", 1, 100.0, T0 + 3 * BAR,
                                  self.clock())
-        self.assertEqual(out2[0]["result"], "FILLED")
+        self.assertTrue(out2[0]["result"].startswith(
+            "REJECTED: toplam notional"))
 
     def test_stale_state_survives_restart(self):
         """Kesinti ortasında restart: yeni süreç feed_down_ts görür →
@@ -185,7 +192,8 @@ class OutageTests(unittest.TestCase):
         self.ex.outage = True
         self.clock.advance(60_000)                  # trade ts > entry ts
         # borsa bağımsız davranır: mark stop altına düşer → tetiklenir
-        self.ex.set_mark("ETHUSDT", 90.03)          # auto_trigger yok ama:
+        # (BLOK29.1: stop 95.10 — 100 notional'da -5 bütçesi ~%5 mesafe)
+        self.ex.set_mark("ETHUSDT", 95.03)          # auto_trigger yok ama:
         self.ex._check_triggers()                   # borsa kendi kuralı
         self.assertEqual(self.ex.algos["C281P1"]["algoStatus"], "TRIGGERED")
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
@@ -195,11 +203,11 @@ class OutageTests(unittest.TestCase):
         # geri dönüş → mutabakat → çözüm
         self.ex.outage = False
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.03)
+        self.ex.set_mark("ETHUSDT", 95.03)
         cyc = self.lc.risk_tick()
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "CLOSED")   # stop fill'den çözüldü
-        self.assertAlmostEqual(pos["exit_px"], 90.10, places=6)
+        self.assertAlmostEqual(pos["exit_px"], 95.10, places=6)
         self.assertEqual(self.lc._live_pos_row(rec["pos_id"])
                          ["protection_status"], "PROTECTION_TRIGGERED")
         # kör dönemde market çıkış POST EDİLMEDİ (stop yeterliydi)

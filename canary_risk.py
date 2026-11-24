@@ -1,8 +1,9 @@
 """canary_risk.py — BLOK27.3: bağımsız, merkezî Canary RiskManager.
 
-Operatör onaylı KESİN sınırlar (2026-11-23, görev metninden):
+Operatör onaylı KESİN sınırlar (2026-11-23 görev metni; BLOK29.1 güncellemesi
+2026-11-25: pozisyon başına notional 50 → 100 USDT, diğerleri DEĞİŞMEDİ):
   MAX_OPEN_POSITIONS      = 2      # eş zamanlı açık pozisyon
-  MAX_POSITION_NOTIONAL   = 50.0   # USDT, pozisyon NOTIONAL değeri (marjin DEĞİL)
+  MAX_POSITION_NOTIONAL   = 100.0  # USDT, pozisyon NOTIONAL değeri (marjin DEĞİL)
   MAX_TOTAL_NOTIONAL      = 100.0  # USDT, toplam açık notional
   MAX_POSITION_NET_LOSS   = 5.0    # -5 USDT: o pozisyon için yeni risk YOK + güvenli çıkış
   MAX_CANARY_NET_LOSS     = 10.0   # -10 USDT: CANARY_RISK_HALTED (yalnız operatör sıfırlar)
@@ -32,7 +33,7 @@ import time
 from typing import Optional
 
 MAX_OPEN_POSITIONS = 2
-MAX_POSITION_NOTIONAL = 50.0
+MAX_POSITION_NOTIONAL = 100.0       # BLOK29.1 (2026-11-25): 50 → 100
 MAX_TOTAL_NOTIONAL = 100.0
 MAX_POSITION_NET_LOSS = 5.0
 MAX_CANARY_NET_LOSS = 10.0
@@ -272,7 +273,7 @@ class RiskManager:
             if not existing and len(opens) >= MAX_OPEN_POSITIONS:
                 raise OrderRejected(f"pozisyon sınırı: {len(opens)} açık, "
                                     "üçüncü pozisyona izin YOK")
-            # 2: pozisyon notional (50 USDT notional — marjin değil)
+            # 2: pozisyon notional (100 USDT notional — marjin değil)
             if notional > MAX_POSITION_NOTIONAL + 1e-9:
                 raise OrderRejected(f"pozisyon notional {notional:.2f} > "
                                     f"{MAX_POSITION_NOTIONAL} USDT")

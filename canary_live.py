@@ -52,7 +52,10 @@ from h1_adapter import H1SignalEngine
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "BNBUSDT", "DOGEUSDT",
            "LINKUSDT", "SOLUSDT", "XRPUSDT"]
-CANARY_NOTIONAL = 50.0               # operatör: pozisyon başına hedef notional
+# BLOK29.1 (2026-11-25): hedef notional TEK MERKEZİ KAYNAK'TAN türetilir —
+# canary_risk.MAX_POSITION_NOTIONAL (100 USDT). Burada ayrı sayı YOKTUR;
+# operatör limiti değişirse yalnızca canary_risk.py güncellenir.
+CANARY_NOTIONAL = MAX_POSITION_NOTIONAL
 
 # ---- PROVIZYONEL politika parametreleri (operatör onayı bekliyor — §14) ----
 MARK_STALE_AFTER_SECONDS = MARK_STALE_S          # 30s (BLOK28.0'dan devralınan)
@@ -497,9 +500,10 @@ class LiveCanary:
         return reasons
 
     def _sizing(self, symbol, ref_px, notional=CANARY_NOTIONAL):
-        """Qty hesabı: stepSize'a aşağı yuvarla; minQty/minNotional ve 50
-        USDT operatör limiti içinde değilse None + neden (§7: keyfi seçim
-        YOK — borsa filtresi izin vermiyorsa giriş engellenir)."""
+        """Qty hesabı: stepSize'a aşağı yuvarla; minQty/minNotional ve
+        MAX_POSITION_NOTIONAL operatör limiti içinde değilse None + neden
+        (§7: keyfi seçim YOK — borsa filtresi izin vermiyorsa giriş
+        engellenir)."""
         f = self.filters.get(symbol)
         if not f or not ref_px:
             return None, f"{symbol} filtre bilgisi yok"
@@ -510,7 +514,8 @@ class LiveCanary:
         qty = round(qty, 12)
         if qty < min_qty:
             return None, (f"{symbol} minQty {min_qty} > hesaplanan {qty} "
-                          "(50 USDT limiti içinde boyutlanamıyor)")
+                          f"({MAX_POSITION_NOTIONAL} USDT limiti içinde "
+                          "boyutlanamıyor)")
         actual = qty * ref_px
         if actual < min_notional:
             return None, (f"{symbol} minNotional {min_notional} > {actual:.2f}")

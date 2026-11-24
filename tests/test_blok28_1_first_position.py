@@ -135,13 +135,18 @@ class FirstPositionTests(unittest.TestCase):
             self.ex.set_mark(s, 100.0)
         self.lc.risk_tick()
         self.assertEqual(self.lc._get_state("first_position_verified"), "1")
-        # artık ikinci giriş serbest (bloklu deneme dir=1'e ilerlettiği
-        # için retry flip'i ters yönde — begin_bar yalnız dir≠pend'i patlatır)
+        # BLOK29.1 (100/100): ilk-pozisyon kapısı kalktı — giriş artık
+        # blocker'lardan geçer ve boyutlandırma SONRASI toplam-notional
+        # kapısından reddedilir (bloklu deneme dir=1'e ilerlettiği için
+        # retry flip'i ters yönde — begin_bar yalnız dir≠pend'i patlatır)
         now3 = T0 + 4 * BAR
         self._fresh_marks(now3)
         out3 = self._flip("LINKUSDT", -1, T0 + 3 * BAR, now3)
-        self.assertEqual(out3[0]["result"], "FILLED")
-        self.assertEqual(len(self.lc.rm.open_positions()), 2)
+        self.assertEqual(out3[0]["result"], "REJECTED: toplam notional "
+                                           "200.00 > 100.0 USDT")
+        self.assertNotIn("ilk pozisyonun fill+koruma doğrulaması",
+                         str(out3[0].get("blockers")))
+        self.assertEqual(len(self.lc.rm.open_positions()), 1)
 
     # ---- sinyal dedup (§7: aynı sinyal ikinci kez emir oluşturamaz) -------------------
 
@@ -170,9 +175,11 @@ class FirstPositionTests(unittest.TestCase):
 
     # ---- eşzamanlı flip'ler: deterministik seçim + maks 2 ------------------------------
 
-    def test_three_same_bar_flips_chronological_max_two(self):
+    def test_three_same_bar_flips_chronological_total_cap(self):
         """8 sinyal durumunun minimal örneği: aynı barda 3 flip — kronolojik
-        (bar_ts, symbol) sırayla işlenir, ilk 2 dolar, üçüncüsü ret."""
+        (bar_ts, symbol) sırayla işlenir. BLOK29.1 (100/100): ilk flip
+        bütçenin tamamını (100) kullanır; kalan flip'ler toplam-notional
+        kapısından reddedilir. Kronoloji sonuç sırasıyla kanıtlanır."""
         self._warmup(T0)
         now = T0 + 2 * BAR
         self._fresh_marks(now)
@@ -180,13 +187,13 @@ class FirstPositionTests(unittest.TestCase):
             self._inject_pend(s, 1, T0)
         kl = {s: [(T0 + BAR, 100.0, 101.0, 1.0)] for s in FLIP_SYMS}
         out = self.lc.strategy_tick(now_ms=now, klines_by_sym=kl)
+        # kronolojik işlenme sırası: ETHUSDT < LINKUSDT < SOLUSDT
+        self.assertEqual([r["symbol"] for r in out], list(FLIP_SYMS))
         results = {r["symbol"]: r["result"] for r in out}
-        # kronolojik sıra: ETHUSDT < LINKUSDT < SOLUSDT
         self.assertEqual(results["ETHUSDT"], "FILLED")
-        self.assertEqual(results["LINKUSDT"], "FILLED")
-        self.assertIn("pozisyon sınırı", results["SOLUSDT"])
-        self.assertIn("üçüncü pozisyona izin YOK", results["SOLUSDT"])
-        self.assertEqual(len(self.lc.rm.open_positions()), 2)
+        self.assertIn("toplam notional", results["LINKUSDT"])
+        self.assertIn("toplam notional", results["SOLUSDT"])
+        self.assertEqual(len(self.lc.rm.open_positions()), 1)
         total = self.lc.rm.total_notional(now)
         self.assertLessEqual(total, 100.0 + 1e-9)
 
@@ -215,8 +222,8 @@ class FirstPositionTests(unittest.TestCase):
         # flip AÇILIŞI: short giriş aynı bar açılışında
         self.assertEqual(out2[0]["result"], "FILLED")
         self.assertEqual(out2[0]["direction"], -1)
-        # ters pozisyon YOK — borsada tek (short) pozisyon
-        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], -0.5)
+        # ters pozisyon YOK — borsada tek (short) pozisyon (qty 1.0 @100)
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], -1.0)
         self.assertEqual(len(self.lc.rm.open_positions()), 1)
 
 

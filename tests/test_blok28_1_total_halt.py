@@ -1,21 +1,23 @@
 """BLOK28.1 §11 — TOPLAM HALT TESTLERİ (mock/fixture; ağ çağrısı YOK).
 
--10 USDT toplam zarar eşiği (§3): -9.99 / -10.00 sınırları, iki pozisyonun
-da çıkışı, UNKNOWN emir varken HALT'in DEVAM etmesi, kısmi kalan, restart
+-10 USDT toplam zarar eşiği (§3): eşik altı / -10.00 sınırı, pozisyonun
+çıkışı, UNKNOWN emir varken HALT'in DEVAM etmesi, kısmi kalan, restart
 korunumu, operatör onayı olmadan giriş yasağı, yalnız C281-sahipli giriş
-emirlerinin iptali, UNKNOWN girişin geç fill'inin HALT sırasında deftere
-işlenip çıkışa alınması.
+emirlerinin iptali, UNKNOWN girişin geç fill'inin deftere işlenip çıkışa
+alınması.
 
 State machine (§3): CANARY_ACTIVE → CANARY_HALT_INTENT → CANARY_RISK_HALTED
 → CANARY_EXITING_ALL → CANARY_EXIT_RECONCILIATION → CANARY_FLAT_VERIFIED →
 CANARY_HALT_LOCKED (yalnız operatör).
 
-Matematik: ETH+SOL her biri qty 0.5 @100, komisyon 0.025/yan.
-  tek pozisyon mark 90.05 → -5.00 | 90.06 → -4.995
-  iki pozisyon 90.06 → toplam -9.99 (HALT YOK)
-  iki pozisyon 90.05 → toplam -10.00 (HALT)
-Stop'lar 90.10'da olduğundan eşik testlerinde korumalar dışarıdan iptal
-edilir (borsa stop'u önce atlar; -10 gap senaryosu ayrıca test edilir).
+Matematik (BLOK29.1, 100/100): tek ETH pozisyonu qty 1.0 @100, komisyon
+0.05/yan. İkinci tam-boyut giriş toplam kapıdan reddedildiğinden eşik
+testleri TEK pozisyonla yapılır:
+  mark 95.06 → pozisyon -4.99 (eşik altı, çıkış YOK, HALT YOK)
+  mark 90.05 → pozisyon -10.00 (toplam -10 → HALT)
+  mark 80.00 → gap: -20.05 (limitler TETİK, cap değil)
+Stop 95.10'da olduğundan eşik testlerinde koruma dışarıdan iptal edilir
+(borsa stop'u önce atlar; -10 gap senaryosu ayrıca test edilir).
 """
 import os
 import sys
@@ -49,13 +51,11 @@ class TotalHaltTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _open_two(self):
-        """ETH + SOL: her biri 50 USDT notional, FILLED + PROTECTED."""
+    def _open_one(self):
+        """ETH: 100 USDT notional (BLOK29.1), FILLED + PROTECTED."""
         r1 = open_one(self.lc, "ETHUSDT", 1)
-        r2 = open_one(self.lc, "SOLUSDT", 1)
         self.assertEqual(r1["result"], "FILLED")
-        self.assertEqual(r2["result"], "FILLED")
-        return r1, r2
+        return r1
 
     def _drive_halt_chain(self, max_ticks=12):
         """risk_tick'lerle LOCKED'a kadar sürükle; durumu döndür."""
@@ -72,15 +72,15 @@ class TotalHaltTests(unittest.TestCase):
         ).fetchall()
         return [r[0] for r in rows]
 
-    # ---- §11: -9.99 / -10.00 eşikleri ---------------------------------------
+    # ---- §11: eşik altı / -10.00 eşiği ---------------------------------------
 
-    def test_total_minus_9_99_no_halt(self):
-        self._open_two()
+    def test_below_threshold_no_exit_no_halt(self):
+        """BLOK29.1 (100/100, tek pozisyon): mark 95.06 → pozisyon -4.99:
+        -5 çıkış tetiği YOK, -10 toplam HALT YOK."""
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.06)     # her pozisyon -4.995
-        self.ex.set_mark("SOLUSDT", 90.06)
+        self.ex.set_mark("ETHUSDT", 95.06)     # pozisyon -4.99
         cyc = self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_ACTIVE)
         self.assertEqual(self.lc.halt_state, HALT_ACTIVE)
@@ -89,26 +89,22 @@ class TotalHaltTests(unittest.TestCase):
             self.assertEqual(p["status"], "OPEN")
 
     def test_total_minus_10_00_halts_and_exits_all_positions(self):
-        r1, r2 = self._open_two()
+        r1 = self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.05)     # her pozisyon -5.00
-        self.ex.set_mark("SOLUSDT", 90.05)
+        self.ex.set_mark("ETHUSDT", 90.05)     # pozisyon -10.00 → toplam -10
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_HALTED)
         self.assertNotEqual(self.lc.halt_state, HALT_ACTIVE)
         # zincir LOCKED'a kadar ilerler
         state = self._drive_halt_chain()
         self.assertEqual(state, HALT_LOCKED)
-        # İKİ pozisyon da CLOSED + borsada flat (positionRisk ile)
-        for rec in (r1, r2):
-            pos = self.lc.rm._pos(rec["pos_id"])
-            self.assertEqual(pos["status"], "CLOSED")
-            self.assertEqual(self.lc._live_pos_row(rec["pos_id"])
-                             ["exit_status"], "EXIT_CONFIRMED")
-        for s in ("ETHUSDT", "SOLUSDT"):
-            self.assertEqual(self.ex.positions[s]["positionAmt"], 0.0)
+        # pozisyon CLOSED + borsada flat (positionRisk ile)
+        pos = self.lc.rm._pos(r1["pos_id"])
+        self.assertEqual(pos["status"], "CLOSED")
+        self.assertEqual(self.lc._live_pos_row(r1["pos_id"])
+                         ["exit_status"], "EXIT_CONFIRMED")
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         # state machine sırası
         joined = " ".join(self._halt_transitions())
         for st in (HALT_INTENT, HALT_RISK, HALT_EXITING_ALL, HALT_RECON,
@@ -116,14 +112,12 @@ class TotalHaltTests(unittest.TestCase):
             self.assertIn(st, joined)
 
     def test_gap_slippage_can_exceed_minus_10_limits_are_triggers(self):
-        """§0: limitler TETİK, cap değil. 90dk gap'te stop 90.10'da ama mark
+        """§0: limitler TETİK, cap değil. Gap'te stop 95.10'da ama mark
         80'e düşerse SAFE_EXIT market 80'den dolar → toplam -10'u aşabilir."""
-        r1, r2 = self._open_two()
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(60_000)
-        self.ex.set_mark("ETHUSDT", 80.0)      # gap: -10.025 tek başına
-        self.ex.set_mark("SOLUSDT", 80.0)
+        self.ex.set_mark("ETHUSDT", 80.0)      # gap: -20.05 tek başına
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_HALTED)
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
@@ -134,18 +128,16 @@ class TotalHaltTests(unittest.TestCase):
     # ---- §11: UNKNOWN varken HALT devam eder ----------------------------------
 
     def test_halt_continues_while_exit_unknown(self):
-        r1, _ = self._open_two()
+        r1 = self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.ex.no_apply_timeouts.add("C281X1n1")   # ETH çıkışı UNKNOWN
-        self.lc.risk_tick()                          # HALT + SOL çıkışı tamam
+        self.lc.risk_tick()                          # HALT + çıkış UNKNOWN
         # UNKNOWN hâlâ çözülmedi: LOCKED'a GEÇİLEMEZ, ETH borsada AÇIK
         self.assertNotEqual(self.lc.halt_state, HALT_LOCKED)
         self.assertNotEqual(self.lc.halt_state, HALT_FLAT_VERIFIED)
-        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.5)
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 1.0)
         # çözüm zinciri: sorgu (-2011) → doğrulanmış kalan → YENİ intent
         # (körlemesine aynı emri tekrar DEĞİL) → kapanır → LOCKED
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
@@ -156,15 +148,13 @@ class TotalHaltTests(unittest.TestCase):
         self.assertEqual(eth_exits, ["C281X1n1", "C281X1n2"])
 
     def test_halt_partial_exit_remainder_before_locked(self):
-        r1, _ = self._open_two()
+        r1 = self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.ex.partial_fill_qty["C281X1n1"] = 0.2    # ETH çıkışı kısmi
         self.lc.risk_tick()
-        # kalan 0.3 kapanmadan LOCKED YOK
+        # kalan 0.8 kapanmadan LOCKED YOK
         for _ in range(3):
             self.clock.advance(10_000)
             self.lc.risk_tick()
@@ -181,12 +171,10 @@ class TotalHaltTests(unittest.TestCase):
     # ---- §11: restart korunumu + operatör kilidi --------------------------------
 
     def test_restart_preserves_halt_and_blocks_entries(self):
-        r1, r2 = self._open_two()
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.lc.risk_tick()
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
         # RESTART: aynı DB üzerinde yeni instance
@@ -214,12 +202,10 @@ class TotalHaltTests(unittest.TestCase):
         self.assertEqual(lc2.halt_state, HALT_LOCKED)
 
     def test_no_entry_after_halt_without_operator_release(self):
-        self._open_two()
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.lc.risk_tick()
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
         out = self.lc.try_entry("LINKUSDT", 1, 100.0, T0 + 9 * BAR,
@@ -240,12 +226,10 @@ class TotalHaltTests(unittest.TestCase):
             "type": "LIMIT", "status": "NEW", "executedQty": "0",
             "avgPrice": "0", "clientOrderId": "OTHERBOT9",
             "reduceOnly": False, "fills": []}
-        self._open_two()
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.lc.risk_tick()
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
         # başka botun emrine DOKUNULMADI (sahiplik kanıtı yok)
@@ -253,12 +237,10 @@ class TotalHaltTests(unittest.TestCase):
 
     def test_halt_unowned_position_noted_not_touched(self):
         self.ex.set_position("XRPUSDT", 100.0, 1.0)   # canary dışı pozisyon
-        r1, _ = self._open_two()
+        self._open_one()
         cancel_protection(self.ex, "C281P1")
-        cancel_protection(self.ex, "C281P2")
         self.clock.advance(10_000)
         self.ex.set_mark("ETHUSDT", 90.05)
-        self.ex.set_mark("SOLUSDT", 90.05)
         self.lc.risk_tick()
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
         # canary dışı pozisyon DOKUNULMADI
@@ -271,12 +253,16 @@ class TotalHaltTests(unittest.TestCase):
     # ---- §3: UNKNOWN girişin geç fill'i HALT sırasında deftere işlenir ----------
 
     def test_halt_resolves_unknown_entry_late_fill_and_exits_it(self):
+        """BLOK29.1 (100/100): ikinci tam-boyut giriş toplam kapıdan
+        reddedildiğinden senaryo tek pozisyonda: UNKNOWN giriş çözülür
+        (defter + koruma), ardından -10 HALT çıkışıyla kapatılır —
+        geç fill asla borsada sahipsiz kalmaz."""
         # 1. giriş: ETH — timeout ile UYGULANIR ama sonuç bilinmez
         self.ex.timeout_client_ids.add("C281E1")
         rec1 = open_one(self.lc, "ETHUSDT", 1)
         self.assertIn("ENTRY_UNKNOWN", rec1["result"])
-        # borsada 0.5 ETH pozisyonu VAR, defterde YOK
-        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.5)
+        # borsada 1.0 ETH pozisyonu VAR, defterde YOK
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 1.0)
         self.assertEqual(len(self.lc.rm.open_positions()), 0)
         # risk tick UNKNOWN girişi ÇÖZER: sorgu → FILLED → defter + koruma
         self.clock.advance(10_000)
@@ -286,16 +272,12 @@ class TotalHaltTests(unittest.TestCase):
         self.assertEqual(o["status"], "FILLED")
         self.assertEqual(self.lc._live_pos_row(o["pos_id"])
                          ["protection_status"], "PROTECTED")
-        # 2. giriş: SOL — normal, korumalı
-        rec2 = open_one(self.lc, "SOLUSDT", 1)
-        self.assertEqual(rec2["result"], "FILLED")
-        # SOL'u -10 tetiğiyle HALT'e götür (tek pozisyon -10.025 ≥ -10)
-        cancel_protection(self.ex, "C281P2")
+        # HALT'e götür: tek pozisyon -10.00 (mark 90.05) ≥ -10
+        cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("SOLUSDT", 80.0)
+        self.ex.set_mark("ETHUSDT", 90.05)
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_HALTED)
-        # HALT zinciri: UNKNOWN girişi ÇÖZER (sorgu → FILLED → defter + çıkış)
         self.assertEqual(self._drive_halt_chain(), HALT_LOCKED)
         # geç fill deftere işlendi VE çıkışla kapatıldı
         rows = self.lc.rm.db.execute(
@@ -304,7 +286,6 @@ class TotalHaltTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1], "CLOSED")
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
-        self.assertEqual(self.lc.rm._pos(rec2["pos_id"])["status"], "CLOSED")
         o = self.lc._order_row("C281E1")
         self.assertEqual(o["status"], "FILLED")
         self.assertIsNotNone(o["pos_id"])

@@ -56,7 +56,7 @@ class ProtectionTests(unittest.TestCase):
         self.assertEqual(a["side"], "SELL")             # long → SELL stop
         self.assertEqual(a["workingType"], "MARK_PRICE")
         self.assertEqual(a["closePosition"], "true")
-        self.assertEqual(float(a["triggerPrice"]), 90.10)
+        self.assertEqual(float(a["triggerPrice"]), 95.10)
         # kalıcı intent + exchange ID + pos_id bağı
         o = self.lc._order_row("C281P1")
         self.assertEqual(o["kind"], "PROTECTION")
@@ -67,11 +67,17 @@ class ProtectionTests(unittest.TestCase):
         self.assertEqual(lp["protection_status"], "PROTECTED")
         self.assertEqual(lp["protection_client_id"], "C281P1")
         self.assertEqual(self.lc._get_state("first_position_verified"), "1")
-        # short pozisyon: BUY stop, entry üstünde
+        # BLOK29.1 (100/100): ikinci pozisyon ancak ilki kapandıktan sonra
+        # açılabilir — ETH long'u borsa stop'uyla kapat (mark 95.05 < 95.10)
+        self.clock.advance(10_000)
+        self.ex.set_mark("ETHUSDT", 95.05)
+        self.lc.risk_tick()
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
+        # short pozisyon: BUY stop, entry üstünde (100 + 4.90 = 104.90)
         rec2 = open_one(self.lc, "SOLUSDT", -1, bar_ts=T0 + 2 * BAR)
         a2 = self.ex.algos[f"C281P{rec2['pos_id']}"]
         self.assertEqual(a2["side"], "BUY")
-        self.assertEqual(float(a2["triggerPrice"]), 109.90)
+        self.assertEqual(float(a2["triggerPrice"]), 104.90)
 
     def test_protection_closeposition_never_combines_quantity(self):
         """closePosition=true → quantity/reduceOnly ASLA gönderilmez
@@ -157,6 +163,10 @@ class ProtectionTests(unittest.TestCase):
         self.ex.set_mark("SOLUSDT", 100.0)
         self.lc.risk_tick()
         self.assertEqual(self.lc._get_state("protection_unverifiable"), "0")
+        # BLOK29.1 (100/100): ETH long'u borsa stop'uyla kapat → bütçe boşalır
+        self.ex.set_mark("ETHUSDT", 95.05)          # stop 95.10 altı
+        self.lc.risk_tick()
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         out2 = self.lc.try_entry("SOLUSDT", 1, 100.0, T0 + 3 * BAR,
                                  self.clock())
         self.assertEqual(out2[0]["result"], "FILLED")
@@ -211,11 +221,11 @@ class ProtectionTests(unittest.TestCase):
         self.assertEqual(self.lc._live_pos_row(pos_id)["exit_status"],
                          "EXIT_UNKNOWN")
         self.clock.advance(60_000)                  # trade ts > entry ts
-        self.ex.set_mark("ETHUSDT", 90.03)          # stop 90.10 tetiklenir
+        self.ex.set_mark("ETHUSDT", 90.03)          # stop 95.10 tetiklenir
         self.lc.risk_tick()
         pos = self.lc.rm._pos(pos_id)
         self.assertEqual(pos["status"], "CLOSED")
-        self.assertAlmostEqual(pos["exit_px"], 90.10, places=6)
+        self.assertAlmostEqual(pos["exit_px"], 95.10, places=6)
         # TEK çıkış POST denemesi (no-apply) — stop kazandı, yeniden POST yok
         self.assertEqual(len(self._exit_posts()), 1)
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
