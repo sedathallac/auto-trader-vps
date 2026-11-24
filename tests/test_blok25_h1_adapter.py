@@ -88,8 +88,8 @@ class FakeWorld:
     def settle_funding(self, symbol, upto_ts):
         self.calls.append(("settle_funding", symbol, upto_ts))
 
-    def on_bar_close(self, symbol, close_px):
-        self.calls.append(("on_bar_close", symbol))
+    def on_bar_close(self, symbol, close_px, ts):
+        self.calls.append(("on_bar_close", symbol, ts))
 
     # Executor surface
     def apply_target(self, decision, ref_price):

@@ -31,6 +31,7 @@ Fill model (frozen in the run manifest BEFORE the paper run starts):
 import json
 import math
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -64,11 +65,36 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# BLOK27.5 (F-1): mark timestamps are UTC epoch MILLISECONDS. A seconds-
+# scale epoch (~1.8e9) or any pre-2001 ms value (< 1e12) is rejected —
+# fail-closed, never silently coerced.
+MS_EPOCH_FLOOR = 10 ** 12
+
+
+def _require_mark_ts(ts):
+    """Validate a mark timestamp: UTC epoch ms of the closed bar's CLOSE.
+    Raises ValueError on None / bool / non-integral / seconds-scale /
+    pre-2001 values — a wrong-unit timestamp must never reach the ledger."""
+    if ts is None or isinstance(ts, bool):
+        raise ValueError("mark ts is REQUIRED (UTC epoch ms, the closed "
+                         "bar's close time) — no silent fallback")
+    if isinstance(ts, float):
+        if not ts.is_integer():
+            raise ValueError(f"mark ts {ts!r} is not an integral ms value")
+        ts = int(ts)
+    if not isinstance(ts, int):
+        raise ValueError(f"mark ts {ts!r} is not an integer (UTC epoch ms)")
+    if ts < MS_EPOCH_FLOOR:
+        raise ValueError(f"mark ts {ts} is not UTC epoch MILLISECONDS "
+                         "(< 1e12: seconds-scale or invalid)")
+    return ts
+
+
 class PaperBroker:
     """World + Executor for the H1Router. SQLite-backed paper ledger."""
 
     def __init__(self, db_file, symbols, equity_start=1000.0,
-                 fill_model=None, barrier_config=None):
+                 fill_model=None, barrier_config=None, clock_ms=None):
         self.db_file = str(db_file)
         self.symbols = list(symbols)
         self.equity_start = float(equity_start)
@@ -76,21 +102,24 @@ class PaperBroker:
         # SL/TP barriers: None = flip-only (H1 frozen design). A config like
         # {"sl_pct": 0.05} would model an exchange-side STOP per bar.
         self.barrier_config = barrier_config
+        # injectable epoch-ms clock (tests); production = wall clock
+        self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._last_mark = {}          # symbol -> latest close (mark proxy)
         self._quote_volume = {}       # symbol -> latest bar quote volume
-        self._cur_ts = {}             # symbol -> current bar ts (note_bar)
         self._init_schema()
         self._reload_marks()         # restart: restore last mark per symbol
 
     def _reload_marks(self):
         """On restart, restore the last mark per symbol from the marks
-        table so unrealized PnL survives a process bounce."""
+        table so unrealized PnL survives a process bounce. BLOK27.5 (F-1):
+        id DESC makes the tie-break among same-ts rows deterministic
+        (append-only history keeps restart-replay duplicates)."""
         conn = self._connect()
         try:
             for s in self.symbols:
                 row = conn.execute(
                     "SELECT mark_px FROM marks WHERE symbol=? "
-                    "ORDER BY ts DESC LIMIT 1", (s,)).fetchone()
+                    "ORDER BY ts DESC, id DESC LIMIT 1", (s,)).fetchone()
                 if row:
                     self._last_mark[s] = row["mark_px"]
         finally:
@@ -254,7 +283,6 @@ class PaperBroker:
         finally:
             conn.close()
         self._quote_volume[symbol] = quote_volume
-        self._cur_ts[symbol] = ts
 
     def note_funding_rate(self, symbol, ts, rate):
         conn = self._connect()
@@ -348,16 +376,23 @@ class PaperBroker:
                 conn.close()
         self._set_account(cash=cash)
 
-    def on_bar_close(self, symbol, close_px, ts=None):
+    def on_bar_close(self, symbol, close_px, ts):
         """Update the mark; write the per-bar mark/uPnL/equity/drawdown row;
         check barriers (SL/TP if configured) and the liquidation model.
-        ts defaults to the current noted bar (the router calls this at the
-        END of each bar, after the open-time flip — the mark therefore
-        reflects the post-flip book)."""
+
+        ts (REQUIRED): the closed bar's CLOSE time in UTC epoch MILLISECONDS
+        (bar open + 4h) — the instant the close price became known.
+        BLOK27.5 (F-1) fix: no silent fallback to the last noted bar or the
+        system clock; a missing/implausible/future ts raises (fail-closed)
+        so a wrong-timestamp mark can never be written. The router calls
+        this at the END of each bar, after the open-time flip — the mark
+        therefore reflects the post-flip book."""
+        ts = _require_mark_ts(ts)
+        if ts > self._clock_ms() + 60_000:
+            raise ValueError(f"mark ts {ts} is in the future — refusing "
+                             "to write a look-ahead mark (fail-closed)")
         self._last_mark[symbol] = close_px
-        ts = ts if ts is not None else self._cur_ts.get(symbol)
-        if ts is not None:
-            self._write_mark(ts, symbol)
+        self._write_mark(ts, symbol)
         pos = self._position(symbol)
         if pos is None or pos["direction"] == 0:
             return

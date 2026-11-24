@@ -58,6 +58,22 @@ LOOKBACK = 180                        # N, in 4h bars
 HALFLIFE = 42.0                       # EWMA vol halflife, in bars
 ANN = math.sqrt(6.0 * 365.0)          # 4h bars per year -> annualization
 LAMBDA = math.exp(math.log(0.5) / HALFLIFE)
+BAR_INTERVAL_MS = 4 * 3600 * 1000     # H1 runs on 4h bars (frozen design)
+
+
+def bar_close_ts(bar_ts):
+    """The closed bar's close timestamp (UTC epoch ms): bar open + 4h —
+    the instant the close price became known. BLOK27.5 (F-1): the mark row
+    must carry THIS value, never the latest live bar's ts. Validates
+    bar_ts (integer, ms-scale) — a seconds-scale or non-integral value
+    raises (fail-closed)."""
+    if bar_ts is None or isinstance(bar_ts, bool):
+        raise ValueError(f"bar_ts {bar_ts!r} is REQUIRED (UTC epoch ms, "
+                         "the closed bar's open time)")
+    v = int(bar_ts)
+    if v != bar_ts or v < 10 ** 12:
+        raise ValueError(f"bar_ts {bar_ts!r} is not UTC epoch MILLISECONDS")
+    return v + BAR_INTERVAL_MS
 
 
 def param_manifest() -> dict:
@@ -496,7 +512,11 @@ class H1Router:
         self.engine.end_bar(symbol, bar_ts, close_px)
         on_close = getattr(self.world, "on_bar_close", None)
         if callable(on_close):
-            on_close(symbol, close_px)
+            # BLOK27.5 (F-1): the mark carries the closed bar's OWN close
+            # time (open + 4h). Warmup-replayed history therefore lands on
+            # its true timestamp — never on the latest live bar's ts, the
+            # old silent fallback that mis-stamped ~99% of marks rows.
+            on_close(symbol, close_px, bar_close_ts(bar_ts))
         return pend
 
     def _execute(self, decision: H1Decision, ref_price: float):

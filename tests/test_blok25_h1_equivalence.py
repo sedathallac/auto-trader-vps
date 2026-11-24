@@ -105,7 +105,7 @@ class ReplicaBroker:
                     {"ts": stime, "cf": cf, "dir": st["dir"], "rate": rate})
             self.fidx[symbol] += 1
 
-    def on_bar_close(self, symbol, close_px):
+    def on_bar_close(self, symbol, close_px, ts):
         self.st[symbol]["prev_settle_close"] = close_px
 
     # Executor --------------------------------------------------------------

@@ -43,9 +43,10 @@ def _decision(symbol=SYM, direction=1, notional=100.0, bar_ts=T0,
 
 
 def _bar(b, ts, open_px, close_px, qv=1e6, symbol=SYM):
-    """note_bar + on_bar_close — what the router does for one bar."""
+    """note_bar + on_bar_close — what the router does for one bar.
+    BLOK27.5: the mark is stamped at the bar's CLOSE time (open + 4h)."""
     b.note_bar(symbol, ts, open_px, close_px, qv)
-    b.on_bar_close(symbol, close_px)
+    b.on_bar_close(symbol, close_px, ts + BAR)
 
 def _broker(**kw):
     tmp = tempfile.mkdtemp()

@@ -102,7 +102,7 @@ class TestObserve(unittest.TestCase):
         b = PaperBroker(db, [SYM, OTHER])
         b.apply_target(_decision(direction=1, notional=100.0), 100.0)
         b.note_bar(SYM, T0 + BAR, 100.0, 110.0, 1e6)
-        b.on_bar_close(SYM, 110.0)
+        b.on_bar_close(SYM, 110.0, T0 + 2 * BAR)   # mark at bar CLOSE time
         b.event("CYCLE_ERROR", "test")
         hb = {"ts": int(time.time() * 1000), "cycle": 5, "ok": True,
               "error": None, "duration_s": 1.0, "rss_mb": 30.0,
