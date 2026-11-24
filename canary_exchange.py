@@ -194,8 +194,11 @@ class BinanceFuturesClient:
         return self._request("GET", "/fapi/v1/openOrders", p, True, False)
 
     def open_algo_orders(self, symbol=None):
+        """Açık CONDITIONAL emirler. NOT (BLOK29 §8 canlı doğrulama):
+        gerçek uç /fapi/v1/openAlgoOrders — /fapi/v1/algoOpenOrders
+        HTTP 404 döner (2026-11-25 VPS'ten salt-okunur sonda kanıtlandı)."""
         p = {"symbol": symbol} if symbol else {}
-        return self._request("GET", "/fapi/v1/algoOpenOrders", p, True, False)
+        return self._request("GET", "/fapi/v1/openAlgoOrders", p, True, False)
 
     def query_order(self, symbol, order_id=None, client_order_id=None):
         """clientOrderId ile sorgu — UNKNOWN çözümünün birinci yolu (§2.3)."""
