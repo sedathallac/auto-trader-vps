@@ -107,7 +107,24 @@ class NotionalTests(unittest.TestCase):
             t.start()
         for t in threads:
             t.join(10)
-        self.assertEqual(len(self.lc.rm.open_positions()), 2)
+        # §7 ilk-pozisyon kuralı yarış zamanlamasına göre 1 veya 2 pozisyon
+        # üretir (ikincisi ilkinin fill+koruma DOĞRULAMASINI bekler) —
+        # her ikisi de spec-uyumlu. DEĞİŞMEZLER: maks 2, toplam ≤ 100,
+        # dolanların hepsi PROTECTED, üçüncü ASLA açılmaz.
+        opens = self.lc.rm.open_positions()
+        self.assertIn(len(opens), (1, 2))
+        for r in results:
+            if r["result"] == "FILLED":
+                self.assertIn(r["symbol"], [p["symbol"] for p in opens])
+            else:
+                # bloke/reddedilen denemeler spec-uyumlu nedenlerle
+                # (ilk-pozisyon kuralı, pozisyon sınırı, koruma doğrulaması)
+                self.assertTrue(
+                    r["result"].startswith(("BLOCKED", "REJECTED:")) or
+                    r["result"] == "DUPLICATE_SIGNAL",
+                    f"beklenmedik sonuç: {r['result']}")
+        self.assertEqual(len(opens), len([r for r in results
+                                           if r["result"] == "FILLED"]))
         total = self.lc.rm.total_notional(self.clock())
         self.assertIsNotNone(total)
         self.assertLessEqual(total, 100.0 + 1e-9)
