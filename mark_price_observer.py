@@ -49,6 +49,7 @@ REST_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
 STALE_THRESHOLD_S = 10.0          # DOCUMENTED stale threshold (1s WS akışı)
 STALE_THRESHOLD_REST_S = 60.0     # DOCUMENTED stale threshold (REST poll)
 POLL_INTERVAL_S = 5.0             # varsayılan REST poll aralığı
+BAR_MS = 4 * 3600 * 1000          # paper run'ın 4h bar aralığı (H1, compare)
 BACKOFF_START = 1.0
 BACKOFF_MAX = 60.0
 DEFAULT_DIR = Path("~/futures-research/blok25/forward-monitor/markprice"
@@ -351,11 +352,19 @@ def stats(directory=DEFAULT_DIR, day=None):
 def compare_proxy(directory=DEFAULT_DIR, db_file=None, day=None,
                   now_ms=None):
     """Gerçek Mark Price (REST/WS tick) vs paper run'ın proxy mark'ı
-    (4h bar kapanışı, salt-okunur ledger 'marks' tablosu).
+    (4h bar kapanışı; salt-okunur ledger 'bars' tablosu).
 
-    Her tick için: o an YÜRÜRLÜKTE olan proxy mark (tick E'sinden büyük
-    olmayan en son mark_px) ile gerçek mark'ın farkı:
-      dev_bp = (gerçek − proxy)/proxy · 1e4   (bp)
+    BLOK27.5 (F-1) düzeltmesi: proxy, tick anında (E) TAMAMLANMIŞ son 4h
+    barının kapanışıdır — bars.ts (bar AÇIK zamanı) + 4h <= E. Eski
+    uygulama kirli 'marks' tablosu üzerinden ts <= E bisect'i yapıyordu:
+    marks satırları bar kapanışından SONRA yazıldığından (ve F-1
+    kirliliğiyle geçmiş bar kapanışları en yeni ts'lerle damgalandığından)
+    bu look-ahead üretiyordu — gelecekte yazılmış mark kayıtları geçmiş
+    değerlendirme anına sızıyordu. bars tablosu (INSERT OR REPLACE,
+    yalnız canlı işlenen barlar) bu sızıntıyı yapısal olarak engeller.
+
+    Her tick için: o an YÜRÜRLÜKTE olan proxy mark ile gerçek mark farkı:
+      dev_bp = |gerçek − proxy|/proxy · 1e4   (bp)
     Rapor: sembol başına |dev| ortalama/p95/p99/maks, örnek sayısı,
     timestamp skew (tick t − E) istatistikleri.
     """
@@ -369,13 +378,15 @@ def compare_proxy(directory=DEFAULT_DIR, db_file=None, day=None,
         if not files:
             return {"error": "no data"}
         day = files[-1].name[:-6]
-    # proxy mark'ları yükle (salt-okunur): symbol -> [(ts, mark_px)]
-    marks = {}
+    # tamamlanmış barlar (salt-okunur): symbol -> [(close_time, close)]
+    # close_time = bar açık zamanı + 4h: kapanışın BİLİNME anı (E-aligned)
+    bars = {}
     try:
         db = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
-        for sym, ts, px in db.execute("SELECT symbol, ts, mark_px "
-                                      "FROM marks ORDER BY ts"):
-            marks.setdefault(sym, []).append((ts, px))
+        for sym, ts, close in db.execute("SELECT symbol, ts, close "
+                                         "FROM bars ORDER BY ts"):
+            if close is not None:
+                bars.setdefault(sym, []).append((ts + BAR_MS, close))
         db.close()
     except sqlite3.Error as e:
         return {"error": f"ledger: {type(e).__name__}: {e}"}
@@ -389,12 +400,12 @@ def compare_proxy(directory=DEFAULT_DIR, db_file=None, day=None,
         tick = json.loads(line)
         s = tick["s"]
         skew.append((tick["t"] - tick["E"]) / 1000)
-        series = marks.get(s)
+        series = bars.get(s)
         if not series:
             continue
-        ts_list = [m[0] for m in series]
-        # yürürlükteki proxy: E'den büyük olmayan en son mark
-        idx = bisect.bisect_right(ts_list, tick["E"]) - 1
+        close_times = [b[0] for b in series]
+        # yürürlükteki proxy: E anında TAMAMLANMIŞ son bar (open+4h <= E)
+        idx = bisect.bisect_right(close_times, tick["E"]) - 1
         if idx < 0:
             continue
         proxy = series[idx][1]
@@ -407,7 +418,8 @@ def compare_proxy(directory=DEFAULT_DIR, db_file=None, day=None,
         rec["n"] += 1
         rec["dev_bp"].append(dev_bp)
         rec["last_t"] = tick["t"]
-    out = {"day": day, "per_symbol": {}, "skew_s": {}}
+    out = {"day": day, "proxy_source": "bars(completed 4h, E-aligned)",
+           "per_symbol": {}, "skew_s": {}}
     for s, rec in sorted(per_sym.items()):
         devs = sorted(rec["dev_bp"])
         out["per_symbol"][s] = {

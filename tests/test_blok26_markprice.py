@@ -125,19 +125,33 @@ class TestStats(unittest.TestCase):
 
 
 class TestCompareProxy(unittest.TestCase):
-    """Gerçek mark vs 4h-close proxy sapma hesabı (sentetik ledger)."""
+    """Gerçek mark vs 4h-close proxy sapma hesabı (sentetik ledger).
 
-    def _db(self):
+    BLOK27.5: proxy kaynağı 'bars' tablosu (yalnız canlı işlenen barlar);
+    bir bar yalnız AÇIK+4h'te (tamamlandığında) yürürlüğe girer —
+    E-aligned, look-ahead YOK.
+    """
+
+    def _db(self, with_polluted_marks=False):
         d = tempfile.mkdtemp()
         db = os.path.join(d, "paper.db")
         con = sqlite3.connect(db)
-        con.execute("CREATE TABLE marks (symbol TEXT, ts INTEGER, "
-                    "mark_px REAL)")
-        # proxy: gün başında 100, +4h'te 110 — arada proxy ESKİ değerde
+        con.execute("CREATE TABLE bars (symbol TEXT, ts INTEGER, "
+                    "open REAL, close REAL, quote_volume REAL)")
+        # 00:00Z'de AÇAN bar 100 kapanar (yürürlük 04:00Z'de), 04:00Z'de
+        # açan bar 110 kapanar (yürürlük 08:00Z'de)
         base = 1735689600000     # 2025-01-01T00:00Z
-        con.executemany("INSERT INTO marks VALUES (?,?,?)",
-                        [("BTCUSDT", base, 100.0),
-                         ("BTCUSDT", base + 14_400_000, 110.0)])
+        con.executemany("INSERT INTO bars VALUES (?,?,?,?,?)",
+                        [("BTCUSDT", base - 14_400_000, 99.0, 100.0, 1e6),
+                         ("BTCUSDT", base, 105.0, 110.0, 1e6)])
+        if with_polluted_marks:
+            # F-1 kirlilik şekli: geçmiş bar kapanışları GELECEK ts'lerle
+            # damgalanmış marks satırları — compare bunları OKUMAZ bile
+            con.execute("CREATE TABLE marks (symbol TEXT, ts INTEGER, "
+                        "mark_px REAL)")
+            con.executemany("INSERT INTO marks VALUES (?,?,?)",
+                            [("BTCUSDT", base + 14_400_000, 999.0),
+                             ("BTCUSDT", base + 20_000_000, 888.0)])
         con.commit()
         con.close()
         return d, db
@@ -167,8 +181,9 @@ class TestCompareProxy(unittest.TestCase):
         self.assertAlmostEqual(rec["dev_bp_mean"], sum(devs) / 3, delta=0.01)
         self.assertAlmostEqual(rec["dev_bp_max"], 90.909, delta=0.01)
         self.assertEqual(out["skew_s"]["n"], 3)
+        self.assertIn("bars", out["proxy_source"])   # kaynak belgeli
 
-    def test_tick_before_first_mark_skipped(self):
+    def test_tick_before_first_completed_bar_skipped(self):
         d, db = self._db()
         t0 = 1735689600000
         with open(Path(d) / "2025-01-01.jsonl", "w") as f:
@@ -177,6 +192,27 @@ class TestCompareProxy(unittest.TestCase):
                                 "r": 0.0, "T": 0}) + "\n")
         out = mp.compare_proxy(d, db, "2025-01-01")
         self.assertNotIn("BTCUSDT", out["per_symbol"])   # proxy yok → atl
+
+    def test_future_bar_cannot_leak_into_past_tick(self):
+        """F-1 look-ahead kanıtı: bar ancak open+4h'te yürürlüğe girer;
+        bar SÜRERKEN (E < open+4h) proxy ÖNCEKİ barın kapanışı kalır."""
+        d, db = self._db(with_polluted_marks=True)
+        t0 = 1735689600000
+        ticks = [
+            # ikinci bar [t0, t0+4h) SÜRERKEN: proxy 100 olmalı (110 DEĞİL)
+            {"t": t0 + 7_200_000, "E": t0 + 7_200_000, "s": "BTCUSDT",
+             "p": 100.2, "i": 100.2, "r": 0.0, "T": 0},
+            # kirlendirilmiş marks tablosunda 999/888 fiyatlı GELECEK
+            # ts'li satırlar var — compare bars'tan okuduğu için etkisiz
+        ]
+        with open(Path(d) / "2025-01-01.jsonl", "w") as f:
+            for tick in ticks:
+                f.write(json.dumps(tick) + "\n")
+        out = mp.compare_proxy(d, db, "2025-01-01")
+        rec = out["per_symbol"]["BTCUSDT"]
+        self.assertEqual(rec["n"], 1)
+        # |100.2 − 100|/100 · 1e4 = 20 bp (110 kullansaydı ~925 bp olurdu)
+        self.assertAlmostEqual(rec["dev_bp_mean"], 20.0, delta=0.01)
 
 
 class TestNoCredentials(unittest.TestCase):
