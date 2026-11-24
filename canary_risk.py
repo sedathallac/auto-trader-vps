@@ -84,15 +84,22 @@ class RiskManager:
 
     # ---- kalıcı durum -----------------------------------------------------
     def _get_state(self, key):
-        row = self.db.execute("SELECT value FROM canary_state WHERE key=?",
-                              (key,)).fetchone()
-        return row[0] if row else None
+        # okuma yolları da kilide bağlı: risk+strateji thread'leri aynı
+        # sqlite bağlantısını paylaşır (§4/§8 — eşzamanlı execute imleç
+        # bozulması üretir); RLock reentrant → iç içe çağrı güvenli
+        with self._lock:
+            row = self.db.execute(
+                "SELECT value FROM canary_state WHERE key=?",
+                (key,)).fetchone()
+            return row[0] if row else None
 
     def _set_state(self, key, value):
-        self.db.execute("INSERT INTO canary_state VALUES (?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (key, value))
-        self.db.commit()
+        with self._lock:
+            self.db.execute("INSERT INTO canary_state VALUES (?,?) "
+                            "ON CONFLICT(key) DO UPDATE "
+                            "SET value=excluded.value",
+                            (key, value))
+            self.db.commit()
 
     @property
     def status(self):
@@ -106,9 +113,10 @@ class RiskManager:
             self._event("OPERATOR_RESET", "HALT operatör onayıyla sıfırlandı")
 
     def _event(self, kind, detail):
-        self.db.execute("INSERT INTO risk_events VALUES (?,?,?)",
-                        (int(time.time() * 1000), kind, detail))
-        self.db.commit()
+        with self._lock:
+            self.db.execute("INSERT INTO risk_events VALUES (?,?,?)",
+                            (int(time.time() * 1000), kind, detail))
+            self.db.commit()
 
     # ---- piyasa verisi ----------------------------------------------------
     def update_mark(self, symbol, mark_px, ts_ms):
@@ -121,13 +129,15 @@ class RiskManager:
 
     def _mark(self, symbol, now_ms):
         """Mark yoksa/stale ise None — hesap YAPILAMIYOR (fail-closed)."""
-        row = self.db.execute("SELECT mark_px, ts FROM marks WHERE symbol=?",
-                              (symbol,)).fetchone()
-        if row is None:
-            return None
-        if (now_ms - row[1]) / 1000 > MARK_STALE_S:
-            return None
-        return row[0]
+        with self._lock:
+            row = self.db.execute(
+                "SELECT mark_px, ts FROM marks WHERE symbol=?",
+                (symbol,)).fetchone()
+            if row is None:
+                return None
+            if (now_ms - row[1]) / 1000 > MARK_STALE_S:
+                return None
+            return row[0]
 
     # ---- pozisyon muhasebesi ----------------------------------------------
     def open_position(self, symbol, direction, notional, entry_px, now_ms,
@@ -163,48 +173,55 @@ class RiskManager:
             self.db.commit()
 
     def _pos(self, pos_id):
-        self.db.row_factory = sqlite3.Row
-        return dict(self.db.execute("SELECT * FROM positions WHERE pos_id=?",
-                                    (pos_id,)).fetchone())
+        with self._lock:
+            self.db.row_factory = sqlite3.Row
+            return dict(self.db.execute(
+                "SELECT * FROM positions WHERE pos_id=?",
+                (pos_id,)).fetchone())
 
     def open_positions(self):
-        self.db.row_factory = sqlite3.Row
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM positions WHERE status IN ('OPEN','SAFE_EXIT')")]
+        with self._lock:
+            self.db.row_factory = sqlite3.Row
+            return [dict(r) for r in self.db.execute(
+                "SELECT * FROM positions WHERE status IN "
+                "('OPEN','SAFE_EXIT')")]
 
     # ---- zarar hesabı (görev §2: tamamı dahil) ------------------------------
     def position_net_loss(self, pos, now_ms):
         """Pozisyon net zararı (pozitif = zarar):
         realized(0 iken yok) + uPnL(Mark) + komisyonlar + funding.
         Mark yoksa/stale ise None → hesap YAPILAMIYOR."""
-        loss = 0.0
-        if pos["status"] == "CLOSED":
-            loss += -pos["realized"]
-            loss += pos["entry_comm"] + (pos["exit_comm"] or 0)
-        else:
-            mark = self._mark(pos["symbol"], now_ms)
-            if mark is None:
-                return None
-            loss += -(pos["direction"] * pos["units"] *
-                      (mark - pos["entry_px"]))
-            loss += pos["entry_comm"]
-        fund = self.db.execute("SELECT COALESCE(SUM(amount),0) FROM funding "
-                               "WHERE pos_id=?", (pos["pos_id"],)).fetchone()[0]
-        loss += -fund          # funding ödemesi (negatif cf = ödenmiş)
-        return loss
+        with self._lock:
+            loss = 0.0
+            if pos["status"] == "CLOSED":
+                loss += -pos["realized"]
+                loss += pos["entry_comm"] + (pos["exit_comm"] or 0)
+            else:
+                mark = self._mark(pos["symbol"], now_ms)
+                if mark is None:
+                    return None
+                loss += -(pos["direction"] * pos["units"] *
+                          (mark - pos["entry_px"]))
+                loss += pos["entry_comm"]
+            fund = self.db.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM funding "
+                "WHERE pos_id=?", (pos["pos_id"],)).fetchone()[0]
+            loss += -fund      # funding ödemesi (negatif cf = ödenmiş)
+            return loss
 
     def total_net_loss(self, now_ms):
         """Toplam canary net zararı: kapalı realized + açık uPnL + tüm
         komisyon + tüm funding. Herhangi biri hesaplanamıyorsa None
         (fail-closed)."""
-        total = 0.0
-        self.db.row_factory = sqlite3.Row
-        for pos in self.db.execute("SELECT * FROM positions"):
-            l = self.position_net_loss(dict(pos), now_ms)
-            if l is None:
-                return None
-            total += l
-        return total
+        with self._lock:
+            total = 0.0
+            self.db.row_factory = sqlite3.Row
+            for pos in self.db.execute("SELECT * FROM positions"):
+                l = self.position_net_loss(dict(pos), now_ms)
+                if l is None:
+                    return None
+                total += l
+            return total
 
     def position_notional(self, pos, now_ms):
         """Güncel fiyatla notional (görev §5: güncel fiyattan yeniden)."""
@@ -341,7 +358,8 @@ class RiskManager:
         live_positions: [{symbol, positionAmt, entryPrice, ...}] (signed GET).
         Dönüş: drift raporu — YENİ EMİR BU FONKSİYONLA AÇILMAZ."""
         now_ms = now_ms or int(time.time() * 1000)
-        ours = {p["symbol"]: p for p in self.open_positions()}
+        with self._lock:
+            ours = {p["symbol"]: p for p in self.open_positions()}
         theirs = {p["symbol"]: p for p in live_positions
                   if float(p.get("positionAmt", 0)) != 0}
         drift = []
