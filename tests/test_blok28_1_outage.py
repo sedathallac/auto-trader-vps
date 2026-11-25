@@ -17,7 +17,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
-                                 open_one, T0)
+                                 open_one, T0,
+                                 stop_trigger)
 
 BAR = 4 * 3600 * 1000
 
@@ -192,7 +193,7 @@ class OutageTests(unittest.TestCase):
         self.ex.outage = True
         self.clock.advance(60_000)                  # trade ts > entry ts
         # borsa bağımsız davranır: mark stop altına düşer → tetiklenir
-        # (BLOK29.1: stop 95.10 — 100 notional'da -5 bütçesi ~%5 mesafe)
+        # (BLOK31: stop ~95.05 — 99 notional'da -5 bütçesi ~%5 mesafe)
         self.ex.set_mark("ETHUSDT", 95.03)          # auto_trigger yok ama:
         self.ex._check_triggers()                   # borsa kendi kuralı
         self.assertEqual(self.ex.algos["C281P1"]["algoStatus"], "TRIGGERED")
@@ -207,7 +208,8 @@ class OutageTests(unittest.TestCase):
         cyc = self.lc.risk_tick()
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "CLOSED")   # stop fill'den çözüldü
-        self.assertAlmostEqual(pos["exit_px"], 95.10, places=6)
+        self.assertAlmostEqual(pos["exit_px"],
+                               stop_trigger(self.ex, rec["pos_id"]), places=6)
         self.assertEqual(self.lc._live_pos_row(rec["pos_id"])
                          ["protection_status"], "PROTECTION_TRIGGERED")
         # kör dönemde market çıkış POST EDİLMEDİ (stop yeterliydi)

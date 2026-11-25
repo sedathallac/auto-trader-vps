@@ -6,13 +6,15 @@ mark staleness (fail-closed), çıkış/stop yarışı, çift kapanış korumas�
 SAFE_EXIT sırasında yeni risk yasağı, F-g (çıkış gerçek borsa miktarını
 okur).
 
-Matematik (fixture, BLOK29.1): ETHUSDT qty 1.0 @100, komisyon 0.0005 →
-giriş komisyonu 0.05. Zarar = (100-m)*1.0 + 0.05:
-  mark 95.06 → -4.99 (tetik YOK)   mark 95.05 → -5.00 (tetik)
-  mark 95.04 → -5.01 (tetik)
-Koruma stop'u 95.10 (bütçe 5 − 0.05 − 0.05 = 4.90 → 4.9 puan). Stop'un
-atlamaması için saf -5 eşik testlerinde koruma dışarıdan iptal edilir;
-borsa-korumalı yarış ayrı testte.
+Matematik (fixture, BLOK31): ETHUSDT qty, giriş ANI fiyatı 100 üzerinden
+ENTRY_SIZE_BUFFER'lı hedefle boyutlanır (99 → 0.99 lot), komisyon 0.0005
+→ giriş komisyonu 0.0495. Zarar = (100-m)*0.99 + 0.0495. Eşik markları
+test içinde loss_mark() ile pozisyonun GERÇEK units/entry_px/entry_comm
+değerlerinden türetilir (boyutlama değişse bile test amacı sabit kalır):
+  -4.99 (tetik YOK)   -5.00 (tetik)   -5.01 (tetik)
+Koruma stop'u ~95.05 (bütçe 5 − 0.0495 − 0.0495 → 4.901/0.99 puan, tick'e
+erken yuvarlama). Stop'un atlamaması için saf -5 eşik testlerinde koruma
+dışarıdan iptal edilir; borsa-korumalı yarış ayrı testte.
 """
 import os
 import sys
@@ -22,7 +24,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
-                                 open_one, T0)
+                                 open_one, stop_trigger, loss_mark, T0)
 
 BAR = 4 * 3600 * 1000
 
@@ -58,7 +60,8 @@ class RiskExitTests(unittest.TestCase):
         self.assertEqual(rec["result"], "FILLED")
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)                   # < 30s koruma kadansı
-        self.ex.set_mark("ETHUSDT", 95.06)           # net zarar -4.99
+        # net zarar -4.99 (gerçek units/komisyondan türetilmiş mark)
+        self.ex.set_mark("ETHUSDT", loss_mark(self.lc, rec["pos_id"], 4.99))
         cyc = self.lc.risk_tick()
         self.assertEqual(cyc["risk_actions"], [])    # eşik ALTINDA: aksiyon yok
         pos = self.lc.rm._pos(rec["pos_id"])
@@ -70,7 +73,8 @@ class RiskExitTests(unittest.TestCase):
         rec = open_one(self.lc)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)           # net zarar -5.00
+        # net zarar tam -5.00 (eşik DAHİL → tetik)
+        self.ex.set_mark("ETHUSDT", loss_mark(self.lc, rec["pos_id"], 5.00))
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -93,7 +97,8 @@ class RiskExitTests(unittest.TestCase):
         rec = open_one(self.lc)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.04)           # net zarar -5.01
+        # net zarar -5.01
+        self.ex.set_mark("ETHUSDT", loss_mark(self.lc, rec["pos_id"], 5.01))
         self.lc.risk_tick()
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "CLOSED")
@@ -105,8 +110,9 @@ class RiskExitTests(unittest.TestCase):
         rec = open_one(self.lc)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)
-        self.lc.rm.update_mark("ETHUSDT", 95.05, self.clock())
+        m = loss_mark(self.lc, rec["pos_id"], 5.00)   # net zarar -5.00
+        self.ex.set_mark("ETHUSDT", m)
+        self.lc.rm.update_mark("ETHUSDT", m, self.clock())
         self.ex.timeout_client_ids.add("C281X1n1")   # UYGULANIR + timeout
         r = self.lc.initiate_risk_exit(rec["pos_id"], "POSITION_LOSS_LIMIT")
         self.assertEqual(r["status"], "EXIT_UNKNOWN")
@@ -128,8 +134,9 @@ class RiskExitTests(unittest.TestCase):
         rec = open_one(self.lc)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)
-        self.lc.rm.update_mark("ETHUSDT", 95.05, self.clock())
+        m = loss_mark(self.lc, rec["pos_id"], 5.00)   # net zarar -5.00
+        self.ex.set_mark("ETHUSDT", m)
+        self.lc.rm.update_mark("ETHUSDT", m, self.clock())
         self.ex.no_apply_timeouts.add("C281X1n1")    # HİÇ uygulanmadı
         r = self.lc.initiate_risk_exit(rec["pos_id"], "POSITION_LOSS_LIMIT")
         self.assertEqual(r["status"], "EXIT_UNKNOWN")
@@ -150,23 +157,25 @@ class RiskExitTests(unittest.TestCase):
         rec = open_one(self.lc)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)
-        self.lc.rm.update_mark("ETHUSDT", 95.05, self.clock())
-        self.ex.partial_fill_qty["C281X1n1"] = 0.2    # 1.0'ın 0.2'si dolar
+        m = loss_mark(self.lc, rec["pos_id"], 5.00)   # net zarar -5.00
+        self.ex.set_mark("ETHUSDT", m)
+        self.lc.rm.update_mark("ETHUSDT", m, self.clock())
+        self.ex.partial_fill_qty["C281X1n1"] = 0.2    # units'in 0.2'si dolar
         self.lc.rm.enforce(self.clock())              # SAFE_EXIT işaretle
         self.lc.initiate_risk_exit(rec["pos_id"], "POSITION_LOSS_LIMIT")
         lp = self._lp(rec["pos_id"])
         self.assertEqual(lp["exit_status"], "EXIT_PARTIAL")
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "SAFE_EXIT")  # CLOSED YAZILMADI (F-b)
-        # kalan 0.8 → sonraki tick: sorgu EXPIRED → yeni intent 0.800
+        # kalan units−0.2 → sonraki tick: sorgu EXPIRED → yeni intent
         self.clock.advance(10_000)
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm._pos(rec["pos_id"])["status"], "CLOSED")
         second = [c for c in self._exit_posts()
                   if c["client_order_id"] == "C281X1n2"]
         self.assertEqual(len(second), 1)
-        self.assertEqual(float(second[0]["quantity"]), 0.8)
+        self.assertAlmostEqual(float(second[0]["quantity"]),
+                               pos["units"] - 0.2, places=6)
 
     # ---- §11: API kesintisi / mark staleness ----------------------------------
 
@@ -199,14 +208,15 @@ class RiskExitTests(unittest.TestCase):
 
     def test_exit_stop_race_exchange_protection_closes_first(self):
         rec = open_one(self.lc)
+        trig = stop_trigger(self.ex, rec["pos_id"])   # gerçek stop seviyesi
         self.clock.advance(60_000)                    # trade ts > entry ts
-        self.ex.set_mark("ETHUSDT", 90.03)            # stop 95.10 altını geçer
+        self.ex.set_mark("ETHUSDT", 90.03)            # stop seviyesinin altı
         cyc = self.lc.risk_tick()
-        # borsa stop'u premium_index sırasında tetiklendi (95.10'dan)
+        # borsa stop'u premium_index sırasında tetiklendi (trig'den)
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "CLOSED")     # userTrades'ten çözüldü
-        self.assertAlmostEqual(pos["exit_px"], 95.10, places=6)
+        self.assertAlmostEqual(pos["exit_px"], trig, places=6)
         self.assertEqual(self._lp(rec["pos_id"])["protection_status"],
                          "PROTECTION_TRIGGERED")
         # market çıkış POST EDİLMEDİ (stop kazandı) — çift kapanış yok
@@ -216,11 +226,14 @@ class RiskExitTests(unittest.TestCase):
 
     def test_double_close_reduceonly_rejected_no_reverse_position(self):
         rec = open_one(self.lc)
+        trig = stop_trigger(self.ex, rec["pos_id"])
         self.clock.advance(60_000)
         self.ex.set_mark("ETHUSDT", 90.03)
         self.lc.risk_tick()                           # stop kapattı → CLOSED
         # geç/tekrar çıkış denemesi: borsa -2022 reddi → ters pozisyon YOK
-        self.lc._submit_exit(rec["pos_id"], 1.0, "geç_çıkış_denemesi")
+        self.lc._submit_exit(
+            rec["pos_id"], self.lc.rm._pos(rec["pos_id"])["units"],
+            "geç_çıkış_denemesi")
         o = self.lc._order_row("C281X1n1")
         self.assertEqual(o["status"], "REJECTED")
         self.assertEqual(self._lp(rec["pos_id"])["exit_status"],
@@ -229,7 +242,7 @@ class RiskExitTests(unittest.TestCase):
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "CLOSED")     # defter ezilmedi
-        self.assertAlmostEqual(pos["exit_px"], 95.10, places=6)
+        self.assertAlmostEqual(pos["exit_px"], trig, places=6)
 
     # ---- §2: SAFE_EXIT sırasında yeni risk yasağı ------------------------------
 
@@ -258,8 +271,9 @@ class RiskExitTests(unittest.TestCase):
         self.ex.set_position("ETHUSDT", 0.4, 100.0)
         cancel_protection(self.ex, "C281P1")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)
-        self.lc.rm.update_mark("ETHUSDT", 95.05, self.clock())
+        m = loss_mark(self.lc, rec["pos_id"], 5.00)   # net zarar -5.00
+        self.ex.set_mark("ETHUSDT", m)
+        self.lc.rm.update_mark("ETHUSDT", m, self.clock())
         self.lc.initiate_risk_exit(rec["pos_id"], "POSITION_LOSS_LIMIT")
         posts = self._exit_posts()
         self.assertEqual(len(posts), 1)

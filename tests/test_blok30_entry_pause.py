@@ -32,7 +32,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
-                                 open_one, T0)
+                                 open_one, loss_mark, T0)
 
 BAR = 4 * 3600 * 1000
 from canary_live import (set_entry_pause, read_entry_pause,
@@ -266,7 +266,8 @@ class TestRiskLoopPreservation(PauseTestBase):
         cancel_protection(self.ex, f"C281P{rec['pos_id']}")
         set_entry_pause(self.db, True, "safe exit testi", "tester")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)       # -5.00 → tetik
+        self.ex.set_mark("ETHUSDT",
+                         loss_mark(self.lc, rec["pos_id"], 5.00))  # tetik
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -283,7 +284,8 @@ class TestRiskLoopPreservation(PauseTestBase):
         cancel_protection(self.ex, f"C281P{rec['pos_id']}")
         set_entry_pause(self.db, True, "halt testi", "tester")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.05)       # -10.00 → toplam tetik
+        self.ex.set_mark("ETHUSDT",
+                         loss_mark(self.lc, rec["pos_id"], 10.00))  # toplam
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_HALTED)
         self.assertNotEqual(self.lc.halt_state, HALT_ACTIVE)
@@ -309,7 +311,8 @@ class TestRiskLoopPreservation(PauseTestBase):
             self.lc.risk_tick()
         pos = self.lc.rm._pos(rec["pos_id"])
         self.assertEqual(pos["status"], "OPEN")
-        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 1.0)
+        self.assertAlmostEqual(self.ex.positions["ETHUSDT"]["positionAmt"],
+                               pos["units"], places=9)
         self.assertEqual(len(self._new_order_posts()), n_posts)  # ek emir YOK
 
     def test_19_protection_orders_maintained_not_canceled(self):
@@ -588,7 +591,8 @@ class TestStatusAndAudit(PauseTestBase):
         cancel_protection(self.ex, f"C281P{rec['pos_id']}")
         set_entry_pause(self.db, True, "ayrım testi", "tester")
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 90.05)       # -10 → global HALT
+        self.ex.set_mark("ETHUSDT",
+                         loss_mark(self.lc, rec["pos_id"], 10.00))  # HALT
         self.lc.risk_tick()
         self.assertEqual(self.lc.rm.status, STATUS_HALTED)
         # bağımsız okuma: PAUSE=1 VE HALT zinciri aynı anda

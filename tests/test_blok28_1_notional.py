@@ -9,11 +9,18 @@ pozisyon açıkken ikinci giriş TOPLAM kapısından reddedilir (operatör
 kuralı "iki pozisyonun toplamı 100'ü geçmez"nin bizzat uygulaması);
 ikinci pozisyon ancak ilki kapandıktan sonra açılabilir.
 
+BLOK31 boyutlama: qty, CANARY_NOTIONAL * (1 - ENTRY_SIZE_BUFFER) hedefiyle
+icra ANI fiyatından boyutlanır (MARKET slippage payı — 100 USDT SERT cap
+aşılmaz; eski NOTIONAL_SLIPPAGE_TOL kaldırıldı). ETHUSDT @100 → 0.99 lot
+(99 USDT). Fill sonrası notional sert cap'in ÜZERİNDEyse pozisyon anında
+reduce-only çıkışla kapatılır (OVER_LIMIT_EXIT).
+
 Kapsam: 100 kapısı, toplam kapı reddi, RiskManager 2-pozisyon üst sınırı,
-eşzamanlı emir yarışı, kısmi fill, fill sonrası fiyat hareketi (tolerans +
-aşım → çıkış), tick/stepSize yuvarlaması (BTCUSDT 100 kapısında artık
-ELIGIBLE — gerçek veri 2026-11-25: 0.001 BTC ≈ 59.9 USDT), komisyon rezervi
-(stop 95.10, 95.00 değil), komisyon/funding çift sayımı yok.
+eşzamanlı emir yarışı, kısmi fill, fill sonrası fiyat hareketi (cap altı
+KALIR / aşım → çıkış), tick/stepSize yuvarlaması (BTCUSDT 100 kapısında
+artık ELIGIBLE — gerçek veri 2026-11-25: 0.001 BTC ≈ 59.9 USDT), komisyon
+rezervi (stop ~95.05, komisyonsuz 94.95 değil), komisyon/funding çift
+sayımı yok.
 """
 import os
 import sys
@@ -24,7 +31,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
-                                 open_one, T0)
+                                 open_one, stop_trigger, T0)
 
 BAR = 4 * 3600 * 1000
 
@@ -48,9 +55,11 @@ class NotionalTests(unittest.TestCase):
     # ---- 100 USDT pozisyon limiti (BLOK29.1) ------------------------------------
 
     def test_position_notional_100_exact(self):
-        rec = open_one(self.lc, "ETHUSDT", 1)      # 1.0 @100 = 100.00
+        """BLOK31: qty, 100*(1−ENTRY_SIZE_BUFFER) hedefiyle boyutlanır →
+        ETHUSDT @100 → 0.99 lot = 99.0 USDT (≤ sert 100 cap)."""
+        rec = open_one(self.lc, "ETHUSDT", 1)      # 0.99 @100 = 99.00
         pos = self.lc.rm._pos(rec["pos_id"])
-        self.assertAlmostEqual(pos["units"] * pos["entry_px"], 100.0, places=6)
+        self.assertAlmostEqual(pos["units"] * pos["entry_px"], 99.0, places=6)
         self.assertLessEqual(pos["units"] * pos["entry_px"], 100.0 + 1e-9)
 
     def test_btcusdt_tradeable_under_100_cap(self):
@@ -90,15 +99,15 @@ class NotionalTests(unittest.TestCase):
         self.assertAlmostEqual(pos["units"] * pos["entry_px"], 91.0, places=6)
 
     def test_step_rounding_ada(self):
-        # ADAUSDT: step 1, minQty 1 → mark 0.35: qty 285 (99.75 ≤ 100)
+        # ADAUSDT: step 1, minQty 1 → mark 0.35: hedef 99 → qty 282 (98.7 ≤ 100)
         self.ex.set_mark("ADAUSDT", 0.35)
         self.lc.rm.update_mark("ADAUSDT", 0.35, self.clock())
         rec2 = self.lc.try_entry("ADAUSDT", 1, 0.35, T0 + BAR,
                                  self.clock())[0]
         self.assertEqual(rec2["result"], "FILLED")
         pos2 = self.lc.rm._pos(rec2["pos_id"])
-        self.assertEqual(pos2["units"], 285.0)
-        self.assertAlmostEqual(pos2["units"] * pos2["entry_px"], 99.75,
+        self.assertEqual(pos2["units"], 282.0)
+        self.assertAlmostEqual(pos2["units"] * pos2["entry_px"], 98.7,
                                places=6)
 
     # ---- 100 USDT toplam + 2 pozisyon sınırı ------------------------------------
@@ -178,11 +187,12 @@ class NotionalTests(unittest.TestCase):
     # ---- fill sonrası fiyat hareketi ---------------------------------------------
 
     def test_fill_price_movement_over_100_exits(self):
-        """Giriş 100 üzerinden boyutlandı, fill 102'den → notional 102 >
-        100*(1+%1) → OVER_LIMIT_EXIT (§8: limit ihlali → anında çıkış)."""
+        """Giriş 100 üzerinden boyutlandı, fill 102'den → notional 0.99*102
+        = 100.98 > 100 SERT cap → OVER_LIMIT_EXIT (§8: limit ihlali → anında
+        çıkış; buffer slippage ödedi, cap yine aşıldı → kapat)."""
         self.ex.set_mark("ETHUSDT", 102.0)
         self.lc.rm.update_mark("ETHUSDT", 102.0, self.clock())
-        rec = open_one(self.lc, "ETHUSDT", 1)      # ref_px 100 → qty 1.0
+        rec = open_one(self.lc, "ETHUSDT", 1)      # ref_px 100 → qty 0.99
         self.assertEqual(rec["result"],
                          "OVER_LIMIT_EXIT: fill notional limiti aştı")
         pos = self.lc.rm._pos(rec["pos_id"])
@@ -192,30 +202,39 @@ class NotionalTests(unittest.TestCase):
         self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], 0.0)
         self.assertEqual(len(self._exit_posts()), 1)
 
-    def test_fill_notional_at_tolerance_kept(self):
-        """Fill 100.9 → notional 100.9, tek pozisyon limiti tam %1
-        tolerans sınırında (100.9 ≤ 100*1.01) → pozisyon KALIR."""
+    def test_fill_notional_under_hard_cap_kept(self):
+        """Fill 100.9 → notional 0.99*100.9 = 99.89 ≤ 100 SERT cap →
+        pozisyon KALIR (eski %1 tolerans kaldırıldı: cap aşılmadıysa
+        kalır, aşıldıysa anında çıkış)."""
         self.ex.set_mark("ETHUSDT", 100.9)
         self.lc.rm.update_mark("ETHUSDT", 100.9, self.clock())
-        rec = open_one(self.lc, "ETHUSDT", 1)      # qty 1.0, fill 100.9
+        rec = open_one(self.lc, "ETHUSDT", 1)      # qty 0.99, fill 100.9
         self.assertEqual(rec["result"], "FILLED")
         self.assertEqual(len(self.lc.rm.open_positions()), 1)
         total = self.lc.rm.total_notional(self.clock())
-        self.assertLessEqual(total, 100.0 * 1.01)
+        self.assertLessEqual(total, 100.0)
 
     # ---- komisyon rezervi + çift sayım yok -----------------------------------------
 
     def test_stop_price_includes_commission_reserve(self):
-        """Stop, -5 bütçesinden KOMİSYON düşülerek hesaplanır: 5 − 0.05
-        (giriş, 100 notional × %0.05) − 0.05 (tahmini çıkış) = 4.90 →
-        100 − 4.90 = 95.10 (tick'e yuvarla, ERKEN taraf). 95.00 DEĞİL
-        (komisyonsuz hesap)."""
-        open_one(self.lc, "ETHUSDT", 1)
+        """Stop, -5 bütçesinden KOMİSYON düşülerek hesaplanır (BLOK31
+        boyutlamasıyla): 5 − 0.0495 (giriş) − 0.0495 (tahmini çıkış) =
+        4.901 → 100 − 4.901/0.99 = 95.0495 → tick'e ERKEN yuvarlama →
+        95.05. Komisyonsuz hesap (100 − 5/0.99 = 94.9495) DEĞİL."""
+        rec = open_one(self.lc, "ETHUSDT", 1)
         a = self.ex.algos["C281P1"]
         self.assertEqual(a["type"], "STOP_MARKET")
         self.assertEqual(a["workingType"], "MARK_PRICE")
-        self.assertEqual(float(a["triggerPrice"]), 95.10)
-        self.assertGreater(float(a["triggerPrice"]), 95.00)
+        pos = self.lc.rm._pos(rec["pos_id"])
+        comm = pos["entry_comm"]
+        trig = stop_trigger(self.ex, rec["pos_id"])
+        self.assertAlmostEqual(trig, 95.05, places=6)
+        # komisyon rezervi: komisyonsuz stop'tan ERKEN (girişe daha yakın)
+        self.assertGreater(trig, pos["entry_px"] - 5.0 / pos["units"])
+        # bütçe dahil hesabın dışına taşmaz (tick payı ≤ 0.01)
+        raw = pos["entry_px"] - (5.0 - 2 * comm) / pos["units"]
+        self.assertGreaterEqual(trig, raw - 1e-9)
+        self.assertLess(trig, raw + 0.01)
 
     def test_funding_counted_once_not_double(self):
         rec = open_one(self.lc, "ETHUSDT", 1)
@@ -234,12 +253,13 @@ class NotionalTests(unittest.TestCase):
             "SELECT COALESCE(SUM(amount),0) FROM funding WHERE pos_id=?",
             (rec["pos_id"],)).fetchone()[0]
         self.assertAlmostEqual(fund2, -0.5, places=9)
-        # zarar: (100-95)*1.0 + 0.05 + 0.5 = 5.55 (funding dahil)
+        # zarar: (100-95)*units + giriş komisyonu + 0.5 funding (dahil)
         self.ex.set_mark("ETHUSDT", 95.0)
         self.lc.rm.update_mark("ETHUSDT", 95.0, self.clock())
-        loss = self.lc.rm.position_net_loss(self.lc.rm._pos(rec["pos_id"]),
-                                            self.clock())
-        self.assertAlmostEqual(loss, 5.55, places=6)
+        pos = self.lc.rm._pos(rec["pos_id"])
+        expected = (100.0 - 95.0) * pos["units"] + pos["entry_comm"] + 0.5
+        loss = self.lc.rm.position_net_loss(pos, self.clock())
+        self.assertAlmostEqual(loss, expected, places=6)
 
     def test_canary_external_pnl_excluded(self):
         """Canary dışı (başka bot) pozisyonu rm zararına GİRMEZ."""
@@ -248,8 +268,9 @@ class NotionalTests(unittest.TestCase):
         self.ex.set_mark("XRPUSDT", 0.5)           # dış pozisyon -500 uPnL
         self.lc.rm.update_mark("XRPUSDT", 0.5, self.clock())
         loss = self.lc.rm.total_net_loss(self.clock())
-        # yalnız ETH: 0.05 komisyon (100 notional × %0.05)
-        self.assertAlmostEqual(loss, 0.05, places=6)
+        # yalnız ETH: giriş komisyonu (99 notional × %0.05 = 0.0495)
+        self.assertAlmostEqual(loss, self.lc.rm._pos(rec["pos_id"])
+                               ["entry_comm"], places=6)
 
 
 if __name__ == "__main__":

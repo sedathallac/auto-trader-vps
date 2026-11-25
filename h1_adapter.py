@@ -169,6 +169,13 @@ class H1SignalEngine:
     def direction(self, symbol) -> int:
         return self._state(symbol)["dir"]
 
+    def pending(self, symbol) -> int:
+        """Read-only: şu an bekleyen (bir sonraki bar açılışında icra
+        edilecek) flip yönü — 0 = bekleyen flip yok. BLOK31: canary_live
+        due-flip taraması ve strateji döngüsü gözlemlenebilirliği için;
+        durum DEĞİŞTİRMEZ (pop yalnız begin_bar'da)."""
+        return self._state(symbol)["pend"]
+
     def sigma(self, symbol) -> Optional[float]:
         """Annualized EWMA vol after the latest close (None before warmup)."""
         v = self._state(symbol)["var"]

@@ -15,7 +15,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
-                                 open_one, T0)
+                                 open_one, loss_mark, T0)
 
 BAR = 4 * 3600 * 1000
 from canary_live import WorkerLockHeld
@@ -42,7 +42,8 @@ class LoopTests(unittest.TestCase):
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05)
+        # net zarar tam -5.00 (gerçek units/komisyondan türetilmiş mark)
+        self.ex.set_mark("ETHUSDT", loss_mark(self.lc, rec["pos_id"], 5.00))
         cyc = self.lc.risk_tick()                 # TEK risk tick yeter
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -54,7 +55,9 @@ class LoopTests(unittest.TestCase):
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
         self.clock.advance(10_000)
-        self.ex.set_mark("ETHUSDT", 95.05, ts=self.clock() - 5_000)
+        self.ex.set_mark("ETHUSDT",
+                         loss_mark(self.lc, rec["pos_id"], 5.00),
+                         ts=self.clock() - 5_000)
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])
@@ -63,8 +66,10 @@ class LoopTests(unittest.TestCase):
         """30s eşiği (PROVIZYONEL): 29s → hesap yapılır; 31s → fail-closed."""
         rec = open_one(self.lc, "ETHUSDT", 1)
         self.ex.algos["C281P1"]["status"] = "CANCELED"
-        # 29s: eşik içi → loss hesaplanır (95.05 → -5.00 → SAFE_EXIT)
-        self.ex.set_mark("ETHUSDT", 95.05, ts=self.clock() - 29_000)
+        # 29s: eşik içi → loss hesaplanır (-5.00 → SAFE_EXIT)
+        self.ex.set_mark("ETHUSDT",
+                         loss_mark(self.lc, rec["pos_id"], 5.00),
+                         ts=self.clock() - 29_000)
         cyc = self.lc.risk_tick()
         self.assertIn({"pos_id": rec["pos_id"], "action": "SAFE_EXIT"},
                       cyc["risk_actions"])

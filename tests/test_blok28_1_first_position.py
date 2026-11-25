@@ -142,8 +142,9 @@ class FirstPositionTests(unittest.TestCase):
         now3 = T0 + 4 * BAR
         self._fresh_marks(now3)
         out3 = self._flip("LINKUSDT", -1, T0 + 3 * BAR, now3)
-        self.assertEqual(out3[0]["result"], "REJECTED: toplam notional "
-                                           "200.00 > 100.0 USDT")
+        # BLOK31: buffer'lı boyutlama (99) — reddin NEDENİ korunur
+        self.assertIn("REJECTED", out3[0]["result"])
+        self.assertIn("toplam notional", out3[0]["result"])
         self.assertNotIn("ilk pozisyonun fill+koruma doğrulaması",
                          str(out3[0].get("blockers")))
         self.assertEqual(len(self.lc.rm.open_positions()), 1)
@@ -156,7 +157,8 @@ class FirstPositionTests(unittest.TestCase):
         self._fresh_marks(now)
         out = self._flip("ETHUSDT", 1, T0 + BAR, now)
         self.assertEqual(out[0]["result"], "FILLED")
-        again = self.lc.try_entry("ETHUSDT", 1, 100.0, T0 + BAR, now)
+        # BLOK31: sig anahtarı KARAR barının ts'si (flip'te bar_ot−BAR = T0)
+        again = self.lc.try_entry("ETHUSDT", 1, 100.0, T0, now)
         self.assertEqual(again[0]["result"], "DUPLICATE_SIGNAL")
         self.assertEqual(len(self.lc.rm.open_positions()), 1)
 
@@ -169,7 +171,8 @@ class FirstPositionTests(unittest.TestCase):
         out = self._flip("ETHUSDT", 1, T0 + BAR, now)
         self.assertEqual(out[0]["result"], "FILLED")
         lc2 = make_canary(self.tmp.name, self.ex)    # aynı DB
-        again = lc2.try_entry("ETHUSDT", 1, 100.0, T0 + BAR, now)
+        # BLOK31: sig anahtarı KARAR barının ts'si (flip'te bar_ot−BAR = T0)
+        again = lc2.try_entry("ETHUSDT", 1, 100.0, T0, now)
         self.assertEqual(again[0]["result"], "DUPLICATE_SIGNAL")
         self.assertEqual(len(lc2.rm.open_positions()), 1)
 
@@ -222,8 +225,8 @@ class FirstPositionTests(unittest.TestCase):
         # flip AÇILIŞI: short giriş aynı bar açılışında
         self.assertEqual(out2[0]["result"], "FILLED")
         self.assertEqual(out2[0]["direction"], -1)
-        # ters pozisyon YOK — borsada tek (short) pozisyon (qty 1.0 @100)
-        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], -1.0)
+        # ters pozisyon YOK — borsada tek (short) pozisyon (qty 0.99 @100)
+        self.assertEqual(self.ex.positions["ETHUSDT"]["positionAmt"], -0.99)
         self.assertEqual(len(self.lc.rm.open_positions()), 1)
 
 

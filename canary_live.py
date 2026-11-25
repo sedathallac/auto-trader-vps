@@ -62,11 +62,19 @@ CANARY_NOTIONAL = MAX_POSITION_NOTIONAL
 MARK_STALE_AFTER_SECONDS = MARK_STALE_S          # 30s (BLOK28.0'dan devralınan)
 STRATEGY_LOOP_S = 300.0                           # H1 sinyal döngüsü
 RISK_LOOP_S = 5.0                                 # mark örnekleme temposu
-NOTIONAL_SLIPPAGE_TOL = 0.01                      # fill sonrası %1 tolerans
 
 BAR_MS = 4 * 3600 * 1000
 WARMUP_BARS = 400
-STALE_BAR_MS = 8 * 3600 * 1000       # paper_runner/shadow ile aynı
+
+# BLOK31 (2026-11-25): giriş ANI fiyat/boyutlama güvenliği — eski bar
+# açılış fiyatıyla saatler sonra MARKET emir gönderme hatasının düzeltmesi.
+# NOTIONAL_SLIPPAGE_TOL KALDIRILDI: fill sonrası %1 tolerans, 100 USDT
+# operatör hard cap'ini fiilen 101'e çıkarıyordu; artık hard cap = 100
+# (ihlal → reduce-only çıkış + açık ihlal kaydı) ve qty, slippage payıyla
+# AŞAĞI boyutlanır (ENTRY_SIZE_BUFFER).
+PRICE_STALE_MS = 30_000             # bookTicker güncelliği (MARK_STALE_S hizalı)
+SIGNAL_PRICE_DEVIATION_MAX = 0.02   # taze icra fiyatı ↔ sinyal kapanışı sapması
+ENTRY_SIZE_BUFFER = 0.01            # MARKET slippage payı — qty aşağı boyutlanır
 
 # HALT state machine (§3)
 HALT_ACTIVE = "CANARY_ACTIVE"
@@ -535,7 +543,8 @@ class LiveCanary:
                 "WHERE status IN ('INTENT','SUBMITTED','UNKNOWN',"
                 "'PARTIALLY_FILLED')").fetchall():
             cid, kind, sym, status = row
-            if kind == "ENTRY" and status in ("UNKNOWN", "SUBMITTED"):
+            if kind == "ENTRY" and status in ("UNKNOWN", "SUBMITTED",
+                                              "PARTIALLY_FILLED"):
                 self._resolve_entry_order(cid, sym)
         # 4) sahipliği kanıtlanamayan açık emirler
         for o in open_orders:
@@ -600,6 +609,107 @@ class LiveCanary:
     # =========================================================================
     # GİRİŞ ZİNCİRİ (§5, §7)
     # =========================================================================
+    def _executable_price(self, symbol, direction, now_ms=None):
+        """Giriş ANINDA icra edilebilir fiyat (BLOK31 §2.3): BUY→ask,
+        SELL→bid (bookTicker, public). Geçersiz/stale/çapraz fiyat →
+        (None, neden) — fail-closed; emir ASLA eski bar fiyatıyla
+        gönderilmez."""
+        now_ms = now_ms or self._now()
+        try:
+            t = self.exchange.book_ticker(symbol)
+        except ExchangeUnavailable as e:
+            return None, f"bookTicker okunamadı ({type(e).__name__}: {e})"
+        except Exception as e:
+            return None, f"bookTicker beklenmeyen hata ({type(e).__name__}: {e})"
+        try:
+            bid = float(t["bidPrice"])
+            ask = float(t["askPrice"])
+            ts = int(t.get("time") or 0)
+        except (KeyError, TypeError, ValueError):
+            return None, "bookTicker alanları okunamadı"
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None, f"bookTicker geçersiz (bid={bid} ask={ask})"
+        if ts <= 0 or now_ms - ts > PRICE_STALE_MS:
+            return None, (f"bookTicker stale ({(now_ms - ts) / 1000:.0f}s"
+                          f" > {PRICE_STALE_MS // 1000}s)")
+        px = ask if direction > 0 else bid
+        return px, {"bid": bid, "ask": ask, "ts": ts}
+
+    def _attempt_due_flip(self, symbol, now_ms, states=None):
+        """Engine'deki due flip'i KARAR ANINDA (bar kapanışı = sonraki bar
+        açılışı) taze icra fiyatıyla değerlendirir (BLOK31 — eski bar
+        açılış fiyatıyla ~4 saat sonra MARKET gönderme hatasının düzeltmesi):
+          - karar penceresi (karar barı kapanışı + 1 bar) KAPANDIYSA → flip
+            tüketilir + MISSED_FLIP kaydı (fail-closed; eski sinyal icra
+            edilmez, oynatılmaz)
+          - taze fiyat alınamıyorsa → flip TUTULUR, sonraki tike retry
+            (FLIP_PRICE_RETRY kaydı; sinyal kaybolmaz)
+          - sapma kapısı (taze fiyat ↔ sinyal kapanışı) aşılıyorsa → flip
+            tüketilir + MISSED_FLIP kaydı
+        Başarıda (symbol, direction, px, karar barı ts, qv, sinyal kapanışı)
+        olayı döner; emir zinciri (try_entry) strategy_tick'te çağrılır."""
+        S = self.engine._state(symbol)
+        if not S["pend"] or S["pend"] == S["dir"]:
+            return None
+        direction = S["pend"]
+        bar_ts = S["pend_bar_ts"]
+        sig_px = S["pend_price"]
+        decision_ts = (bar_ts or 0) + BAR_MS
+        st = states.get(symbol) if states else None
+
+        def _note(decision, reason):
+            if st is not None:
+                st["decision"] = decision
+                st["decision_reason"] = reason
+
+        # 1) karar penceresi: flip, karar barından SONRAKİ barın açılışında
+        #    icra edilir; o bar kapandıysa pencere geçmiştir → MISSED
+        if now_ms - decision_ts > BAR_MS:
+            self.engine.begin_bar(symbol, sig_px or 0.0)      # tüket
+            reason = (f"karar penceresi kapandı (karar yaşı "
+                      f"{(now_ms - decision_ts) / 3600000:.1f}h > "
+                      f"{BAR_MS / 3600000:.0f}h)")
+            self._log("live_orders.jsonl",
+                      {"t": now_ms, "kind": "MISSED_FLIP", "symbol": symbol,
+                       "bar_ts": bar_ts, "direction": direction,
+                       "signal_px": sig_px, "reason": reason,
+                       "execute": False})
+            _note("SIGNAL_STALE", reason)
+            return None
+        # 2) taze icra fiyatı (BUY→ask, SELL→bid; freshness kapılı)
+        px, pmeta = self._executable_price(symbol, direction, now_ms)
+        if px is None:
+            self._log("live_orders.jsonl",
+                      {"t": now_ms, "kind": "FLIP_PRICE_RETRY",
+                       "symbol": symbol, "bar_ts": bar_ts,
+                       "reason": pmeta})
+            _note("PRICE_UNAVAILABLE", pmeta)
+            return None
+        # 3) sapma kapısı: taze fiyat sinyal kapanışından çok uçtuysa girme
+        if sig_px and abs(px - sig_px) / sig_px > SIGNAL_PRICE_DEVIATION_MAX:
+            dev = abs(px - sig_px) / sig_px
+            self.engine.begin_bar(symbol, px)                 # tüket
+            reason = (f"fiyat sapma kapısı: taze {px:.6f} vs sinyal kapanışı "
+                      f"{sig_px:.6f} (%{dev * 100:.2f} > "
+                      f"{SIGNAL_PRICE_DEVIATION_MAX * 100:.0f})")
+            self._log("live_orders.jsonl",
+                      {"t": now_ms, "kind": "MISSED_FLIP", "symbol": symbol,
+                       "bar_ts": bar_ts, "direction": direction,
+                       "signal_px": sig_px, "executable_px": px,
+                       "reason": reason, "execute": False})
+            _note("PRICE_DEVIATION", reason)
+            return None
+        # 4) ICRA: flip karar anında (= icra barı açılışı) taze fiyatla
+        #    tüketilir; dir ilerler. Sonuç (executed/blocked) try_entry'de.
+        d = self.engine.begin_bar(symbol, px)
+        d.execution_ts = decision_ts
+        d.ref_price = px
+        if st is not None:
+            st["decision"] = "SIGNAL_VALID"
+            st["current_executable_price"] = px
+            st["price_age_ms"] = now_ms - pmeta.get("ts", now_ms)
+        return (symbol, direction, px, bar_ts, None, sig_px)
+
     def _entry_blockers(self, symbol, direction, bar_ts, now_ms):
         """Giriş öncesi tüm kapılar — ret nedenleri listesi (boş = geçer)."""
         reasons = []
@@ -612,9 +722,14 @@ class LiveCanary:
             reasons.append("ENTRY_PAUSED (operatör giriş duraklatması — "
                            "mevcut pozisyon yönetimi ve çıkışlar çalışır)")
 
-        if bar_ts <= self.t0_ms:
-            reasons.append(f"T0 öncesi/eski sinyal (bar_ts {bar_ts} <= "
-                           f"t0 {self.t0_ms}) — eski -1x8 hedefleri emir "
+        # BLOK31: T0 kapısı KARAR ZAMANINA göre — bar_ts karar barının
+        # AÇILIŞI; karar, kapanışta (bar_ts + BAR_MS) verilir. T0'dan önce
+        # AÇILIP T0'dan sonra KAPANAN barın sinyali T0 sonrası ilk GEÇERLİ
+        # sinyaldir (eski kod ot <= t0 kontrolüyle bunu yanlışlıkla
+        # engelliyor ve dedup nedeniyle kalıcı kaybediyordu).
+        if bar_ts + BAR_MS <= self.t0_ms:
+            reasons.append(f"T0 öncesi/eski sinyal (karar {bar_ts + BAR_MS} "
+                           f"<= t0 {self.t0_ms}) — eski -1x8 hedefleri emir "
                            "oluşturamaz")
         if self._get_state("feed_down_ts"):
             reasons.append("Mark Price feed kesintide (fail-closed)")
@@ -638,7 +753,8 @@ class LiveCanary:
         opens = self.rm.open_positions()
         pending_entries = self._db_execute(
             "SELECT COUNT(*) FROM live_orders WHERE kind='ENTRY' AND status "
-            "IN ('INTENT','SUBMITTED','UNKNOWN')").fetchone()[0]
+            "IN ('INTENT','SUBMITTED','UNKNOWN','PARTIALLY_FILLED')"
+        ).fetchone()[0]
         first_verified = str(self._get_state("first_position_verified")
                              or "0") == "1"
         if (opens or pending_entries) and not first_verified:
@@ -682,11 +798,15 @@ class LiveCanary:
         return f"{qty:.{prec}f}", None
 
     def try_entry(self, symbol, direction, ref_px, bar_ts, now_ms=None,
-                  qv=None):
-        """Tam giriş zinciri (§5 adım 1-9). Ret/engel her durumda kayda geçer."""
+                  qv=None, signal_px=None):
+        """Tam giriş zinciri (§5 adım 1-9). ref_px = İCRA ANI fiyatı
+        (BLOK31: strateji yolu bookTicker ask/bid getirir; eski bar açılışı
+        ASLA kullanılmaz); signal_px = sinyal barı kapanışı (sapma kaydı).
+        Ret/engel her durumda kayda geçer."""
         now_ms = now_ms or self._now()
         rec = {"t": now_ms, "kind": "LIVE_ENTRY_ATTEMPT", "symbol": symbol,
-               "direction": direction, "bar_ts": bar_ts, "ref_px": ref_px}
+               "direction": direction, "bar_ts": bar_ts, "ref_px": ref_px,
+               "signal_px": signal_px}
         out = [rec]
         if direction == 0:
             rec["result"] = "FLAT_TARGET"
@@ -706,7 +826,8 @@ class LiveCanary:
             self.rm._event("ENTRY_BLOCKED",
                            f"{symbol} {' | '.join(blockers)[:300]}")
             return out
-        qty_str, err = self._sizing(symbol, ref_px)
+        qty_str, err = self._sizing(
+            symbol, ref_px, CANARY_NOTIONAL * (1 - ENTRY_SIZE_BUFFER))
         if err:
             rec["result"] = "BLOCKED"
             rec["blockers"] = [err]
@@ -714,6 +835,8 @@ class LiveCanary:
             self.rm._event("ENTRY_BLOCKED", f"{symbol} {err}")
             return out
         qty = float(qty_str)
+        rec["qty"] = qty_str
+        rec["notional"] = round(qty * ref_px, 6)
         with self._entry_lock:
             # BLOK30 §4: ortak giriş kapısı (flock) — operatör CLI'si ile
             # aynı kilidi paylaşır. INTENT kaydı + new_order() + sonuç
@@ -810,8 +933,11 @@ class LiveCanary:
         comm = sum(float(f.get("commission", 0) or 0)
                    for f in resp.get("fills", []))
         notional = qty * avg
-        # fill sonrası notional kontrolü (§8: price movement sonrası)
-        if notional > MAX_POSITION_NOTIONAL * (1 + NOTIONAL_SLIPPAGE_TOL):
+        # fill sonrası notional kontrolü (§8) — BLOK31: HARD cap (100).
+        # Eski %1 tolerans (NOTIONAL_SLIPPAGE_TOL) sınırın fiilen 101'e
+        # çıkmasına izin veriyordu; ihlal artık açık kayıt + reduce-only
+        # çıkış üretir ve "sınır içinde" gibi RAPORLANMAZ.
+        if notional > MAX_POSITION_NOTIONAL + 1e-9:
             pos_id = self.rm.open_position(symbol, direction, notional, avg,
                                            now_ms, comm)
             self._db_execute("INSERT OR REPLACE INTO live_positions "
@@ -819,21 +945,32 @@ class LiveCanary:
                             " updated_ts) VALUES (?,?,?,?,?)",
                             (pos_id, symbol, P_FAILED, X_NONE, now_ms))
             self.db.commit()
-            self._upsert_order(cid, "ENTRY", symbol, O_FILLED, pos_id=pos_id)
+            # result=resp: fill yanıtı (executedQty/avgPrice/komisyon) sonraki
+            # pos_id güncellemesiyle EZİLMEZ — denetim izi kalıcı (BLOK31 §6)
+            self._upsert_order(cid, "ENTRY", symbol, O_FILLED, pos_id=pos_id,
+                               result=resp)
+            self.rm._event("OVER_LIMIT_NOTIONAL",
+                           f"{symbol} fill notional {notional:.4f} > "
+                           f"{MAX_POSITION_NOTIONAL} (HARD cap) — reduce-only "
+                           "çıkış başlatıldı")
             self.initiate_risk_exit(pos_id, "OVER_LIMIT_NOTIONAL")
             return {"pos_id": pos_id, "result":
                     "OVER_LIMIT_EXIT: fill notional limiti aştı"}
         pos_id = self.rm.open_position(symbol, direction, notional, avg,
                                        now_ms, comm)
-        self._upsert_order(cid, "ENTRY", symbol, O_FILLED, pos_id=pos_id)
+        self._upsert_order(cid, "ENTRY", symbol, O_FILLED, pos_id=pos_id,
+                           result=resp)
         total_n = self.rm.total_notional(now_ms)
-        if total_n is not None and \
-                total_n > MAX_TOTAL_NOTIONAL * (1 + NOTIONAL_SLIPPAGE_TOL):
+        if total_n is not None and total_n > MAX_TOTAL_NOTIONAL + 1e-9:
             self._db_execute("INSERT OR REPLACE INTO live_positions "
                             "(pos_id, symbol, protection_status, exit_status,"
                             " updated_ts) VALUES (?,?,?,?,?)",
                             (pos_id, symbol, P_FAILED, X_NONE, now_ms))
             self.db.commit()
+            self.rm._event("OVER_LIMIT_TOTAL_NOTIONAL",
+                           f"toplam fill notional {total_n:.4f} > "
+                           f"{MAX_TOTAL_NOTIONAL} (HARD cap) — reduce-only "
+                           "çıkış başlatıldı")
             self.initiate_risk_exit(pos_id, "OVER_LIMIT_TOTAL_NOTIONAL")
             return {"pos_id": pos_id, "result":
                     "OVER_LIMIT_EXIT: toplam notional limiti aştı"}
@@ -1187,7 +1324,8 @@ class LiveCanary:
         """ENTRY UNKNOWN/SUBMITTED → client id ile sorgu; körlemesine tekrar
         POST edilmez."""
         o = self._order_row(cid)
-        if o is None or o["status"] not in (O_UNKNOWN, O_SUBMITTED, O_INTENT):
+        if o is None or o["status"] not in (O_UNKNOWN, O_SUBMITTED, O_INTENT,
+                                            O_PARTIAL):
             return
         try:
             resp = self.exchange.query_order(symbol, client_order_id=cid)
@@ -1200,7 +1338,11 @@ class LiveCanary:
         status = resp.get("status")
         self._upsert_order(cid, "ENTRY", symbol, status,
                            exchange_id=str(resp.get("orderId")), result=resp)
-        if status == O_FILLED and not o.get("pos_id"):
+        # terminal duruma ulaşmış ama KISMEN dolmuş giriş → gerçek fill'i
+        # deftere işle (executedQty > 0); borsada sahipsiz pozisyon kalmasın
+        if not o.get("pos_id") and status in (O_FILLED, O_PARTIAL, "EXPIRED",
+                                              O_CANCELED) and \
+                float(resp.get("executedQty") or 0) > 0:
             self._process_late_entry_fill(cid, resp, symbol)
 
     def _process_late_entry_fill(self, cid, resp, symbol):
@@ -1503,7 +1645,8 @@ class LiveCanary:
         # çözülmeden yeni giriş zinciri ilerleyemez)
         for row in self._db_execute(
                 "SELECT client_id, symbol FROM live_orders WHERE kind="
-                "'ENTRY' AND status IN ('UNKNOWN','SUBMITTED')").fetchall():
+                "'ENTRY' AND status IN ('UNKNOWN','SUBMITTED',"
+                "'PARTIALLY_FILLED')").fetchall():
             self._resolve_entry_order(row[0], row[1])
         # 4) limit değerlendirme (SAFE_EXIT / HALT tetikleri)
         try:
@@ -1648,6 +1791,7 @@ class LiveCanary:
     # =========================================================================
     def strategy_tick(self, now_ms=None, klines_by_sym=None):
         now = now_ms or self._now()
+        fetch_errors = {}
         if klines_by_sym is None:
             klines_by_sym = {}
             for s in self.symbols:
@@ -1656,11 +1800,15 @@ class LiveCanary:
                     klines_by_sym[s] = [(int(k[0]), float(k[1]),
                                          float(k[4]), float(k[7]))
                                         for k in rows]
-                except ExchangeUnavailable:
-                    continue
-        events = self._evaluate(now, klines_by_sym)
+                except ExchangeUnavailable as e:
+                    fetch_errors[s] = f"{type(e).__name__}: {e}"
+                except Exception as e:
+                    # parse/beklenmeyen hata da sembol bazında fail-closed —
+                    # eskiden sessizce yutuluyordu (BLOK31 §5)
+                    fetch_errors[s] = f"{type(e).__name__}: {e}"
+        events, states = self._evaluate(now, klines_by_sym, fetch_errors)
         out = []
-        for (symbol, direction, ref_px, bar_ts, qv) in events:
+        for (symbol, direction, ref_px, bar_ts, qv, signal_px) in events:
             # strateji çıkışı (flip'in kapanış bacağı — risk AZALTAN,
             # HALT'ta da serbest; reduce-only)
             for pos in self.rm.open_positions():
@@ -1671,29 +1819,62 @@ class LiveCanary:
                         self.initiate_risk_exit(pos["pos_id"],
                                                 "H1_FLIP_STRATEGY_EXIT")
             if direction != 0:
-                out.extend(self.try_entry(symbol, direction, ref_px,
-                                          bar_ts, now, qv))
+                recs = self.try_entry(symbol, direction, ref_px, bar_ts,
+                                      now, qv, signal_px=signal_px)
+                out.extend(recs)
+                if states.get(symbol) is not None:
+                    states[symbol]["entry_result"] = recs[0].get("result")
+                    states[symbol]["entry_blockers"] = recs[0].get("blockers")
+        # BLOK31 §5: her strateji döngüsü GÖRÜNÜR — başarı/başarısızlık ve
+        # sembol bazlı durum ayrık kayda geçer (thread'in bu kaydı yazması
+        # döngünün çalıştığının kendisidir)
+        seq = int(self._get_state("strategy_cycle_seq") or 0) + 1
+        self._set_state("strategy_cycle_seq", seq)
+        self._log("strategy_cycles.jsonl",
+                  {"t": now, "kind": "STRATEGY_CYCLE", "cycle_id": seq,
+                   "written_by": "canary-strategy",
+                   "fetch_errors": fetch_errors,
+                   "symbols": [states[s] for s in self.symbols
+                               if states.get(s) is not None]})
         return out
 
-    def _evaluate(self, now_ms, klines_by_sym):
+    def _evaluate(self, now_ms, klines_by_sym, fetch_errors=None):
         """Shadow/paper semantiği: warmup replay execute'siz; YENİ barların
-        flip'i bar açılışında icra; STALE_BAR_MS; kalıcı last_bar dedup."""
+        sinyali KARAR ANINDA (bar kapanışı = sonraki bar açılışı) taze icra
+        fiyatıyla değerlendirilir (BLOK31); kalıcı last_bar dedup;
+        penceresi geçen flip MISSED (fail-closed). (symbol, direction,
+        px, karar barı ts, qv, sinyal kapanışı) olayları + sembol bazlı
+        durum haritası döner."""
         decisions = []
+        states = {}
         warmup_events, live_events = [], []
-        newly_warmed = set()
-        for s, kl in klines_by_sym.items():
+        attempted = set()
+        for s in self.symbols:
+            kl = klines_by_sym.get(s)
+            if kl is None:
+                states[s] = {"symbol": s, "interval": "4h"}
+                continue
             last = self._last_bar.get(s)
             cold = s not in self._warmed
+            n_new = 0
+            latest_closed = None
             for (ot, o, c, qv) in kl:
                 if ot + BAR_MS > now_ms:
-                    continue
+                    continue                      # açık mum ASLA girdi değil
+                latest_closed = ot if latest_closed is None \
+                    else max(latest_closed, ot)
                 if last is not None and ot <= last and not cold:
                     continue
                 if cold and (last is None or ot <= last):
                     warmup_events.append((ot, s, o, c, qv))
-                    newly_warmed.add(s)
                 else:
                     live_events.append((ot, s, o, c, qv))
+                    n_new += 1
+            states[s] = {"symbol": s, "interval": "4h",
+                         "bar_count": len(kl), "new_bar_count": n_new,
+                         "latest_closed_bar": latest_closed,
+                         "last_processed_bar": last,
+                         "warmup": s in self._warmed}
         warmup_events.sort(key=lambda e: (e[0], e[1]))
         live_events.sort(key=lambda e: (e[0], e[1]))   # deterministik seçim:
         # kronolojik (bar_ts, symbol) sıra + limit kapısı — var olan,
@@ -1706,25 +1887,61 @@ class LiveCanary:
         for s, ot in warm_last.items():
             self._warmed.add(s)
             self._set_last(s, ot)
+        qv_by = {}
         for (ot, s, o, c, qv) in live_events:
             self._set_last(s, ot)
-            pend = self.engine.begin_bar(s, o)
-            if pend is not None:
-                pend.execution_ts = ot
-                pend.ref_price = o
-                if now_ms - ot > STALE_BAR_MS:
-                    self._log("live_orders.jsonl",
-                              {"t": now_ms, "kind": "STALE_BAR", "symbol": s,
-                               "bar_ts": ot, "execute": False})
-                else:
-                    decisions.append((s, pend.direction, o, ot, qv))
+            qv_by[s] = qv
+            # (c)+(e): EWMA + BU kapanışta sinyal → pend hemen değerlendirme
+            # alır (karar anı = bu barın kapanışı = sonraki barın açılışı)
             self.engine.end_bar(s, ot, c)
             self._warmed.add(s)
+            attempted.add(s)
+            ev = self._attempt_due_flip(s, now_ms, states)
+            if ev is not None:
+                decisions.append(ev)
+        # önceki tiklerden kalan due flip'ler (fiyat retry / restart sonrası
+        # warmup sınırı): (karar barı, symbol) kronolojik deterministik sıra
+        leftover = [s for s in self.symbols
+                    if self.engine.pending(s) and s not in attempted]
+        leftover.sort(key=lambda s: (self.engine._state(s)["pend_bar_ts"]
+                                     or 0, s))
+        for s in leftover:
+            ev = self._attempt_due_flip(s, now_ms, states)
+            if ev is not None:
+                decisions.append(ev)
+        # sembol bazlı durum etiketleri (gözlemlenebilirlik — BLOK31 §5)
+        for s, row in states.items():
+            row["signal_direction"] = self.engine.direction(s)
+            row["signal_pending"] = self.engine.pending(s)
+            S = self.engine._state(s)
+            if S["pend"]:
+                row["signal_timestamp"] = S["pend_bar_ts"]
+                row["signal_price_reference"] = S["pend_price"]
+            if row.get("decision"):
+                continue
+            if s in (fetch_errors or {}):
+                row["decision"] = "DATA_FETCH_ERROR"
+                row["decision_reason"] = fetch_errors[s]
+            elif "bar_count" not in row:
+                row["decision"] = "NO_KLINES"
+                row["decision_reason"] = "bu tikte kline verisi sağlanmadı"
+            elif not row.get("warmup") and s not in self._warmed:
+                row["decision"] = "WARMUP"
+                row["decision_reason"] = "henüz yeterli bar yok"
+            elif self.engine.pending(s):
+                row["decision"] = "PRICE_UNAVAILABLE"
+                row["decision_reason"] = "due flip taze fiyat bekliyor (retry)"
+            elif row.get("new_bar_count"):
+                row["decision"] = "NO_SIGNAL"
+                row["decision_reason"] = "yeni kapalı bar işlendi, flip yok"
+            else:
+                row["decision"] = "NO_NEW_CLOSED_BAR"
+                row["decision_reason"] = "işlenecek yeni kapalı bar yok"
         if warmup_events:
             self._log("live_orders.jsonl",
                       {"t": now_ms, "kind": "WARMUP_DONE",
                        "bars_replayed": len(warmup_events), "execute": False})
-        return decisions
+        return decisions, states
 
     def _set_last(self, symbol, ot):
         self._last_bar[symbol] = ot

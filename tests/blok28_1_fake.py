@@ -98,6 +98,9 @@ class FakeExchange:
         self.partial_fill_qty = {}          # client_id → dolacak miktar
         self.post_calls = []                # tüm mutasyon çağrı kaydı
         self.kline_data = {}                # symbol → klines
+        self.book_ticker_fail = set()       # sembol bazlı bookTicker hatası
+        self.book_ticker_time = {}          # symbol → time override (stale)
+        self.book_spread = 0.0002           # bid/ask spread payı
         self.position_mode_resp = {"dualSidePosition": False}
         self.margin_modes = {s: "isolated" for s in self.symbols}
         self.leverages = {s: 10 for s in self.symbols}
@@ -167,6 +170,20 @@ class FakeExchange:
         if self.outage:
             raise ExchangeUnavailable("simulated network outage")
         return list(self.kline_data.get(symbol, []))
+
+    def book_ticker(self, symbol):
+        """BLOK31: en iyi bid/ask (mark ± spread). Senaryo kumandaları:
+        book_ticker_fail (sembol bazlı hata), book_ticker_time (eski time)."""
+        if self.outage or symbol in self.book_ticker_fail:
+            raise ExchangeUnavailable("simulated bookTicker outage")
+        px = self.mark_px.get(symbol, 100.0)
+        spread = self.book_spread
+        return {"symbol": symbol,
+                "bidPrice": str(px * (1 - spread)),
+                "bidQty": "1.0",
+                "askPrice": str(px * (1 + spread)),
+                "askQty": "1.0",
+                "time": self.book_ticker_time.get(symbol, self._clock())}
 
     def funding_rate(self, symbol, start_ms=None, limit=100):
         return []
@@ -463,9 +480,31 @@ def prime(lc):
 
 
 def open_one(lc, symbol="ETHUSDT", direction=1, bar_ts=None, now=None):
-    """Standart tam doğrulanmış giriş: FILLED + PROTECTED."""
+    """Standart tam doğrulanmış giriş: FILLED + PROTECTED.
+
+    ref_px=100.0 → icra ANI fiyatı (BLOK31); qty CANARY_NOTIONAL *
+    (1 - ENTRY_SIZE_BUFFER) üzerinden boyutlanır (ETHUSDT 100 USDT
+    hedef → 0.99 lot). Eşik testleri bu gerçek birimleri
+    loss_mark()/stop_trigger() ile pozisyondan türetir."""
     now = now if now is not None else lc._now()
     recs = lc.try_entry(symbol, direction, 100.0,
                         bar_ts if bar_ts is not None else T0 + 4 * 3600_000,
                         now)
     return recs[0]
+
+
+def stop_trigger(ex, pos_id):
+    """Pozisyonun STOP_MARKET korumasının GERÇEK triggerPrice'ı (canlı
+    koruma doğrulamasında borsanın kabul ettiği değer)."""
+    return float(ex.algos[f"C281P{pos_id}"]["triggerPrice"])
+
+
+def loss_mark(lc, pos_id, target_loss):
+    """Hedeflenen zararı ÜRETEN mark fiyatı — pozisyonun gerçek
+    units/entry_px/entry_comm değerinden türetilir (ENTRY_SIZE_BUFFER'lı
+    boyutlamadan bağımsız, test amacı korunur).
+
+    position_net_loss (long) = (entry - mark) * units + entry_comm
+    """
+    pos = lc.rm._pos(pos_id)
+    return pos["entry_px"] - (target_loss - pos["entry_comm"]) / pos["units"]

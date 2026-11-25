@@ -169,6 +169,14 @@ class BinanceFuturesClient:
                              {"symbol": symbol, "interval": interval,
                               "limit": limit}, False, False)
 
+    def book_ticker(self, symbol):
+        """En iyi bid/ask (public, imzasız). BLOK31: giriş ANI icra fiyatı —
+        BUY→askPrice, SELL→bidPrice; `time` alanı güncellik kapısında
+        kullanılır (eski bar açılış fiyatıyla boyutlama hatasının düzeltmesi).
+        """
+        return self._request("GET", "/fapi/v1/ticker/bookTicker",
+                             {"symbol": symbol}, False, False)
+
     def exchange_info(self):
         return self._request("GET", "/fapi/v1/exchangeInfo", None, False, False)
 
