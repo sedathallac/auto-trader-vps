@@ -30,6 +30,7 @@ Mimari (görev §0-§7):
 
 Operatör limitleri canary_risk.RiskManager'da merkezî ve değiştirilemez.
 """
+import contextlib
 import fcntl
 import json
 import math
@@ -136,6 +137,148 @@ class WorkerLockHeld(Exception):
     """Tekil risk worker kilidi başkasında (§4.2)."""
 
 
+class EntryGateBusy(Exception):
+    """Ortak giriş-kapısı kilidi (flock) timeout içinde alınamadı —
+    fail-closed: emir GÖNDERİLMEZ (BLOK30 §4)."""
+
+
+# ============================================================================
+# BLOK30 — KALICI ENTRY PAUSE (operatör kontrolü; HALT'tan TAMAMEN BAĞIMSIZ)
+#
+#   entry_paused=0 → yeni girişler mevcut TÜM güvenlik kontrollerine tabidir
+#   entry_paused=1 → yeni giriş emirleri engellenir; risk döngüsü, SAFE_EXIT,
+#                    -5/-10 limitleri, HALT state machine, koruma doğrulama,
+#                    strateji ÇIKIŞLARI ve mevcut pozisyon yönetimi ÇALIŞIR
+#
+# Durum live_state tablosunda kalıcıdır (restart sıfırlayamaz); yalnızca
+# operatör aracı (canary_control.py resume) kaldırabilir. HALT mekanizmasına
+# (halt_state / rm.status) DOKUNULMAZ — PAUSE global HALT'ı bastırmaz.
+#
+# Eşzamanlılık (§4): uygulama süreci ile CLI süreci arasındaki TEK
+# senkronizasyon noktası, DB ile aynı dizinde tutulan ortak OS kilidi
+# `<db>.entry-gate.lock` (fcntl.flock)'tir. Giriş zinciri bu kilidi INTENT
+# kaydı + new_order() + sonuç yazımı boyunca TUTAR; operatör pause/resume
+# yazımı da AYNI kilidi almadan durum değiştirMEZ. Böylece "kontrol sonrası
+# emir öncesi PAUSE açıldı" yarış penceresi kapanır. Python threading
+# kilidi ayrı süreci serileştiremeyeceği için flock ZORUNLUDUR.
+# Kilit sıralaması: entry chain → _entry_lock (thread) → entry-gate (flock)
+# → sqlite yazımı; pause/resume → entry-gate (flock) → sqlite yazımı.
+# Deadlock yok: flock hiçbir zaman thread kilitleri bekleyen bir yolda
+# tutulmaz; risk döngüsü ve çıkışlar bu kilide DOKUNMAZ.
+# ============================================================================
+ENTRY_PAUSE_KEY = "entry_paused"
+
+
+def entry_gate_lock_path(db_path):
+    """Ortak giriş-kapısı kilit dosyası (DB ile aynı dizin)."""
+    return str(db_path) + ".entry-gate.lock"
+
+
+@contextlib.contextmanager
+def entry_gate(db_path, timeout_s=None):
+    """Giriş kapısı kilidi (flock). timeout_s=None → süresiz bekleme;
+    aksi halde deadline dolarsa EntryGateBusy (çağıran fail-closed davranır).
+    Aynı süreçte farklı fd'lerden alınan flock'ler birbirini ENGELLER —
+    süreç içi pause/entry yarışı da aynı kapıdan geçer."""
+    path = entry_gate_lock_path(db_path)
+    f = open(path, "w")
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise EntryGateBusy(
+                        f"entry-gate kilidi {timeout_s}s içinde alınamadı: "
+                        f"{path}")
+                time.sleep(0.02)
+        try:
+            yield f
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    finally:
+        f.close()
+
+
+def set_entry_pause(db_path, paused, reason, by, timeout_s=120.0):
+    """Operatör ENTRY PAUSE/RESUME yazımı — giriş kapısı kilidi ALTINDA.
+
+    Devam eden bir giriş zinciri varsa (INTENT + new_order + sonuç yazımı)
+    sonucunu BEKLER; kilit `timeout_s` içinde boşalmazsa EntryGateBusy
+    verir ve durum DEĞİŞMEZ ( erken 'etkinleşti' bildirimi YOK).
+    Sadece entry_paused* anahtarlarını yazar; halt_state, rm durumu,
+    koruma emirleri ve pozisyonlara DOKUNMAZ."""
+    action = "ENTRY_PAUSED" if paused else "ENTRY_RESUMED"
+    with entry_gate(db_path, timeout_s=timeout_s):
+        db = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE IF NOT EXISTS live_state ("
+                       "key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS risk_events ("
+                       "ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT)")
+            now = int(time.time() * 1000)
+            row = db.execute("SELECT value FROM live_state WHERE key=?",
+                             (ENTRY_PAUSE_KEY,)).fetchone()
+            prev = row[0] if row else "0"
+            for k, v in ((ENTRY_PAUSE_KEY, "1" if paused else "0"),
+                         ("entry_pause_ts", str(now)),
+                         ("entry_pause_by", str(by)),
+                         ("entry_pause_reason", str(reason or "")),
+                         ("entry_pause_last_action", action)):
+                db.execute("INSERT INTO live_state VALUES (?,?) ON CONFLICT"
+                            "(key) DO UPDATE SET value=excluded.value", (k, v))
+            db.execute("INSERT INTO risk_events VALUES (?,?,?)",
+                       (now, action, f"by={by} reason={reason}"))
+            db.commit()
+        finally:
+            db.close()
+    return {"action": action, "paused": bool(paused), "previous": prev,
+            "ts": now, "by": str(by), "reason": str(reason or "")}
+
+
+def read_entry_pause(db_path):
+    """Salt-okunur PAUSE/HALT/pending-entry görünümü (status aracı).
+    mode=ro ile açılır — hiçbir şey YAZMAZ, borsa API'si ÇAĞIRMAZ."""
+    out = {"db": str(db_path), "exists": os.path.exists(str(db_path)),
+           "entry_paused": False}
+    if not out["exists"]:
+        return out
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        def get(k, table="live_state"):
+            try:
+                row = db.execute(f"SELECT value FROM {table} WHERE key=?",
+                                 (k,)).fetchone()
+                return row[0] if row else None
+            except sqlite3.Error:
+                return None
+        out["entry_paused"] = (get(ENTRY_PAUSE_KEY) or "0") == "1"
+        out["entry_pause_ts"] = get("entry_pause_ts")
+        out["entry_pause_by"] = get("entry_pause_by")
+        out["entry_pause_reason"] = get("entry_pause_reason")
+        out["entry_pause_last_action"] = get("entry_pause_last_action")
+        out["halt_state"] = get("halt_state") or "CANARY_ACTIVE"
+        out["rm_status"] = get("status", table="canary_state")
+        out["worker_pid"] = get("worker_pid")
+        try:
+            rows = db.execute(
+                "SELECT client_id, symbol, status, updated_ts FROM "
+                "live_orders WHERE kind='ENTRY' AND status IN "
+                "('INTENT','SUBMITTED','UNKNOWN') ORDER BY updated_ts"
+            ).fetchall()
+            out["pending_entries"] = [dict(zip(
+                ("client_id", "symbol", "status", "updated_ts"), r))
+                for r in rows]
+        except sqlite3.Error:
+            out["pending_entries"] = []
+        return out
+    finally:
+        db.close()
+
+
 class LiveCanary:
     """Mainnet canary release candidate. Tüm borsa erişimi `exchange`
     soyutlamasından (BinanceFuturesClient | FakeExchange) geçer."""
@@ -203,6 +346,13 @@ class LiveCanary:
     @property
     def halt_state(self):
         return self._get_state("halt_state") or HALT_ACTIVE
+
+    @property
+    def entry_paused(self):
+        """BLOK30: kalıcı operatör ENTRY PAUSE bayrağı. Anahtar yoksa
+        varsayılan 0'dır; constructor/startup/restart ASLA sıfırlamaz —
+        yalnızca operatör aracı (resume) kaldırır."""
+        return str(self._get_state(ENTRY_PAUSE_KEY) or "0") == "1"
 
     def _transition_halt(self, new_state, detail=""):
         """Atomik (BEGIN IMMEDIATE) ve kalıcı HALT geçişi (§3 adım 1)."""
@@ -456,6 +606,12 @@ class LiveCanary:
         if self.rm.status == STATUS_HALTED or \
                 self.halt_state != HALT_ACTIVE:
             reasons.append(f"HALT ({self.rm.status}/{self.halt_state})")
+        # BLOK30: operatör ENTRY PAUSE — HALT'tan BAĞIMSIZ kontrol; yalnızca
+        # yeni GİRİŞLERİ engeller (risk/çıkış/koruma döngüleri çalışır)
+        if self.entry_paused:
+            reasons.append("ENTRY_PAUSED (operatör giriş duraklatması — "
+                           "mevcut pozisyon yönetimi ve çıkışlar çalışır)")
+
         if bar_ts <= self.t0_ms:
             reasons.append(f"T0 öncesi/eski sinyal (bar_ts {bar_ts} <= "
                            f"t0 {self.t0_ms}) — eski -1x8 hedefleri emir "
@@ -559,51 +715,91 @@ class LiveCanary:
             return out
         qty = float(qty_str)
         with self._entry_lock:
+            # BLOK30 §4: ortak giriş kapısı (flock) — operatör CLI'si ile
+            # aynı kilidi paylaşır. INTENT kaydı + new_order() + sonuç
+            # yazımı bu kritik bölümün İÇİNDE tamamlanır; kapı ALTINDA
+            # PAUSE/HALT durumu SON KEZ yeniden okunur (kontrol ile emir
+            # arasındaki yarış penceresi kapalı). Kilit alınamazsa emir
+            # GÖNDERİLMEZ (fail-closed).
             try:
-                # atomik risk kapısı (canary_risk kural 10)
-                self.rm.check_order(symbol, direction, qty * ref_px, now_ms)
-            except OrderRejected as e:
-                rec["result"] = f"REJECTED: {e}"
+                with entry_gate(self.db_path, timeout_s=30.0):
+                    gate_blockers = self._final_entry_gate()
+                    if gate_blockers:
+                        rec["result"] = "BLOCKED"
+                        rec["blockers"] = gate_blockers
+                        self._log("live_orders.jsonl", rec)
+                        self.rm._event(
+                            "ENTRY_BLOCKED",
+                            f"{symbol} {' | '.join(gate_blockers)[:300]}")
+                        return out
+                    try:
+                        # atomik risk kapısı (canary_risk kural 10)
+                        self.rm.check_order(symbol, direction,
+                                            qty * ref_px, now_ms)
+                    except OrderRejected as e:
+                        rec["result"] = f"REJECTED: {e}"
+                        self._log("live_orders.jsonl", rec)
+                        return out
+                    # intent KAYIT ÖNCESİ (idempotency anchor — §2.3)
+                    seq = self._db_execute(
+                        "SELECT COUNT(*)+1 FROM live_orders "
+                        "WHERE kind='ENTRY'").fetchone()[0]
+                    cid = f"{CLIENT_PREFIX}E{seq}"
+                    self._upsert_order(cid, "ENTRY", symbol, O_INTENT,
+                                       params={"side": "BUY" if direction > 0
+                                               else "SELL",
+                                               "quantity": qty_str,
+                                               "type": "MARKET"})
+                    try:
+                        resp = self.exchange.new_order(
+                            symbol, "BUY" if direction > 0 else "SELL",
+                            "MARKET", quantity=qty_str, client_order_id=cid,
+                            new_order_resp_type="RESULT")
+                    except UnknownResult as e:
+                        self._upsert_order(cid, "ENTRY", symbol, O_UNKNOWN,
+                                           result={"error": str(e)})
+                        rec["result"] = "ENTRY_UNKNOWN (client id ile " \
+                                        "çözülecek)"
+                        self._log("live_orders.jsonl", rec)
+                        return out
+                    except BinanceApiError as e:
+                        self._upsert_order(cid, "ENTRY", symbol, O_REJECTED,
+                                           result={"code": e.code,
+                                                   "msg": e.msg})
+                        rec["result"] = f"REJECTED: {e}"
+                        self._log("live_orders.jsonl", rec)
+                        return out
+                    self._upsert_order(cid, "ENTRY", symbol,
+                                       resp.get("status", O_SUBMITTED),
+                                       exchange_id=str(resp.get("orderId")),
+                                       result=resp)
+                    rec["entry_client_id"] = cid
+                    if resp.get("status") == O_FILLED:
+                        rec.update(self._on_entry_filled(cid, resp, symbol,
+                                                         direction, now_ms))
+                    else:
+                        rec["result"] = f"entry status {resp.get('status')} " \
+                                        "— risk döngüsü izleyecek"
+            except EntryGateBusy as e:
+                rec["result"] = "BLOCKED"
+                rec["blockers"] = [f"entry-gate kilidi meşgul ({e})"]
                 self._log("live_orders.jsonl", rec)
                 return out
-            # intent KAYIT ÖNCESİ (idempotency anchor — §2.3)
-            seq = self._db_execute("SELECT COUNT(*)+1 FROM live_orders "
-                                   "WHERE kind='ENTRY'").fetchone()[0]
-            cid = f"{CLIENT_PREFIX}E{seq}"
-            self._upsert_order(cid, "ENTRY", symbol, O_INTENT,
-                               params={"side": "BUY" if direction > 0
-                                       else "SELL", "quantity": qty_str,
-                                       "type": "MARKET"})
-            try:
-                resp = self.exchange.new_order(
-                    symbol, "BUY" if direction > 0 else "SELL", "MARKET",
-                    quantity=qty_str, client_order_id=cid,
-                    new_order_resp_type="RESULT")
-            except UnknownResult as e:
-                self._upsert_order(cid, "ENTRY", symbol, O_UNKNOWN,
-                                   result={"error": str(e)})
-                rec["result"] = "ENTRY_UNKNOWN (client id ile çözülecek)"
-                self._log("live_orders.jsonl", rec)
-                return out
-            except BinanceApiError as e:
-                self._upsert_order(cid, "ENTRY", symbol, O_REJECTED,
-                                   result={"code": e.code, "msg": e.msg})
-                rec["result"] = f"REJECTED: {e}"
-                self._log("live_orders.jsonl", rec)
-                return out
-            self._upsert_order(cid, "ENTRY", symbol,
-                               resp.get("status", O_SUBMITTED),
-                               exchange_id=str(resp.get("orderId")),
-                               result=resp)
-            rec["entry_client_id"] = cid
-            if resp.get("status") == O_FILLED:
-                rec.update(self._on_entry_filled(cid, resp, symbol,
-                                                 direction, now_ms))
-            else:
-                rec["result"] = f"entry status {resp.get('status')} — " \
-                                "risk döngüsü izleyecek"
         self._log("live_orders.jsonl", rec)
         return out
+
+    def _final_entry_gate(self):
+        """Kapı kilidi ALTINDA son kabul kontrolü (BLOK30 §4). PAUSE durumu
+        bu sürecin DB bağlantısından YENİDEN okunur — erken _entry_blockers
+        kontrolünden sonra değişmiş olabilir. HALT da yeniden doğrulanır.
+        Boş liste = geçer."""
+        reasons = []
+        if self.entry_paused:
+            reasons.append("ENTRY_PAUSED (operatör giriş duraklatması)")
+        if self.rm.status == STATUS_HALTED or \
+                self.halt_state != HALT_ACTIVE:
+            reasons.append(f"HALT ({self.rm.status}/{self.halt_state})")
+        return reasons
 
     def _on_entry_filled(self, cid, resp, symbol, direction, now_ms):
         """Gerçek fill → defter + koruma zinciri (§5 adım 2-9)."""
@@ -1263,7 +1459,8 @@ class LiveCanary:
     # =========================================================================
     def risk_tick(self, now_ms=None):
         now = now_ms or self._now()
-        cyc = {"t": now, "kind": "RISK_TICK"}
+        cyc = {"t": now, "kind": "RISK_TICK",
+               "entry_paused": self.entry_paused}   # BLOK30 izleme
         # 1) Mark Price (REST_SAMPLED) — feed sağlık durumu kalıcı
         try:
             rows = self.exchange.premium_index()
