@@ -661,6 +661,7 @@ class LiveCanary:
             if st is not None:
                 st["decision"] = decision
                 st["decision_reason"] = reason
+                st["flip_detected"] = True
 
         # 1) karar penceresi: flip, karar barından SONRAKİ barın açılışında
         #    icra edilir; o bar kapandıysa pencere geçmiştir → MISSED
@@ -707,7 +708,9 @@ class LiveCanary:
         if st is not None:
             st["decision"] = "SIGNAL_VALID"
             st["current_executable_price"] = px
+            st["price_source"] = "bookTicker"
             st["price_age_ms"] = now_ms - pmeta.get("ts", now_ms)
+            st["flip_detected"] = True
         return (symbol, direction, px, bar_ts, None, sig_px)
 
     def _entry_blockers(self, symbol, direction, bar_ts, now_ms):
@@ -1823,16 +1826,41 @@ class LiveCanary:
                                       now, qv, signal_px=signal_px)
                 out.extend(recs)
                 if states.get(symbol) is not None:
-                    states[symbol]["entry_result"] = recs[0].get("result")
+                    res = recs[0].get("result")
+                    states[symbol]["entry_result"] = res
                     states[symbol]["entry_blockers"] = recs[0].get("blockers")
+                    states[symbol]["sizing_result"] = recs[0].get("qty")
+                    prot = recs[0].get("protection")
+                    if isinstance(prot, dict):
+                        states[symbol]["protection_status"] = prot.get(
+                            "status")
+                    # §8 final_decision: giriş zinciri sonucu etikete bağlanır
+                    if res == "FILLED":
+                        states[symbol]["final_decision"] = "FILL_CONFIRMED"
+                    elif isinstance(res, str) and res.startswith("REJECTED"):
+                        states[symbol]["final_decision"] = "ORDER_REJECTED"
+                    elif res == "BLOCKED":
+                        states[symbol]["final_decision"] = "ENTRY_BLOCKED"
+                    elif isinstance(res, str) and "UNKNOWN" in res:
+                        states[symbol]["final_decision"] = "ENTRY_UNKNOWN"
+                    else:
+                        states[symbol]["final_decision"] = "ENTRY_ATTEMPTED"
         # BLOK31 §5: her strateji döngüsü GÖRÜNÜR — başarı/başarısızlık ve
         # sembol bazlı durum ayrık kayda geçer (thread'in bu kaydı yazması
-        # döngünün çalıştığının kendisidir)
+        # döngünün çalıştığının kendisidir). BLOK31.1 §8: döngü-düzeyi
+        # kapı durumları (PAUSE/HALT/risk/mutabakat/feed) da kayıtta.
         seq = int(self._get_state("strategy_cycle_seq") or 0) + 1
         self._set_state("strategy_cycle_seq", seq)
         self._log("strategy_cycles.jsonl",
                   {"t": now, "kind": "STRATEGY_CYCLE", "cycle_id": seq,
                    "written_by": "canary-strategy",
+                   "entry_paused": self.entry_paused,
+                   "halt_state": self.halt_state,
+                   "rm_status": self.rm.status,
+                   "reconciliation_status":
+                       str(self._get_state("reconciled_ok") or "0"),
+                   "feed_status": ("DOWN" if self._get_state("feed_down_ts")
+                                   else "OK"),
                    "fetch_errors": fetch_errors,
                    "symbols": [states[s] for s in self.symbols
                                if states.get(s) is not None]})
@@ -1844,15 +1872,46 @@ class LiveCanary:
         fiyatıyla değerlendirilir (BLOK31); kalıcı last_bar dedup;
         penceresi geçen flip MISSED (fail-closed). (symbol, direction,
         px, karar barı ts, qv, sinyal kapanışı) olayları + sembol bazlı
-        durum haritası döner."""
+        durum haritası döner.
+
+        BLOK31.1 düzeltmeleri:
+          - `warmup` log alanının semantiği: true = warmup HENÜZ tamamlan-
+            mamış (eskiden `s in _warmed` yazılıyordu — tamamlanmış semboller
+            için de true okunuyordu). Tamamlanma `warmup_complete` /
+            `warmup_state` alanlarından açıkça görünür; eksikse `warmup_missing_bars`
+            + `warmup_reason` söyler. Engine durumu DEĞİŞTİRİLMEDİ — yalnızca
+            doğru etiketlendirme.
+          - `last_processed_bar_before` / `_after`: döngü kaydı artık işleme
+            öncesi VE sonrası durumu taşır (eskiden yalnızca öncesi yazılıp
+            sonrası sanılıyordu — cycle35 tutarsızlığının kök nedeni).
+          - kanonik §7 bar sırası (BLOK31.1): canlı barda end_bar'dan ÖNCE,
+            o barın açılışında due olan flip pop edilir. İcra penceresi
+            (karar barından sonraki bar) kapanmışsa flip MISSED tüketilir —
+            eskiden end_bar önce çalıştığı için momentum geri dönerse due
+            flip sessizce iptal oluyor, engine dir'i kanonik akıştan
+            sapabiliyordu.
+        """
         decisions = []
         states = {}
         warmup_events, live_events = [], []
         attempted = set()
+        newly_warmed = set()
         for s in self.symbols:
             kl = klines_by_sym.get(s)
             if kl is None:
-                states[s] = {"symbol": s, "interval": "4h"}
+                states[s] = {"symbol": s, "interval": "4h",
+                             "engine_direction_before":
+                                 self.engine.direction(s)}
+                continue
+            if not kl:
+                # boş kline yanıtı veri hatasıdır — NO_NEW_CLOSED_BAR olarak
+                # sessizce geçilmez (§8: veri hatası ayrıştırılır, fail-closed)
+                states[s] = {"symbol": s, "interval": "4h",
+                             "engine_direction_before":
+                                 self.engine.direction(s),
+                             "decision": "DATA_FETCH_ERROR",
+                             "decision_reason":
+                                 "kline yanıtı boş (veri hatası — fail-closed)"}
                 continue
             last = self._last_bar.get(s)
             cold = s not in self._warmed
@@ -1873,8 +1932,9 @@ class LiveCanary:
             states[s] = {"symbol": s, "interval": "4h",
                          "bar_count": len(kl), "new_bar_count": n_new,
                          "latest_closed_bar": latest_closed,
-                         "last_processed_bar": last,
-                         "warmup": s in self._warmed}
+                         "last_processed_bar_before": last,
+                         "engine_direction_before":
+                             self.engine.direction(s)}
         warmup_events.sort(key=lambda e: (e[0], e[1]))
         live_events.sort(key=lambda e: (e[0], e[1]))   # deterministik seçim:
         # kronolojik (bar_ts, symbol) sıra + limit kapısı — var olan,
@@ -1885,15 +1945,44 @@ class LiveCanary:
             self.engine.end_bar(s, ot, c)
             warm_last[s] = ot
         for s, ot in warm_last.items():
+            if s not in self._warmed:
+                newly_warmed.add(s)
             self._warmed.add(s)
             self._set_last(s, ot)
         qv_by = {}
         for (ot, s, o, c, qv) in live_events:
+            # KANONİK §7 SIRASI (BLOK31.1): bu barın AÇILIŞINDA (ot) due
+            # olan flip, end_bar'dan ÖNCE nihai olarak çözülür — ya taze
+            # fiyatla İCRA ya da MISSED (fail-closed). end_bar'ın sig!=dir
+            # karşılaştırması ilerlememiş dir üzerinden yapıldığı için bu
+            # koruma olmadan momentum geri dönerse due flip SESSİZCE iptal
+            # oluyor (ya da sig!=dir ise üzerine yazılıyordu) — engine
+            # target book'i kanonik akıştan sapıyordu. Penceresi kesinlikle
+            # geçmiş flip doğrudan MISSED; sınır anında (karar yaşı == 1
+            # bar) hâlâ geçerli sayılır ve taze fiyatla denenir; fiyat
+            # alınamazsa icra barı kapanmak üzere olduğundan flip MISSED
+            # tüketilir (bir sonraki tikte sessiz iptal yerine görünür kayıt).
+            S = self.engine._state(s)
+            if S["pend"] and (S["pend_bar_ts"] or 0) + BAR_MS <= ot:
+                if now_ms > (S["pend_bar_ts"] or 0) + 2 * BAR_MS:
+                    self._consume_overdue_flip(s, ot, now_ms, states)
+                else:
+                    ev = self._attempt_due_flip(s, now_ms, states)
+                    if ev is not None:
+                        decisions.append(ev)
+                    S = self.engine._state(s)
+                    if S["pend"] and \
+                            (S["pend_bar_ts"] or 0) + BAR_MS <= ot:
+                        # attempt flip'i tüketemedi (fiyat alınamadı) —
+                        # pencere bu barın kapanışıyla kapanır → MISSED
+                        self._consume_overdue_flip(s, ot, now_ms, states)
             self._set_last(s, ot)
             qv_by[s] = qv
             # (c)+(e): EWMA + BU kapanışta sinyal → pend hemen değerlendirme
             # alır (karar anı = bu barın kapanışı = sonraki barın açılışı)
             self.engine.end_bar(s, ot, c)
+            if s not in self._warmed:
+                newly_warmed.add(s)
             self._warmed.add(s)
             attempted.add(s)
             ev = self._attempt_due_flip(s, now_ms, states)
@@ -1909,15 +1998,35 @@ class LiveCanary:
             ev = self._attempt_due_flip(s, now_ms, states)
             if ev is not None:
                 decisions.append(ev)
-        # sembol bazlı durum etiketleri (gözlemlenebilirlik — BLOK31 §5)
+        # sembol bazlı durum etiketleri (gözlemlenebilirlik — BLOK31 §5,
+        # BLOK31.1 §7/§8: before/after, warmup semantiği, hedef değişimi)
         for s, row in states.items():
             row["signal_direction"] = self.engine.direction(s)
             row["signal_pending"] = self.engine.pending(s)
+            row["engine_direction_after"] = self.engine.direction(s)
+            row["target_changed"] = (row.get("engine_direction_before")
+                                     != row["engine_direction_after"])
+            row["last_processed_bar_after"] = self._last_bar.get(s)
             S = self.engine._state(s)
             if S["pend"]:
                 row["signal_timestamp"] = S["pend_bar_ts"]
                 row["signal_price_reference"] = S["pend_price"]
+                row["signal_age_ms"] = now_ms - (S["pend_bar_ts"] or 0) \
+                    - BAR_MS
+            warmed = s in self._warmed and self.engine.warm(s)
+            row["warmup_complete"] = warmed
+            row["warmup"] = not warmed     # BLOK31.1: true = warmup SÜRÜYOR
+            row["warmup_state"] = ("WARMUP_COMPLETE" if warmed
+                                   else "WARMUP_INCOMPLETE")
+            if not warmed:
+                missing = max(0, self.engine.lookback - S["n"])
+                row["warmup_missing_bars"] = missing
+                row["warmup_reason"] = (
+                    f"n={S['n']} < lookback {self.engine.lookback}"
+                    if missing else
+                    "EWMA varyans henüz hesaplanamadı (var None/0)")
             if row.get("decision"):
+                row["final_decision"] = row["decision"]
                 continue
             if s in (fetch_errors or {}):
                 row["decision"] = "DATA_FETCH_ERROR"
@@ -1925,23 +2034,62 @@ class LiveCanary:
             elif "bar_count" not in row:
                 row["decision"] = "NO_KLINES"
                 row["decision_reason"] = "bu tikte kline verisi sağlanmadı"
-            elif not row.get("warmup") and s not in self._warmed:
-                row["decision"] = "WARMUP"
-                row["decision_reason"] = "henüz yeterli bar yok"
+            elif not warmed:
+                row["decision"] = "WARMUP_INCOMPLETE"
+                row["decision_reason"] = row.get("warmup_reason")
+            elif s in newly_warmed:
+                row["decision"] = "WARMUP_COMPLETE"
+                row["decision_reason"] = "warmup replay bu döngüde tamamlandı"
             elif self.engine.pending(s):
                 row["decision"] = "PRICE_UNAVAILABLE"
                 row["decision_reason"] = "due flip taze fiyat bekliyor (retry)"
             elif row.get("new_bar_count"):
-                row["decision"] = "NO_SIGNAL"
-                row["decision_reason"] = "yeni kapalı bar işlendi, flip yok"
+                row["decision"] = "TARGET_UNCHANGED"
+                row["decision_reason"] = ("yeni kapalı bar işlendi, hedef "
+                                          "yön değişmedi (flip yok)")
             else:
                 row["decision"] = "NO_NEW_CLOSED_BAR"
                 row["decision_reason"] = "işlenecek yeni kapalı bar yok"
+            row["final_decision"] = row["decision"]
         if warmup_events:
+            # BLOK31.1: kayıt sembol bazlı tamamlanma durumu da taşır —
+            # `bars_replayed` yalnızca bu süreçte replay edilen bar sayısıdır
+            # (restart başına bir kez; 409 kapalı bar × 8 sembol = 3272),
+            # engine warmup tamamlanması ayrıca doğrulanır
+            per_sym = {s: (s in self._warmed and self.engine.warm(s))
+                       for s in self.symbols}
             self._log("live_orders.jsonl",
                       {"t": now_ms, "kind": "WARMUP_DONE",
-                       "bars_replayed": len(warmup_events), "execute": False})
+                       "bars_replayed": len(warmup_events), "execute": False,
+                       "symbols_warmed": per_sym,
+                       "all_warm": all(per_sym.values())})
         return decisions, states
+
+    def _consume_overdue_flip(self, symbol, bar_ot, now_ms, states=None):
+        """BLOK31.1 (§7 kanonik sıra): end_bar'dan ÖNCE, karar penceresi
+        KESİNLİKLE kapanmış (> 1 bar) pending flip'i tüketir → MISSED
+        (fail-closed; eski sinyal asla oynatılmaz). Bu tüketim olmadan
+        end_bar'ın sig!=dir karşılaştırması ilerlememiş dir üzerinden
+        yapılıyor ve momentum geri dönerse due flip SESSİZCE iptal
+        oluyordu (engine target book'i kanonik akıştan sapıyordu)."""
+        S = self.engine._state(symbol)
+        direction = S["pend"]
+        bar_ts = S["pend_bar_ts"]
+        sig_px = S["pend_price"]
+        self.engine.begin_bar(symbol, sig_px or 0.0)      # pop + dir ilerler
+        reason = (f"karar penceresi kapandı (kanonik sıra koruması — karar "
+                  f"yaşı {(now_ms - (bar_ts or 0) - BAR_MS) / 3600000:.1f}h "
+                  f">= {BAR_MS / 3600000:.0f}h; end_bar öncesi tüketildi)")
+        self._log("live_orders.jsonl",
+                  {"t": now_ms, "kind": "MISSED_FLIP", "symbol": symbol,
+                   "bar_ts": bar_ts, "direction": direction,
+                   "signal_px": sig_px, "reason": reason, "execute": False,
+                   "source": "canonical_order_guard"})
+        st = states.get(symbol) if states else None
+        if st is not None:
+            st["decision"] = "SIGNAL_STALE"
+            st["decision_reason"] = reason
+            st["flip_detected"] = True
 
     def _set_last(self, symbol, ot):
         self._last_bar[symbol] = ot

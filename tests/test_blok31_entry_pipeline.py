@@ -52,8 +52,17 @@ class Blok31EntryPipelineTests(unittest.TestCase):
 
     # ---- yardımcılar -----------------------------------------------------------
 
-    def _warmup(self, now, bars=3):
-        kl = {s: [(now - bars * BAR + i * BAR, 100.0, 100.0, 1.0)
+    def _warmup(self, now, bars=200):
+        """Gerçekten TAMAMLANAN warmup (BLOK31.1): 3 barlık sabit kline
+        dizisi engine'i asla ısıtamıyordu (n=3 < lookback 180, var=0) —
+        eski kod bu durumu NO_NEW_CLOSED_BAR olarak yanlış etiketliyordu.
+        Sürekli DÜŞEN kapanışlar (30→10): n=200 ≥ 180, var>0, replay sonu
+        dir=-1, pend=0 (warm replay invariant'ı: dir == son momentum).
+        Testlerin enjekte ettiği +1 flip böylece GERÇEK flip'tir (dir=-1 →
+        +1); `_flip`'in icra barı kapanışı (101) 180 bar önceki kapanışın
+        (~28) üzerine çıkar → momentum pozitife döner → end_bar karşı-flip
+        ÜRETMEZ (test_32'nin genuine-sinyal deseni ile aynı)."""
+        kl = {s: [(now - bars * BAR + i * BAR, 100.0, 30.0 - 0.1 * i, 1.0)
                   for i in range(bars)] for s in self.ex.symbols}
         return self.lc.strategy_tick(now_ms=now, klines_by_sym=kl)
 
@@ -126,23 +135,25 @@ class Blok31EntryPipelineTests(unittest.TestCase):
         self.assertEqual(self._entry_posts(), [])
 
     def test_02_closed_bar_processed_exactly_once(self):
-        """(2) Aynı kapalı bar ikinci tikte YENİ sayılmaz (kalıcı last_bar)."""
+        """(2) Aynı kapalı bar ikinci tikte YENİ sayılmaz (kalıcı last_bar).
+        (Bar kapanışı warmup serisini sürdürür → momentum flip'i YOK —
+        bu test bar-dedup'ı izoler; genuine flip davranışı test_32'de.)"""
         self._warmup(T0)
         now = T0 + 2 * BAR
         self._fresh_marks(now)
         out = self.lc.strategy_tick(
-            now_ms=now, klines_by_sym={"ETHUSDT": [(T0 + BAR, 100.0, 101.0,
+            now_ms=now, klines_by_sym={"ETHUSDT": [(T0 + BAR, 10.0, 10.0,
                                                     1.0)]})
         self.assertEqual(out, [])               # flip yok, bar işlendi
         now2 = now + 60_000
         self._fresh_marks(now2)
         self.lc.strategy_tick(
-            now_ms=now2, klines_by_sym={"ETHUSDT": [(T0 + BAR, 100.0, 101.0,
+            now_ms=now2, klines_by_sym={"ETHUSDT": [(T0 + BAR, 10.0, 10.0,
                                                      1.0)]})
         st = self._symbol_state(self._last_cycle(), "ETHUSDT")
         self.assertEqual(st["new_bar_count"], 0)
         self.assertEqual(st["decision"], "NO_NEW_CLOSED_BAR")
-        self.assertEqual(st["last_processed_bar"], T0 + BAR)
+        self.assertEqual(st["last_processed_bar_after"], T0 + BAR)
 
     def test_03_pre_t0_decision_blocked(self):
         """(3) Karar anı ≤ T0 olan sinyal emir oluşturAMAZ (T0 kapısı)."""
@@ -232,8 +243,9 @@ class Blok31EntryPipelineTests(unittest.TestCase):
                          "DATA_FETCH_ERROR")
         sol = self._symbol_state(cyc, "SOLUSDT")
         self.assertIsNotNone(sol.get("bar_count"))     # SOL işlendi
-        self.assertIn(sol["decision"], ("NO_SIGNAL", "NO_NEW_CLOSED_BAR",
-                                        "WARMUP"))
+        self.assertIn(sol["decision"], ("TARGET_UNCHANGED", "NO_NEW_CLOSED_BAR",
+                                        "WARMUP_INCOMPLETE",
+                                        "WARMUP_COMPLETE"))
 
     def test_09_canonical_interval_4h_everywhere(self):
         """(9) Kanonik aralık 4h'dir (BLOK22 prereg donmuş tasarım) ve
@@ -284,13 +296,19 @@ class Blok31EntryPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(meta_s["bid"], px_s, places=9)
 
     def test_12_stale_bookticker_blocks_then_retries(self):
-        """(12) bookTicker `time` alanı 31s eski → giriş YOK, flip TUTULUR;
-        sonraki tikte taze fiyatla retry → emir."""
+        """(12) KARAR ANINDA (bar kapanışı) bookTicker `time` 31s eski →
+        giriş YOK, flip TUTULUR; karar penceresi İÇİNDE sonraki tikte taze
+        fiyatla retry → emir. (BLOK31.1: flip karar barının işlendiği
+        tikte end_bar'dan doğar; fiyat alınamazsa TUTULUR — yalnız icra
+        barının kapanışına kadar. İcra barı kapanış anında fiyat hâlâ
+        yoksa flip MISSED tüketilir; bkz. test_blok31_1 c17.)"""
         self._warmup(T0)
-        now = T0 + 2 * BAR
+        now = T0 + BAR                     # karar barı T0 şimdi KAPANIYOR
         self._fresh_marks(now)
         self.ex.book_ticker_time["ETHUSDT"] = now - 31_000
-        out = self._flip("ETHUSDT", 1, T0 + BAR, now)
+        out = self.lc.strategy_tick(
+            now_ms=now, klines_by_sym={"ETHUSDT": [(T0, 100.0, 101.0,
+                                                    1.0)]})
         self.assertEqual(out, [])                     # emir YOK
         self.assertEqual(self._entry_posts(), [])
         st = self._symbol_state(self._last_cycle(), "ETHUSDT")
@@ -299,30 +317,36 @@ class Blok31EntryPipelineTests(unittest.TestCase):
         self.assertTrue(any(r["kind"] == "FLIP_PRICE_RETRY"
                             for r in self._orders_log()))
         self.assertEqual(self.lc.engine.pending("ETHUSDT"), 1)  # flip YAŞIYOR
-        # taze fiyatla retry (aynı karar penceresi anı — age hâlâ == BAR)
+        # taze fiyatla retry (karar penceresi içinde — age < 1 bar)
         del self.ex.book_ticker_time["ETHUSDT"]
+        now2 = now + 60_000
+        self._fresh_marks(now2)
         out2 = self.lc.strategy_tick(
-            now_ms=now, klines_by_sym={"ETHUSDT": [(T0 + BAR, 100.0, 101.0,
-                                                    1.0)]})
+            now_ms=now2, klines_by_sym={"ETHUSDT": [(T0, 100.0, 101.0,
+                                                     1.0)]})
         self.assertEqual(out2[0]["result"], "FILLED")
         self.assertEqual(self.lc.engine.pending("ETHUSDT"), 0)
 
     def test_13_bookticker_failure_keeps_pend(self):
-        """(13) bookTicker çağrısı hata verirse flip TUTULUR (kayıp yok),
-        fiyat gelince icra edilir."""
+        """(13) bookTicker ÇAĞRISI hata verirse flip TUTULUR (kayıp yok),
+        pencere içinde fiyat gelince icra edilir."""
         self._warmup(T0)
-        now = T0 + 2 * BAR
+        now = T0 + BAR                     # karar barı T0 şimdi KAPANIYOR
         self._fresh_marks(now)
         self.ex.book_ticker_fail.add("ETHUSDT")
-        out = self._flip("ETHUSDT", 1, T0 + BAR, now)
+        out = self.lc.strategy_tick(
+            now_ms=now, klines_by_sym={"ETHUSDT": [(T0, 100.0, 101.0,
+                                                    1.0)]})
         self.assertEqual(out, [])
         st = self._symbol_state(self._last_cycle(), "ETHUSDT")
         self.assertEqual(st["decision"], "PRICE_UNAVAILABLE")
         self.assertEqual(self.lc.engine.pending("ETHUSDT"), 1)
         self.ex.book_ticker_fail.clear()
+        now2 = now + 60_000
+        self._fresh_marks(now2)
         out2 = self.lc.strategy_tick(
-            now_ms=now, klines_by_sym={"ETHUSDT": [(T0 + BAR, 100.0, 101.0,
-                                                    1.0)]})
+            now_ms=now2, klines_by_sym={"ETHUSDT": [(T0, 100.0, 101.0,
+                                                     1.0)]})
         self.assertEqual(out2[0]["result"], "FILLED")
 
     def test_14_price_deviation_gate_misses_flip(self):
@@ -712,7 +736,10 @@ class Blok31EntryPipelineTests(unittest.TestCase):
             self.assertIn("symbols", c)
         self.assertEqual(len(cyc[-1]["symbols"]), len(self.ex.symbols))
         st = self._symbol_state(cyc[-1], "ETHUSDT")
-        self.assertEqual(st["decision"], "NO_NEW_CLOSED_BAR")
+        # BLOK31.1: boş kline yanıtı veri hatasıdır — NO_NEW_CLOSED_BAR
+        # olarak sessizce geçilmez (FakeExchange kline_data boş → [])
+        self.assertEqual(st["decision"], "DATA_FETCH_ERROR")
+        self.assertIn("boş", st["decision_reason"])
 
     def test_45_fetch_error_states_in_cycle(self):
         """(45) Kline hatası döngü kaydında sembol bazlı görünür (madde 7
