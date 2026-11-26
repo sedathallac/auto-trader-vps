@@ -453,15 +453,19 @@ class FakeClock:
 
 
 def make_canary(tmpdir, ex=None, t0=T0, verified_liq=True, symbols=None,
-                entry_policy=None):
+                entry_policy=None, signal_source=None, brain_source=None):
     """Doğrulanmış likidasyon modeli + gerçek filtrelerle LiveCanary.
 
     BLOK32: entry_policy varsayılanı FLIP_ONLY'dur — BLOK30/31/31.1 legacy
     testlerinin kanonik flip-only davranışı BLOK32 ile DEĞİŞMEZ. Quality
-    politikası testleri entry_policy='QUALITY_BIDIRECTIONAL' ister."""
+    politikası testleri entry_policy='QUALITY_BIDIRECTIONAL' ister.
+
+    GÖREV (2026-11-26): signal_source/brain_source verilirse BRAIN_PRIMARY
+    modunda LiveCanary kurulur (test_brain_primary.py); verilmezse davranış
+    öncekiyle BİREBİR aynıdır (H1_LOCAL)."""
     import os
 
-    from canary_live import LiveCanary
+    from canary_live import LiveCanary, SIGNAL_SOURCE_H1
     from canary_liquidation import (LiquidationModel,
                                     parse_leverage_brackets,
                                     POSITION_MODE_ONEWAY)
@@ -474,10 +478,15 @@ def make_canary(tmpdir, ex=None, t0=T0, verified_liq=True, symbols=None,
             margin_modes=ex.margin_modes, leverages=ex.leverages,
             position_mode=POSITION_MODE_ONEWAY, wallet_usdt=ex.wallet)
     db = os.path.join(str(tmpdir), "canary_live.db")
+    kw = {}
+    if signal_source is not None:
+        kw["signal_source"] = signal_source
+        kw["brain_source"] = brain_source
     return LiveCanary(db, ex, symbols=symbols or ex.symbols, t0_ms=t0,
                       filters=ex.filters, liq_model=liq,
                       clock_ms=ex._clock, log_dir=str(tmpdir),
-                      entry_policy=entry_policy or cq.ENTRY_POLICY_FLIP_ONLY)
+                      entry_policy=entry_policy or cq.ENTRY_POLICY_FLIP_ONLY,
+                      **kw)
 
 
 def prime(lc):

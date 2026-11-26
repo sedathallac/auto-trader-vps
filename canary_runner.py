@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BLOK29 — LIVE CANARY RUNTIME LAUNCHER (deployment tutkalı).
+"""BLOK29 — LIVE CANARY RUNNER LAUNCHER (deployment tutkalı).
 
 37e3497 çekirdeğini (canary_live/canary_risk/canary_liquidation/
 canary_exchange) DEĞİŞTİRMEDEN çalıştırır. Bu dosya yalnızca:
@@ -9,14 +9,28 @@ canary_exchange) DEĞİŞTİRMEDEN çalıştırır. Bu dosya yalnızca:
   - T0'ı ilk başlangıçta kalıcı olarak kaydeder,
   - SIGTERM/SIGINT ile systemd için düzgün kapanış sağlar.
 
+GÖREV (2026-11-26) — CANARY AI BRAIN ANA SİNYAL KAYNAĞI:
+  - İşlem evreni artık sabit 8 sembol DEĞİL: beynin eligible contract
+    discovery çıktısı (futures-brain ile AYNI contract_discovery hattı)
+    ana sembol evrenidir (~519 LIVE_ELIGIBLE sözleşme; sınır YOK).
+  - signal_source=BRAIN_PRIMARY: giriş adayları yalnız futures-brain
+    servisinin BRAIN_DB'sinden (salt-okunur) gelir; eski H1 strateji
+    döngüsü bağımsız emir AÇAMAZ.
+  - Beyin önerisi emir değildir: suggested_notional politika tavanıyla
+    kırpılır; son kararı bağımsız CROSS risk kapısı verir.
+
 Emir yetkisi: canary_live.run() içindeki giriş zinciri, tüm kapılar
-(LIQUIDATION_RISK_UNVERIFIED, feed, mutabakat, ilk-pozisyon, T0)
-geçilmedikçe emir GÖNDERMEZ (fail-closed).
+(LIQUIDATION_RISK_UNVERIFIED, feed, mutabakat, ilk-pozisyon, T0, ENTRY
+PAUSE, yön kilitleri) geçilmedikçe emir GÖNDERMEZ (fail-closed).
 
 Ortam değişkenleri:
   BINANCE_KEY / BINANCE_SECRET  (zorunlu)
   CANARY_DB     (varsayılan /var/lib/futures-canary/canary_live.db)
   CANARY_LOG_DIR (varsayılan /var/log/futures-canary)
+  BRAIN_DB      (varsayılan /var/lib/futures-canary-brain/brain.db —
+                 futures-brain.service ile AYNI dosya, salt-okunur)
+  BRAIN_DECISION_MAX_AGE_MS (varsayılan 5h — eski beyin döngüsünden aday
+                 VERİLMEZ, fail-closed)
 """
 import json
 import os
@@ -26,11 +40,15 @@ import sys
 import time
 
 from canary_exchange import BinanceFuturesClient, ExchangeError
-from canary_live import LiveCanary, SYMBOLS, CLIENT_PREFIX
+from canary_live import LiveCanary, CLIENT_PREFIX
 from canary_liquidation import (LiquidationModel, parse_leverage_brackets,
                                 POSITION_MODE_ONEWAY, POSITION_MODE_HEDGE)
 from canary_account_adapter import BinanceHttpTransport
 from canary_account_risk_gate import AccountRiskGate
+from canary_brain_adapter import (BrainDecisionSource,
+                                  SIGNAL_SOURCE_BRAIN, DEFAULT_MAX_AGE_MS)
+from canary_brain import eligible_symbols, MODEL_VERSION
+from contract_discovery import discover_contracts
 
 
 def _load_t0(db_path):
@@ -52,12 +70,29 @@ def _load_t0(db_path):
     return int(time.time() * 1000), True
 
 
-def _build_filters(ex):
-    """H1 evreni için gerçek exchangeInfo filtreleri (public GET)."""
+def _build_universe(ex):
+    """Ana sembol evreni — BEYNİN eligible contract discovery çıktısı.
+
+    futures-brain.service ile AYNI hattı kullanır (contract_discovery.
+    discover_contracts + canary_brain.eligible_symbols): fapi
+    exchangeInfo'dan PERPETUAL + USDT quote + USDT margin + TRADING
+    sözleşmeler. Sabit 8 sembol listesi BURADA KULLANILMAZ; aday sınırı
+    (Top-8/10/20) YOK. Evren kurulamazsa boş döner → çağıran FATAL ile
+    durur (eski 8 sembole sessiz geri dönüş YOK — fail-closed)."""
     info = ex.exchange_info()
+    res = discover_contracts(fapi_info=info, dapi_info=None)
+    return eligible_symbols(res), res
+
+
+def _build_filters(ex, symbols):
+    """Evren sembolleri için gerçek exchangeInfo filtreleri (public GET).
+    Evren dışı sembol süzgesi YOK — beyin evreninin tamamı işlenebilir;
+    hiçbir uygun sembol eski 8 sembol listesi nedeniyle dışarıda KALMAZ."""
+    info = ex.exchange_info()
+    wanted = set(symbols)
     filters = {}
     for s in info.get("symbols", []):
-        if s.get("symbol") not in SYMBOLS:
+        if s.get("symbol") not in wanted:
             continue
         f = {x["filterType"]: x for x in s.get("filters", [])}
         if "PRICE_FILTER" not in f or "LOT_SIZE" not in f:
@@ -76,7 +111,8 @@ def _build_filters(ex):
 
 def _build_liq_model(ex):
     """Gerçek leverageBracket + positionRisk + positionSide/dual + bakiye
-    (§5/§6 — hepsi imzalı salt-okunur GET)."""
+    (§5/§6 — hepsi imzalı salt-okunur GET). positionRisk'ten sembol
+    süzgesi YOK: pozisyonu olan her sembol (yabancı dahil) görünür."""
     lb = ex.leverage_brackets()
     pr = ex.position_risk()
     pm = ex.position_mode()
@@ -85,7 +121,7 @@ def _build_liq_model(ex):
     leverages = {}
     for r in pr:
         sym = r.get("symbol")
-        if sym in SYMBOLS:
+        if sym:
             margin_modes[sym] = str(r.get("marginType", "")).lower()
             try:
                 leverages[sym] = int(r.get("leverage", 0))
@@ -122,14 +158,33 @@ def main():
     ex = BinanceFuturesClient(key, secret)
     t0, first_start = _load_t0(db_path)
 
+    # ANA SEMBOL EVRENİ (görev §1): beynin eligible contract discovery
+    # çıktısı (~519). Boşsa BAŞLAMA — eski 8 sembole geri dönüş YOK.
+    universe, discovery = _build_universe(ex)
+    if not universe:
+        print("FATAL: beyin evreni kurulamadı (discovery boş) — eski 8 "
+              "sembol listesine geri DÖNÜLMÜYOR", file=sys.stderr)
+        return 2
+
     # salt-okunur kurulum verileri (kapılar burada da fail-closed:
     # eksik veri → model UNVERIFIED → canary_live girişi bloklar)
-    filters = _build_filters(ex)
+    filters = _build_filters(ex, universe)
     liq, acct_info = _build_liq_model(ex)
-    verify = {s: liq.verify(s)[0] for s in SYMBOLS}
+    verify = {s: liq.verify(s)[0] for s in universe}
 
-    lc = LiveCanary(db_path, ex, symbols=SYMBOLS, t0_ms=t0,
-                    filters=filters, liq_model=liq, log_dir=log_dir)
+    # beyin karar kaynağı — futures-brain.service BRAIN_DB (salt-okunur;
+    # execution beynin araştırma belleğine ASLA yazmaz)
+    brain_db = os.environ.get("BRAIN_DB",
+                              "/var/lib/futures-canary-brain/brain.db")
+    brain = BrainDecisionSource(
+        db_path=brain_db,
+        max_age_ms=int(os.environ.get("BRAIN_DECISION_MAX_AGE_MS",
+                                      str(DEFAULT_MAX_AGE_MS))),
+        expected_model_version=MODEL_VERSION)
+
+    lc = LiveCanary(db_path, ex, symbols=universe, t0_ms=t0,
+                    filters=filters, liq_model=liq, log_dir=log_dir,
+                    signal_source=SIGNAL_SOURCE_BRAIN, brain_source=brain)
     if first_start:
         lc._set_state("t0", str(t0))
 
@@ -138,6 +193,7 @@ def main():
     # güvenli varsayılan BLOCK üretir (kaynak kodda eşik icat EDİLMEZ).
     # Öneriler (dayanak canary_account_risk_gate docstring):
     #   CANARY_ACCOUNT_MAX_AGE_MS=30000, CANARY_ACCOUNT_MARGIN_BUFFER_USDT=50
+    # (görev §3: öneri operatör onayı OLMADAN canlı ayara YAZILMAZ)
     def _cfg_int(name):
         raw = os.environ.get(name)
         if raw is None or raw.strip() == "":
@@ -176,12 +232,25 @@ def main():
         "bracket_symbols": len(gate.brackets_by_symbol),
         "note": "esikler operatör env konfiginden; yoksa guvenli "
                 "varsayilan BLOCK (canli giris izni DEGILDIR)"})
+    brain_cycle = brain.latest_cycle()
     lc._log("live_orders.jsonl", {
         "t": int(time.time() * 1000), "kind": "RUNNER_START",
         "first_start": first_start, "t0": t0,
-        "symbols": SYMBOLS, "filters_loaded": len(filters),
+        "signal_source": SIGNAL_SOURCE_BRAIN,
+        "brain_model_version_expected": MODEL_VERSION,
+        "brain_db": brain_db,
+        "brain_latest_cycle": brain_cycle,
+        "universe_symbols": len(universe),
+        "universe_discovery": {
+            "coins": discovery.coin_count,
+            "contracts_fapi": sum(
+                1 for coin in discovery.coins for c in coin.contracts
+                if c.venue == "fapi"),
+            "eligible": len(universe)},
+        "filters_loaded": len(filters),
         "liq_verified": verify, "account": acct_info,
         "entry_policy": lc.entry_policy,
+        "entry_paused": lc.entry_paused,
         "commit": os.environ.get("CANARY_COMMIT", "unspecified")})
 
     def _shutdown(signum, frame):

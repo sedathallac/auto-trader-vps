@@ -64,8 +64,14 @@ from canary_exchange import (ExchangeUnavailable, UnknownResult,
 from canary_liquidation import (LiquidationModel, LIQUIDATION_RISK_UNVERIFIED,
                                 round_to_tick)
 from h1_adapter import H1SignalEngine
+from canary_brain_adapter import (SIGNAL_SOURCE_H1, SIGNAL_SOURCE_BRAIN,
+                                  BrainDecisionSource)
 import canary_quality as cq
 
+# LEGACY 8 sembollük sabit evren — yalnız FLIP_ONLY/legacy testler ve
+# reference kayıt için durur. Üretim (BRAIN_PRIMARY) evreni canary_runner
+# beynin eligible contract discovery çıktısından kurar (görev §1: eski
+# liste yeni işlem evreninin belirleyicisi DEĞİLDİR).
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "BNBUSDT", "DOGEUSDT",
            "LINKUSDT", "SOLUSDT", "XRPUSDT"]
 # BLOK29.1 (2026-11-25): hedef notional TEK MERKEZİ KAYNAK'TAN türetilir —
@@ -368,7 +374,9 @@ class LiveCanary:
 
     def __init__(self, db_path, exchange, symbols=SYMBOLS, t0_ms=None,
                  filters=None, liq_model: Optional[LiquidationModel] = None,
-                 clock_ms=None, log_dir=None, entry_policy=None):
+                 clock_ms=None, log_dir=None, entry_policy=None,
+                 signal_source=SIGNAL_SOURCE_H1,
+                 brain_source: Optional[BrainDecisionSource] = None):
         self.db_path = str(db_path)
         self.dir = Path(log_dir or os.path.dirname(self.db_path))
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +401,20 @@ class LiveCanary:
         if self.entry_policy not in (cq.ENTRY_POLICY_QUALITY,
                                      cq.ENTRY_POLICY_FLIP_ONLY):
             raise ValueError(f"bilinmeyen entry_policy: {entry_policy!r}")
+        # GÖREV §1/§2 (2026-11-26): sinyal kaynağı. BRAIN_PRIMARY modunda
+        # giriş adayları YALNIZ CANARY AI BRAIN'den (futures-brain.service
+        # BRAIN_DB) gelir; eski 8 sembollük yerel H1 motoru giriş ÜRETEMEZ
+        # (yalnız savunma-derinliği olarak kilitlenir — çıkış/risk/koruma
+        # altyapısı aynen çalışır). H1_LOCAL: legacy davranış (testler).
+        self.signal_source = signal_source
+        if self.signal_source not in (SIGNAL_SOURCE_H1,
+                                      SIGNAL_SOURCE_BRAIN):
+            raise ValueError(f"bilinmeyen signal_source: {signal_source!r}")
+        if self.signal_source == SIGNAL_SOURCE_BRAIN and \
+                brain_source is None:
+            raise ValueError("BRAIN_PRIMARY modu brain_source ister "
+                             "(BrainDecisionSource)")
+        self.brain_source = brain_source
         # kalite modeli: engine durumunu OKUR (closes/var), kendi hacim/
         # sigma penceresini canlı + warmup replay barlarıyla besler
         self.quality = cq.QualityModel(self.engine)
@@ -406,6 +428,10 @@ class LiveCanary:
             if v is not None:
                 self._last_bar[s] = int(v)
         self._warmed = set()
+        # BRAIN_PRIMARY: son beyin döngüsü değerlendirme özeti (izleme;
+        # STRATEGY_CYCLE kaydına girer — iki servisin aynı kararı
+        # kullandığının kanıt kaynağı)
+        self._last_brain_tick = None
         # restart güvenliği (§4.2): mutabakat BU SÜREÇ tarafından yeniden
         # kanıtlanmalı — önceki sürecin reconciled_ok değeri miras ALINMAZ
         self._set_state("reconciled_ok", 0)
@@ -762,6 +788,10 @@ class LiveCanary:
             tüketilir + MISSED_FLIP kaydı
         Başarıda (symbol, direction, px, karar barı ts, qv, sinyal kapanışı)
         olayı döner; emir zinciri (try_entry) strategy_tick'te çağrılır."""
+        # GÖREV §1: BRAIN_PRIMARY modunda eski H1 motoru giriş ÜRETEMEZ
+        # (savunma-derinliği — strategy_tick bu yolu zaten çağırmaz)
+        if self.signal_source == SIGNAL_SOURCE_BRAIN:
+            return None
         S = self.engine._state(symbol)
         if not S["pend"] or S["pend"] == S["dir"]:
             return None
@@ -1015,24 +1045,39 @@ class LiveCanary:
         return f"{qty:.{prec}f}", None
 
     def try_entry(self, symbol, direction, ref_px, bar_ts, now_ms=None,
-                  qv=None, signal_px=None):
+                  qv=None, signal_px=None, decision_id=None, notional=None):
         """Tam giriş zinciri (§5 adım 1-9). ref_px = İCRA ANI fiyatı
         (BLOK31: strateji yolu bookTicker ask/bid getirir; eski bar açılışı
         ASLA kullanılmaz); signal_px = sinyal barı kapanışı (sapma kaydı).
-        Ret/engel her durumda kayda geçer."""
+        Ret/engel her durumda kayda geçer.
+
+        GÖREV §2 (2026-11-26): decision_id verilirse (BRAIN_PRIMARY yolu)
+        idempotency çapası budur — brainsig:{decision_id} kalıcı anahtarı
+        aynı beyin kararının ikinci kez emir üretmesini engeller; karar
+        kimliği emir params'ına ve denetim kaydına yazılır (beyin kaydından
+        execution değerlendirmesine izlenebilirlik). notional: beyin önerisi
+        (suggested_notional) — SADECE politika tavanına kadar kabul edilir;
+        nihai boyut _sizing (borsa filtreleri) + rm.check_order (CROSS risk
+        kapısı) tarafından belirlenir (AI önerisi doğrudan emir DEĞİLDİR)."""
         now_ms = now_ms or self._now()
         rec = {"t": now_ms, "kind": "LIVE_ENTRY_ATTEMPT", "symbol": symbol,
                "direction": direction, "bar_ts": bar_ts, "ref_px": ref_px,
-               "signal_px": signal_px}
+               "signal_px": signal_px, "signal_source": self.signal_source}
+        if decision_id:
+            rec["decision_id"] = decision_id
         out = [rec]
         if direction == 0:
             rec["result"] = "FLAT_TARGET"
             return out
-        # sinyal dedup (aynı sinyal ikinci kez işlem oluşturamaz — §7)
-        sig_key = f"sig:{symbol}:{bar_ts}"
+        # sinyal dedup (aynı sinyal ikinci kez işlem oluşturamaz — §7).
+        # BRAIN_PRIMARY: dedup kararı decision_id üzerinden (beyin kaydına
+        # birebir izlenebilir); H1 yolu kanonik sig:{symbol}:{bar_ts}.
+        sig_key = (f"brainsig:{decision_id}" if decision_id
+                   else f"sig:{symbol}:{bar_ts}")
         with self._lock:
             if self._get_state(sig_key) is not None:
-                rec["result"] = "DUPLICATE_SIGNAL"
+                rec["result"] = ("DUPLICATE_BRAIN_DECISION" if decision_id
+                                 else "DUPLICATE_SIGNAL")
                 return out
             self._set_state(sig_key, str(direction))
         blockers = self._entry_blockers(symbol, direction, bar_ts, now_ms)
@@ -1043,8 +1088,22 @@ class LiveCanary:
             self.rm._event("ENTRY_BLOCKED",
                            f"{symbol} {' | '.join(blockers)[:300]}")
             return out
-        qty_str, err = self._sizing(
-            symbol, ref_px, CANARY_NOTIONAL * (1 - ENTRY_SIZE_BUFFER))
+        # BRAIN_PRIMARY: beyin önerilen notional yalnız politika tavanına
+        # KADAR kabul edilir (AI önerisi doğrudan emir haline GETİRİLMEZ —
+        # görev §2); hiçbir durumda operatör 100 USDT hard cap'ini aşamaz.
+        # H1 yolu ve önerisiz beyin kaydı kanonik politika boyutunu kullanır.
+        target_notional = CANARY_NOTIONAL * (1 - ENTRY_SIZE_BUFFER)
+        if notional is not None:
+            if notional <= 0:
+                rec["result"] = "BLOCKED"
+                rec["blockers"] = [f"BRAIN_SIZING_INVALID:notional="
+                                   f"{notional}"]
+                self._log("live_orders.jsonl", rec)
+                self.rm._event("ENTRY_BLOCKED",
+                               f"{symbol} beyin notional gecersiz ({notional})")
+                return out
+            target_notional = min(float(notional), target_notional)
+        qty_str, err = self._sizing(symbol, ref_px, target_notional)
         if err:
             rec["result"] = "BLOCKED"
             rec["blockers"] = [err]
@@ -1089,7 +1148,10 @@ class LiveCanary:
                                        params={"side": "BUY" if direction > 0
                                                else "SELL",
                                                "quantity": qty_str,
-                                               "type": "MARKET"})
+                                               "type": "MARKET",
+                                               "decision_id": decision_id,
+                                               "signal_source":
+                                                   self.signal_source})
                     try:
                         resp = self.exchange.new_order(
                             symbol, "BUY" if direction > 0 else "SELL",
@@ -2013,8 +2075,158 @@ class LiveCanary:
     # =========================================================================
     # STRATEGY LOOP (§4.1 — 300s H1; risk loop'u BEKLEMEZ)
     # =========================================================================
+    # ========================================================================
+    # GÖREV §2 (2026-11-26): CANARY AI BRAIN → EXECUTION yolu (BRAIN_PRIMARY)
+    #
+    # Beynin BRAIN_DB'deki son döngüsündeki CANDIDATE kayıtları (LONG ve
+    # SHORT ayrı) giriş zincirine taşınır. Her aday kanonik try_entry
+    # zincirinden geçer: ENTRY PAUSE, HALT, yön kilidi, T0, mutabakat,
+    # sahiplik, likidasyon, ilk-pozisyon, boyutlama (borsa filtreleri),
+    # CROSS risk kapısı (AccountRiskGate + canary_risk bütçeleri), flock
+    # giriş kapısı, idempotency (brainsig:{decision_id}).
+    # Beyin önerisi emir DEĞİLDİR: suggested_notional yalnız politika
+    # tavanına kadar kabul edilir; son kararı bağımsız risk kapısı verir.
+    # ========================================================================
+    def _brain_tick(self, now_ms):
+        """Bir strateji döngüsünde beyin adaylarını değerlendirir."""
+        fresh = self.brain_source.fresh_candidates(now_ms)
+        tick = {"t": now_ms, "kind": "BRAIN_TICK",
+                "signal_source": SIGNAL_SOURCE_BRAIN,
+                "brain_cycle_id": fresh.get("cycle_id"),
+                "brain_cycle_ts": fresh.get("cycle_ts"),
+                "brain_age_ms": fresh.get("age_ms"),
+                "brain_ok": fresh.get("ok"),
+                "brain_reasons": fresh.get("reasons"),
+                "candidates_seen": len(fresh.get("candidates") or []),
+                "evaluated": []}
+        self._last_brain_tick = tick
+        out = []
+        if not fresh.get("ok"):
+            # fail-closed: taze/doğrulanmış aday YOK → emir YOK (NO_TRADE
+            # beyin kararındadır; burada sinyal İCAT EDİLMEZ)
+            self._log("live_orders.jsonl", tick)
+            return out
+        # deterministik sıra: decision_id (sembol+yön) — sabit Top-N YOK,
+        # bütün adaylar değerlendirilir; sınırı risk kapısı koyar
+        for dec in sorted(fresh["candidates"],
+                          key=lambda d: d.decision_id):
+            recs = self._apply_brain_decision(dec, now_ms)
+            out.extend(recs)
+            tick["evaluated"].append({
+                "decision_id": dec.decision_id, "symbol": dec.symbol,
+                "direction": dec.direction,
+                "result": recs[0].get("result") if recs else None,
+                "blockers": recs[0].get("blockers") if recs else None})
+        self._log("live_orders.jsonl", tick)
+        return out
+
+    def _apply_brain_decision(self, dec, now_ms):
+        """Tek beyin adayını giriş zincirine taşır (dedup → boyut doğrulama
+        → taze fiyat → sapma kapısı → try_entry)."""
+        rec = {"t": now_ms, "kind": "BRAIN_DECISION", "execute": True,
+               "decision_id": dec.decision_id, "symbol": dec.symbol,
+               "direction": dec.direction, "brain_ts": dec.ts,
+               "cycle_id": dec.cycle_id, "model_version": dec.model_version,
+               "signal_source": SIGNAL_SOURCE_BRAIN,
+               "expected_net_return_pct": dec.expected_net_return_pct,
+               "expected_transaction_costs_pct":
+                   dec.expected_transaction_costs_pct,
+               "calibrated_probability": dec.calibrated_probability,
+               "probability_is_calibrated": dec.probability_is_calibrated,
+               "prediction_uncertainty_pct": dec.prediction_uncertainty_pct,
+               "stop_distance_pct": dec.stop_distance_pct,
+               "suggested_notional": dec.suggested_notional,
+               "suggested_quantity": dec.suggested_quantity,
+               "rejection_reasons": list(dec.rejection_reasons),
+               "brain_price": dec.price}
+        out = [rec]
+        # idempotency (erken kontrol): bu karar daha önce DEĞERLENDİRİLDİ
+        # mi? (try_entry dedup'ıyla AYNI anahtar — bir kez değerlendirilen
+        # karar — ister emir çıksın ister bloklansın ister tüketilsin —
+        # bir daha emir zincirine GİRMEZ; yeni sinyal yeni döngüdedir)
+        with self._lock:
+            if self._get_state(f"brainsig:{dec.decision_id}") is not None:
+                rec["result"] = "DUPLICATE_BRAIN_DECISION"
+                self._log("live_orders.jsonl", rec)
+                return out
+        # beyin kaydındaki ret nedenleri varsa aday zaten geçersiz
+        if dec.rejection_reasons:
+            rec["result"] = "BLOCKED"
+            rec["blockers"] = [f"BRAIN_REJECTION:{r}"
+                               for r in dec.rejection_reasons]
+            self._log("live_orders.jsonl", rec)
+            return out
+        # boyutlama önerisi yok/geçersiz → fail-closed (AI önerisi olmadan
+        # politika boyutu icat EDİLMEZ — öneri ile emir ayrımı §2)
+        sizing = dec.sizing or {}
+        if not sizing.get("ok") or not (dec.suggested_notional or 0) > 0:
+            rec["result"] = "BLOCKED"
+            rec["blockers"] = ["BRAIN_SIZING_NOT_OK:"
+                               + ",".join(sizing.get("reasons") or
+                                          ["sizing_yok"])]
+            self._log("live_orders.jsonl", rec)
+            self.rm._event("ENTRY_BLOCKED",
+                           f"{dec.symbol} beyin boyutlamasi gecersiz "
+                           f"({dec.decision_id})")
+            return out
+        # taze icra fiyatı (BUY→ask, SELL→bid; freshness kapılı)
+        px, pmeta = self._executable_price(dec.symbol, dec.direction, now_ms)
+        if px is None:
+            rec["result"] = "PRICE_UNAVAILABLE"
+            rec["blockers"] = [f"bookTicker: {pmeta}"]
+            self._log("live_orders.jsonl", rec)
+            return out
+        # sapma kapısı: taze fiyat beyin tarama fiyatından çok uçtuysa
+        # karar ömrü dolmuş sayılır → KALICI olarak tüketilir (eski sinyal
+        # oynatılmaz — MISSED_FLIP semantiği; sonraki döngü taze karar verir)
+        if dec.price and \
+                abs(px - dec.price) / dec.price > SIGNAL_PRICE_DEVIATION_MAX:
+            dev = abs(px - dec.price) / dec.price
+            self._set_state(f"brainsig:{dec.decision_id}",
+                            str(dec.direction))
+            rec["result"] = "BRAIN_SIGNAL_STALE"
+            rec["executable_px"] = px
+            rec["blockers"] = [f"fiyat sapması: taze {px:.6f} vs beyin "
+                               f"{dec.price:.6f} (%{dev * 100:.2f} > "
+                               f"{SIGNAL_PRICE_DEVIATION_MAX * 100:.0f}) — "
+                               "karar kalıcı olarak tüketildi"]
+            self._log("live_orders.jsonl", rec)
+            return out
+        rec["executable_px"] = px
+        recs = self.try_entry(dec.symbol, dec.direction, px, dec.ts,
+                              now_ms, signal_px=dec.price,
+                              decision_id=dec.decision_id,
+                              notional=dec.suggested_notional)
+        # try_entry sonucu BRAIN_DECISION kaydına da bağlanır (denetim
+        # izi: beyin kaydı → execution değerlendirmesi tek kayıtta görünür)
+        rec["result"] = recs[0].get("result")
+        rec["blockers"] = recs[0].get("blockers")
+        rec["qty"] = recs[0].get("qty")
+        out.extend(recs)
+        return out
+
     def strategy_tick(self, now_ms=None, klines_by_sym=None):
         now = now_ms or self._now()
+        # GÖREV §1/§4 (2026-11-26): BRAIN_PRIMARY modunda giriş adayları
+        # YALNIZ yeni beyinden gelir — eski 8 sembollük H1 strateji döngüsü
+        # (kline çekimi + flip/quality değerlendirmesi) ÇALIŞMAZ, dolayısıyla
+        # eski strateji bağımsız emir AÇAMAZ. Risk döngüsü, çıkışlar, koruma
+        # doğrulaması, HALT/PAUSE ve mutabakat aynen sürer (risk_tick).
+        if self.signal_source == SIGNAL_SOURCE_BRAIN:
+            out = self._brain_tick(now)
+            seq = int(self._get_state("strategy_cycle_seq") or 0) + 1
+            self._set_state("strategy_cycle_seq", seq)
+            self._log("strategy_cycles.jsonl",
+                      {"t": now, "kind": "STRATEGY_CYCLE", "cycle_id": seq,
+                       "written_by": "canary-strategy",
+                       "signal_source": SIGNAL_SOURCE_BRAIN,
+                       "entry_policy": self.entry_policy,
+                       "entry_paused": self.entry_paused,
+                       "halt_state": self.halt_state,
+                       "rm_status": self.rm.status,
+                       "universe_symbols": len(self.symbols),
+                       "brain": self._last_brain_tick})
+            return out
         fetch_errors = {}
         if klines_by_sym is None:
             klines_by_sym = {}
@@ -2409,6 +2621,10 @@ class LiveCanary:
         Fail-closed: bileşen hesaplanamıyorsa skor yok → giriş yok + neden.
         Bekleyen (çözülmemiş) flip varken değerlendirme YOK — o anki geçiş
         flip yolunun tekelindedir. Kalitesi yetersizse NOTHING (emir yok)."""
+        # GÖREV §1: BRAIN_PRIMARY modunda eski H1 kalite yolu giriş ÜRETEMEZ
+        # (savunma-derinliği — strategy_tick bu yolu zaten çağırmaz)
+        if self.signal_source == SIGNAL_SOURCE_BRAIN:
+            return
         S = self.engine._state(symbol)
         if S["pend"]:
             return                      # çözülmemiş flip — flip yolu sahiplikte
