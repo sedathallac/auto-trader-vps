@@ -135,6 +135,7 @@ def main():
         "first_start": first_start, "t0": t0,
         "symbols": SYMBOLS, "filters_loaded": len(filters),
         "liq_verified": verify, "account": acct_info,
+        "entry_policy": lc.entry_policy,
         "commit": os.environ.get("CANARY_COMMIT", "unspecified")})
 
     def _shutdown(signum, frame):

@@ -28,6 +28,20 @@ Mimari (görev §0-§7):
     bloklar (F-c), kesinti 'pozisyon yok' OKUNMAZ (F-d), -2021 sınıflandırılır
     (F-e), koruma/çıkış taze positionRisk okur (F-g).
 
+
+BLOK32 (2026-11-25, operatör strateji kararı): giriş politikası
+QUALITY_BIDIRECTIONAL — çift yönlü LONG/SHORT quality-based
+target-following. Girişler yalnızca momentum flip'ine bağlı DEĞİL: her YENİ
+kapalı mumpda mevcut hedef yön (engine target) bağımsız LONG/SHORT kalite
+skoruyla doğrulanır (canary_quality.py — kalibre edilmiş eşikler, hysteresis
+episode makinesi, fail-closed bileşen hesabı). Kalite eşiği geçilmedikçe
+emir YOK; flip tek başına giriş hakkı VERMEZ (flip tüketilir + görünür
+QUALITY_INSUFFICIENT_FLIP kaydı). Reversal (One-way): ters sinyalde ÖNCE
+reduce-only çıkış → borsada flat doğrulama → ancak sonraki barlarda yeni
+yön değerlendirmesi; aynı sembolde ikinci pozisyon ASLA açılmaz.
+FLIP_ONLY politikası (kanonik araştırma davranışı) entry_policy bayrağıyla
+korunur — legacy testler ve flip-only semantiği değişmez.
+
 Operatör limitleri canary_risk.RiskManager'da merkezî ve değiştirilemez.
 """
 import contextlib
@@ -50,6 +64,7 @@ from canary_exchange import (ExchangeUnavailable, UnknownResult,
 from canary_liquidation import (LiquidationModel, LIQUIDATION_RISK_UNVERIFIED,
                                 round_to_tick)
 from h1_adapter import H1SignalEngine
+import canary_quality as cq
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "BNBUSDT", "DOGEUSDT",
            "LINKUSDT", "SOLUSDT", "XRPUSDT"]
@@ -293,7 +308,7 @@ class LiveCanary:
 
     def __init__(self, db_path, exchange, symbols=SYMBOLS, t0_ms=None,
                  filters=None, liq_model: Optional[LiquidationModel] = None,
-                 clock_ms=None, log_dir=None):
+                 clock_ms=None, log_dir=None, entry_policy=None):
         self.db_path = str(db_path)
         self.dir = Path(log_dir or os.path.dirname(self.db_path))
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +325,17 @@ class LiveCanary:
         self.db.executescript(LIVE_SCHEMA)
         self.db.commit()
         self.engine = H1SignalEngine(self.symbols)
+        # BLOK32: giriş politikası. Üretim varsayılanı QUALITY_BIDIRECTIONAL
+        # (operatör kararı 2026-11-25); FLIP_ONLY kanonik araştırma
+        # davranışıdır (legacy testler bu bayrakla çalışır — davranışları
+        # BLOK30/31/31.1 ile birebir aynı kalır).
+        self.entry_policy = entry_policy or cq.ENTRY_POLICY_QUALITY
+        if self.entry_policy not in (cq.ENTRY_POLICY_QUALITY,
+                                     cq.ENTRY_POLICY_FLIP_ONLY):
+            raise ValueError(f"bilinmeyen entry_policy: {entry_policy!r}")
+        # kalite modeli: engine durumunu OKUR (closes/var), kendi hacim/
+        # sigma penceresini canlı + warmup replay barlarıyla besler
+        self.quality = cq.QualityModel(self.engine)
         self._lock = threading.RLock()          # canaryLive tabloları
         self._entry_lock = threading.RLock()    # giriş zinciri serileştirme
         self._lockfile = None
@@ -361,6 +387,22 @@ class LiveCanary:
         varsayılan 0'dır; constructor/startup/restart ASLA sıfırlamaz —
         yalnızca operatör aracı (resume) kaldırır."""
         return str(self._get_state(ENTRY_PAUSE_KEY) or "0") == "1"
+
+    # ---- BLOK32: kalıcı kalite episode durum makinesi -----------------------
+    # qep:{symbol}:{direction} = ARMED | ENGAGED (live_state tablosunda —
+    # restart/süreç ölümü durumunda DA kaybolmaz; §6 "Process belleğinde
+    # kaybolan state canlı girişin tekrarına yol açmamalı").
+    # ARMED   → skor θ_d'yi geçince giriş adayı doğabilir
+    # ENGAGED → bu episode'da emir ÇIKTI; yeniden silahlanma YALNIZ skor
+    #           θ_d − h_d altına düştüğünde (hysteresis — eşik kenarı
+    #           gir-çık davranışı engellenir). Çıkış episode'u yeniden
+    #           silahlamaz: aynı sinyalde otomatik yeniden giriş YOK.
+    def _episode_engaged(self, symbol, direction):
+        return self._get_state(f"qep:{symbol}:{direction}") == "ENGAGED"
+
+    def _episode_set(self, symbol, direction, engaged):
+        self._set_state(f"qep:{symbol}:{direction}",
+                        "ENGAGED" if engaged else "ARMED")
 
     def _transition_halt(self, new_state, detail=""):
         """Atomik (BEGIN IMMEDIATE) ve kalıcı HALT geçişi (§3 adım 1)."""
@@ -700,17 +742,70 @@ class LiveCanary:
                        "reason": reason, "execute": False})
             _note("PRICE_DEVIATION", reason)
             return None
+        # 3.5) BLOK32 kalite kapısı (yalnız QUALITY_BIDIRECTIONAL): flip tek
+        #    başına giriş hakkı VERMEZ — yeni hedef yönün kalite skoru
+        #    eşiği geçmeli VE episode silahlanmış olmalı. Kalibrasyon
+        #    semantiği (~/blok32-calibration simulate()): hedef defteri
+        #    (engine dir) flip'te KOŞULSUZ ilerler; EMİR yalnız kalite
+        #    geçince çıkar. Kalitesi yetersiz flip TÜKETİLİR + görünür
+        #    QUALITY_INSUFFICIENT_FLIP kaydı (fail-closed; eski sinyal
+        #    oynatılmaz, sonraki barlar hedef-yön takibiyle tekrar
+        #    değerlendirir).
+        qinfo = None
+        if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+            qinfo = self.quality.compute(symbol, direction)
+            engaged = self._episode_engaged(symbol, direction)
+            if qinfo is None or engaged or not qinfo["quality_pass"]:
+                self.engine.begin_bar(symbol, px)      # tüket (hedef ilerler)
+                if qinfo is None:
+                    reason = ("kalite hesaplanamadı (fail-closed: bileşen "
+                              "penceresi dolmadı / veri eksik)")
+                elif engaged:
+                    reason = (f"episode ENGAGED (hysteresis) — yeniden giriş "
+                              f"için skor {qinfo['quality_threshold'] - cq.hysteresis(direction):.1f}"
+                              f" altına inmeli (skor {qinfo['quality_score']})")
+                else:
+                    reason = (f"kalite skoru {qinfo['quality_score']} < eşik "
+                              f"{qinfo['quality_threshold']} — "
+                              f"{qinfo['signal_reason']}")
+                rec = {"t": now_ms, "kind": "QUALITY_INSUFFICIENT_FLIP",
+                       "symbol": symbol, "bar_ts": bar_ts,
+                       "direction": direction, "signal_px": sig_px,
+                       "executable_px": px, "reason": reason,
+                       "episode": "ENGAGED" if engaged else "ARMED",
+                       "execute": False}
+                if qinfo is not None:
+                    rec.update({k: qinfo[k] for k in
+                                ("quality_score", "quality_threshold",
+                                 "momentum_strength", "trend_confirmation",
+                                 "volatility_context", "volume_confirmation")})
+                self._log("live_orders.jsonl", rec)
+                _note("QUALITY_INSUFFICIENT", reason)
+                return None
         # 4) ICRA: flip karar anında (= icra barı açılışı) taze fiyatla
         #    tüketilir; dir ilerler. Sonuç (executed/blocked) try_entry'de.
         d = self.engine.begin_bar(symbol, px)
         d.execution_ts = decision_ts
         d.ref_price = px
         if st is not None:
-            st["decision"] = "SIGNAL_VALID"
+            st["decision"] = ("QUALITY_VALID_LONG" if direction > 0 else
+                              "QUALITY_VALID_SHORT") \
+                if self.entry_policy == cq.ENTRY_POLICY_QUALITY \
+                else "SIGNAL_VALID"
             st["current_executable_price"] = px
             st["price_source"] = "bookTicker"
             st["price_age_ms"] = now_ms - pmeta.get("ts", now_ms)
             st["flip_detected"] = True
+            if qinfo is not None:
+                for k in ("quality_score", "quality_threshold",
+                          "quality_pass", "momentum_strength",
+                          "trend_confirmation", "volatility_context",
+                          "volume_confirmation", "signal_reason"):
+                    st[k] = qinfo[k]
+                st["signal_timestamp"] = now_ms
+                st["signal_bar_timestamp"] = bar_ts
+                st["quality_episode"] = "ENGAGED" if \
+                    self._episode_engaged(symbol, direction) else "ARMED"
         return (symbol, direction, px, bar_ts, None, sig_px)
 
     def _entry_blockers(self, symbol, direction, bar_ts, now_ms):
@@ -772,6 +867,22 @@ class LiveCanary:
                 reasons.append(f"{p['symbol']} pozisyonu korumasız/"
                                "koruma doğrulanmamış (PROTECTED değil)")
                 break
+        # BLOK32 (yalnız QUALITY_BIDIRECTIONAL): aynı sembolde ikinci pozisyon
+        # YOK — One-way reversal protokolü (§7): ters sinyalde ÖNCE reduce-only
+        # çıkış → borsada flat doğrulama → koruma/defter mutabakatı → ancak
+        # sonraki barlarda yeni yön değerlendirmesi. Çıkışı süren veya durumu
+        # belirsiz pozisyon üzerine ters emir ASLA gönderilmez. (FLIP_ONLY
+        # kanonik davranış değişmez.)
+        if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+            for p in opens:
+                if p["symbol"] == symbol:
+                    lp = self._live_pos_row(p["pos_id"]) or {}
+                    reasons.append(
+                        f"{symbol} pozisyonu açık (çıkış durumu "
+                        f"{lp.get('exit_status', 'bilinmiyor')}) — quality "
+                        "politika: aynı sembolde ikinci pozisyon yok, reversal "
+                        "önce çıkışın flat doğrulamasını ister")
+                    break
         return reasons
 
     def _sizing(self, symbol, ref_px, notional=CANARY_NOTIONAL):
@@ -1810,6 +1921,11 @@ class LiveCanary:
                     # eskiden sessizce yutuluyordu (BLOK31 §5)
                     fetch_errors[s] = f"{type(e).__name__}: {e}"
         events, states = self._evaluate(now, klines_by_sym, fetch_errors)
+        # BLOK32: hedef yönü değişmiş açık pozisyonları çıkışa al (QUALITY
+        # politikası — flip tüketildiğinde koşulsuz; kalibrasyon semantiği).
+        # Olay döngüsünden ÖNCE çalışır: reversal protokolünün çıkış bacağı.
+        if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+            self._quality_target_exits(now, states)
         out = []
         for (symbol, direction, ref_px, bar_ts, qv, signal_px) in events:
             # strateji çıkışı (flip'in kapanış bacağı — risk AZALTAN,
@@ -1822,6 +1938,23 @@ class LiveCanary:
                         self.initiate_risk_exit(pos["pos_id"],
                                                 "H1_FLIP_STRATEGY_EXIT")
             if direction != 0:
+                # BLOK32 reversal protokolü (yalnız QUALITY): aynı sembolde
+                # açık pozisyon varken ters yönde emir ASLA gönderilmez —
+                # önce reduce-only çıkış, borsada flat doğrulama, koruma/
+                # defter mutabakatı; yeni yön SONRAKİ barlarda değerlendirilir
+                # (§7 "Korumasız veya çıkış durumu belirsiz pozisyon üzerine
+                # yeni ters yönlü emir gönderme").
+                open_on_sym = [p for p in self.rm.open_positions()
+                               if p["symbol"] == symbol]
+                if self.entry_policy == cq.ENTRY_POLICY_QUALITY and open_on_sym:
+                    if states.get(symbol) is not None:
+                        states[symbol]["entry_result"] = "REVERSAL_EXIT_FIRST"
+                        states[symbol]["final_decision"] = \
+                            "REVERSAL_EXIT_FIRST"
+                        states[symbol]["decision_reason"] = (
+                            "quality politika: aynı sembolde açık pozisyon — "
+                            "önce çıkış + flat doğrulaması, sonra yeni yön")
+                    continue
                 recs = self.try_entry(symbol, direction, ref_px, bar_ts,
                                       now, qv, signal_px=signal_px)
                 out.extend(recs)
@@ -1840,11 +1973,40 @@ class LiveCanary:
                     elif isinstance(res, str) and res.startswith("REJECTED"):
                         states[symbol]["final_decision"] = "ORDER_REJECTED"
                     elif res == "BLOCKED":
-                        states[symbol]["final_decision"] = "ENTRY_BLOCKED"
+                        # BLOK32 (yalnız QUALITY): blok nedeni ayrıştırılır —
+                        # operatör PAUSE'u ve global HALT kendi karar
+                        # durumlarıyla görünür (§5 karar durumları listesi)
+                        if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+                            bl = " ".join(recs[0].get("blockers") or [])
+                            if "ENTRY_PAUSED" in bl:
+                                states[symbol]["final_decision"] = \
+                                    "ENTRY_PAUSED"
+                            elif "HALT" in bl:
+                                states[symbol]["final_decision"] = \
+                                    "GLOBAL_HALT"
+                            else:
+                                states[symbol]["final_decision"] = \
+                                    "ENTRY_BLOCKED"
+                        else:
+                            states[symbol]["final_decision"] = "ENTRY_BLOCKED"
                     elif isinstance(res, str) and "UNKNOWN" in res:
                         states[symbol]["final_decision"] = "ENTRY_UNKNOWN"
                     else:
-                        states[symbol]["final_decision"] = "ENTRY_ATTEMPTED"
+                        states[symbol]["final_decision"] = (
+                            "ORDER_SUBMITTED" if self.entry_policy ==
+                            cq.ENTRY_POLICY_QUALITY else "ENTRY_ATTEMPTED")
+                    # BLOK32: emir ÇIKTI ise episode ENGAGED (kalıcı — restart
+                    # sonrası da aynı sinyal episode'u tekrar emir ÜRETEMEZ).
+                    # BLOCKED/DUPLICATE kalırsa ARMED kalır: sonraki barlar
+                    # engel kalkınca tekrar değerlendirir (hedef-yön takibi).
+                    if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+                        order_out = (res == "FILLED"
+                                     or (isinstance(res, str) and (
+                                         res.startswith("REJECTED")
+                                         or "UNKNOWN" in res
+                                         or res.startswith("entry status"))))
+                        if order_out:
+                            self._episode_set(symbol, direction, True)
         # BLOK31 §5: her strateji döngüsü GÖRÜNÜR — başarı/başarısızlık ve
         # sembol bazlı durum ayrık kayda geçer (thread'in bu kaydı yazması
         # döngünün çalıştığının kendisidir). BLOK31.1 §8: döngü-düzeyi
@@ -1854,6 +2016,7 @@ class LiveCanary:
         self._log("strategy_cycles.jsonl",
                   {"t": now, "kind": "STRATEGY_CYCLE", "cycle_id": seq,
                    "written_by": "canary-strategy",
+                   "entry_policy": self.entry_policy,
                    "entry_paused": self.entry_paused,
                    "halt_state": self.halt_state,
                    "rm_status": self.rm.status,
@@ -1943,6 +2106,14 @@ class LiveCanary:
         for (ot, s, o, c, qv) in warmup_events:
             self.engine.begin_bar(s, o)
             self.engine.end_bar(s, ot, c)
+            # BLOK32: kalite modelinin hacim/sigma penceresi warmup replay
+            # ile kurulur (restart sonrası geçmiş pencere kendini yeniden
+            # kurar — ek kalıcı durum YOK; episode/sig anahtarları DB'de)
+            if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+                S = self.engine._state(s)
+                self.quality.feed(s, qv, math.sqrt(S["var"])
+                                  if S["var"] is not None and S["var"] > 0
+                                  else None)
             warm_last[s] = ot
         for s, ot in warm_last.items():
             if s not in self._warmed:
@@ -1951,6 +2122,12 @@ class LiveCanary:
             self._set_last(s, ot)
         qv_by = {}
         for (ot, s, o, c, qv) in live_events:
+            # BLOK32: bu yinelemede bu sembol için flip olayı ÜRETİLDİ mi?
+            # (bar açılışındaki kanonik deneme VEYA end_bar sonrası deneme
+            # — hangisinden gelirse gelsin, o sembolün bu tikteki giriş
+            # kararı flip yolunun tekelindedir; kalite değerlendirmesi
+            # yinelenmez)
+            sym_flip_fired = False
             # KANONİK §7 SIRASI (BLOK31.1): bu barın AÇILIŞINDA (ot) due
             # olan flip, end_bar'dan ÖNCE nihai olarak çözülür — ya taze
             # fiyatla İCRA ya da MISSED (fail-closed). end_bar'ın sig!=dir
@@ -1970,6 +2147,7 @@ class LiveCanary:
                     ev = self._attempt_due_flip(s, now_ms, states)
                     if ev is not None:
                         decisions.append(ev)
+                        sym_flip_fired = True
                     S = self.engine._state(s)
                     if S["pend"] and \
                             (S["pend_bar_ts"] or 0) + BAR_MS <= ot:
@@ -1981,6 +2159,11 @@ class LiveCanary:
             # (c)+(e): EWMA + BU kapanışta sinyal → pend hemen değerlendirme
             # alır (karar anı = bu barın kapanışı = sonraki barın açılışı)
             self.engine.end_bar(s, ot, c)
+            if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+                S = self.engine._state(s)
+                self.quality.feed(s, qv, math.sqrt(S["var"])
+                                  if S["var"] is not None and S["var"] > 0
+                                  else None)
             if s not in self._warmed:
                 newly_warmed.add(s)
             self._warmed.add(s)
@@ -1988,6 +2171,12 @@ class LiveCanary:
             ev = self._attempt_due_flip(s, now_ms, states)
             if ev is not None:
                 decisions.append(ev)
+                sym_flip_fired = True
+            # BLOK32: hedef-yön takibi — bu tikte bu sembol için flip olayı
+            # ÜRETİLMEDİYSE mevcut hedef yön yeni kapalı mumpdan kalite
+            # skoruna bağlanır (flip GEREKMEZ — operatör kararı §5)
+            if self.entry_policy == cq.ENTRY_POLICY_QUALITY and not sym_flip_fired:
+                self._quality_evaluate(s, ot, c, now_ms, states, decisions)
         # önceki tiklerden kalan due flip'ler (fiyat retry / restart sonrası
         # warmup sınırı): (karar barı, symbol) kronolojik deterministik sıra
         leftover = [s for s in self.symbols
@@ -2090,6 +2279,160 @@ class LiveCanary:
             st["decision"] = "SIGNAL_STALE"
             st["decision_reason"] = reason
             st["flip_detected"] = True
+
+    # =========================================================================
+    # BLOK32 — QUALITY-BASED TARGET-FOLLOWING (operatör kararı 2026-11-25)
+    # =========================================================================
+    def _quality_evaluate(self, symbol, bar_ot, close_px, now_ms, states,
+                          decisions):
+        """Her YENİ kapalı mumpda mevcut hedef yönü (engine target — flip
+        GEREKMEZ) bağımsız kalite skorundan geçer. Kalibrasyon semantiği
+        (~/blok32-calibration simulate(), OOS'e DEĞİŞMEDEN taşıdı):
+          - episode ARMED + skor >= θ_d  → giriş adayı (taze icra fiyatıyla)
+          - episode ENGAGED + skor < θ_d − h_d → yeniden silahlanma (hysteresis)
+          - çıkış episode'u yeniden silahlamaz (aynı sinyalde yeniden giriş yok)
+        Fail-closed: bileşen hesaplanamıyorsa skor yok → giriş yok + neden.
+        Bekleyen (çözülmemiş) flip varken değerlendirme YOK — o anki geçiş
+        flip yolunun tekelindedir. Kalitesi yetersizse NOTHING (emir yok)."""
+        S = self.engine._state(symbol)
+        if S["pend"]:
+            return                      # çözülmemiş flip — flip yolu sahiplikte
+        d = S["dir"]
+        if d == 0 or not self.engine.warm(symbol):
+            return
+        st = states.get(symbol)
+        if st is not None:
+            st["target"] = "TARGET_LONG" if d > 0 else "TARGET_SHORT"
+            st["target_direction"] = d
+        q = self.quality.compute(symbol, d)
+        th = cq.threshold(d)
+        hy = cq.hysteresis(d)
+        engaged = self._episode_engaged(symbol, d)
+        if q is None:
+            if st is not None and st.get("decision") is None:
+                st["decision"] = "QUALITY_INSUFFICIENT"
+                st["decision_reason"] = ("kalite hesaplanamadı (fail-closed: "
+                                         "bileşen penceresi dolmadı / veri "
+                                         "eksik) — {0} hedefi doğrulanamadı"
+                                         .format("TARGET_LONG" if d > 0
+                                                 else "TARGET_SHORT"))
+            return
+        # §3 sinyal nesnesi alanları — yalnız GERÇEK hesaplanan bileşenler
+        if st is not None:
+            for k in ("quality_score", "quality_threshold", "quality_pass",
+                      "momentum_strength", "trend_confirmation",
+                      "volatility_context", "volume_confirmation"):
+                st[k] = q[k]
+            st["signal_reason"] = q["signal_reason"]
+            st["signal_timestamp"] = now_ms
+            st["signal_bar_timestamp"] = bar_ot
+            st["quality_episode"] = "ENGAGED" if engaged else "ARMED"
+        if engaged:
+            # hysteresis: yeniden silahlanma YALNIZ skor θ−h altına inince
+            if q["quality_score"] < th - hy:
+                self._episode_set(symbol, d, False)
+                if st is not None:
+                    st["quality_episode"] = "ARMED"
+                    st["quality_rearmed"] = True
+                    st["quality_rearm_reason"] = (
+                        f"skor {q['quality_score']} < θ−h "
+                        f"({th:.1f}−{hy:.1f}={th - hy:.1f}) — episode yeniden "
+                        "silahlandı (hysteresis)")
+            elif st is not None and st.get("decision") is None:
+                st["decision"] = "QUALITY_INSUFFICIENT"
+                st["decision_reason"] = (f"episode ENGAGED (hysteresis) — "
+                                         f"skor {q['quality_score']}")
+            return
+        if not q["quality_pass"]:
+            if st is not None and st.get("decision") is None:
+                st["decision"] = "QUALITY_INSUFFICIENT"
+                st["decision_reason"] = (f"kalite skoru {q['quality_score']} < "
+                                         f"eşik {th} — {q['signal_reason']}")
+            return
+        # kalite GEÇTİ → giriş adayı. Aynı sembolde açık pozisyon varsa giriş
+        # YOK (reversal protokolü §7: önce çıkış + borsada flat doğrulama;
+        # ters yön kalitesi pozisyonu çıkışa süren hedef değişiminde zaten
+        # _quality_target_exits ile başlatılır).
+        if any(p["symbol"] == symbol for p in self.rm.open_positions()):
+            if st is not None and st.get("decision") is None:
+                st["decision"] = ("QUALITY_VALID_LONG" if d > 0 else
+                                  "QUALITY_VALID_SHORT")
+                st["decision_reason"] = (f"kalite geçti ({q['quality_score']} "
+                                         f">= {th}) ama sembolde pozisyon "
+                                         "açık — reversal: önce çıkış")
+            return
+        # aynı bar için sinyal anahtarı zaten tükendiyse ikinci deneme YOK
+        # (§6: aynı kalite olayında ikinci MARKET yok)
+        if self._get_state(f"sig:{symbol}:{bar_ot}") is not None:
+            return
+        px, pmeta = self._executable_price(symbol, d, now_ms)
+        if px is None:
+            if st is not None and st.get("decision") is None:
+                st["decision"] = "PRICE_UNAVAILABLE"
+                st["decision_reason"] = (f"kalite geçti ({q['quality_score']}) "
+                                         f"ama icra fiyatı yok: {pmeta}")
+            return
+        if abs(px - close_px) / close_px > SIGNAL_PRICE_DEVIATION_MAX:
+            dev = abs(px - close_px) / close_px
+            if st is not None and st.get("decision") is None:
+                st["decision"] = "PRICE_DEVIATION"
+                st["decision_reason"] = (f"taze {px:.6f} vs bar kapanışı "
+                                         f"{close_px:.6f} (%{dev * 100:.2f} > "
+                                         f"{SIGNAL_PRICE_DEVIATION_MAX * 100:.0f})")
+            return
+        self._log("live_orders.jsonl",
+                  {"t": now_ms, "kind": "QUALITY_SIGNAL", "symbol": symbol,
+                   "bar_ts": bar_ot, "direction": d,
+                   "quality_score": q["quality_score"],
+                   "quality_threshold": th,
+                   "momentum_strength": q["momentum_strength"],
+                   "trend_confirmation": q["trend_confirmation"],
+                   "volatility_context": q["volatility_context"],
+                   "volume_confirmation": q["volume_confirmation"],
+                   "signal_reason": q["signal_reason"],
+                   "signal_timestamp": now_ms,
+                   "signal_bar_timestamp": bar_ot,
+                   "executable_px": px, "signal_px": close_px,
+                   "execute": True})
+        if st is not None:
+            st["decision"] = ("QUALITY_VALID_LONG" if d > 0 else
+                              "QUALITY_VALID_SHORT")
+            st["decision_reason"] = (f"kalite geçti: {q['quality_score']} >= "
+                                     f"{th} — giriş zinciri tetiklendi")
+            st["current_executable_price"] = px
+            st["price_source"] = "bookTicker"
+            st["price_age_ms"] = now_ms - pmeta.get("ts", now_ms)
+        decisions.append((symbol, d, px, bar_ot, None, close_px))
+
+    def _quality_target_exits(self, now_ms, states=None):
+        """BLOK32 (yalnız QUALITY politika): hedef yön değiştiğinde (flip
+        TÜKETİLDİ — kalite geçsin geçmesin; kalibrasyon semantiği: çıkış
+        flip'te koşulsuz) açık ters pozisyonu reduce-only çıkışa al.
+        One-way reversal protokolünün ÇIKIŞ bacağı (§7); yeni giriş yalnız
+        borsada flat doğrulaması + koruma/defter mutabakatından SONRAki
+        barlarda değerlendirilir (same-symbol kapısı bunu zorlar —
+        rm pozisyonu yalnız flat-doğrulanmış kapanışta defterden düşer).
+        FLIP_ONLY'da çıkışlar olay tabanlı kalır (değişiklik YOK)."""
+        for pos in self.rm.open_positions():
+            sym = pos["symbol"]
+            d = self.engine.direction(sym)
+            if d == 0 or pos["direction"] == d:
+                continue
+            lp = self._live_pos_row(pos["pos_id"])
+            if lp and lp["exit_status"] not in (X_NONE, X_CONFIRMED):
+                continue          # çıkış akışı zaten sürüyor — dokunma
+            res = self.initiate_risk_exit(pos["pos_id"],
+                                          "QUALITY_TARGET_FLIP_EXIT")
+            self._log("live_orders.jsonl",
+                      {"t": now_ms, "kind": "QUALITY_REVERSAL_EXIT",
+                       "symbol": sym, "pos_id": pos["pos_id"],
+                       "position_direction": pos["direction"],
+                       "target_direction": d, "result": res,
+                       "reason": "hedef yön değişti (flip tüketildi) — "
+                                 "reduce-only çıkış; flat doğrulama sonrası "
+                                 "yeni yön değerlendirmesi"})
+            if states.get(sym) is not None:
+                states[sym]["reversal_exit_initiated"] = True
 
     def _set_last(self, symbol, ot):
         self._last_bar[symbol] = ot

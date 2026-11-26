@@ -452,14 +452,20 @@ class FakeClock:
         self.t += int(ms)
 
 
-def make_canary(tmpdir, ex=None, t0=T0, verified_liq=True, symbols=None):
-    """Doğrulanmış likidasyon modeli + gerçek filtrelerle LiveCanary."""
+def make_canary(tmpdir, ex=None, t0=T0, verified_liq=True, symbols=None,
+                entry_policy=None):
+    """Doğrulanmış likidasyon modeli + gerçek filtrelerle LiveCanary.
+
+    BLOK32: entry_policy varsayılanı FLIP_ONLY'dur — BLOK30/31/31.1 legacy
+    testlerinin kanonik flip-only davranışı BLOK32 ile DEĞİŞMEZ. Quality
+    politikası testleri entry_policy='QUALITY_BIDIRECTIONAL' ister."""
     import os
 
     from canary_live import LiveCanary
     from canary_liquidation import (LiquidationModel,
                                     parse_leverage_brackets,
                                     POSITION_MODE_ONEWAY)
+    import canary_quality as cq
     ex = ex or FakeExchange()
     liq = None
     if verified_liq:
@@ -470,7 +476,8 @@ def make_canary(tmpdir, ex=None, t0=T0, verified_liq=True, symbols=None):
     db = os.path.join(str(tmpdir), "canary_live.db")
     return LiveCanary(db, ex, symbols=symbols or ex.symbols, t0_ms=t0,
                       filters=ex.filters, liq_model=liq,
-                      clock_ms=ex._clock, log_dir=str(tmpdir))
+                      clock_ms=ex._clock, log_dir=str(tmpdir),
+                      entry_policy=entry_policy or cq.ENTRY_POLICY_FLIP_ONLY)
 
 
 def prime(lc):
