@@ -72,8 +72,19 @@ import canary_quality as cq
 # reference kayıt için durur. Üretim (BRAIN_PRIMARY) evreni canary_runner
 # beynin eligible contract discovery çıktısından kurar (görev §1: eski
 # liste yeni işlem evreninin belirleyicisi DEĞİLDİR).
+# GÖREV 2026-11-27 §3.10: bu sabit LiveCanary kurulum yolunda ARTIK
+# varsayılan DEĞİLDİR — symbols parametresi ZORUNLUDUR (aşağıda None
+# kontrolü); 8 sembole sessiz geri dönüş fiziksel olarak imkânsız.
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "BNBUSDT", "DOGEUSDT",
            "LINKUSDT", "SOLUSDT", "XRPUSDT"]
+
+# GÖREV 2026-11-27 §3.7/§11: beyin modunda TANIMLI tek çıkış semantiği —
+# risk katmanı (girişte STOP_MARKET SL + −5 SAFE_EXIT + −10 HALT). H1
+# hedef-çıkış yolu BRAIN_PRIMARY'de ÇALIŞMAZ (strategy_tick erken döner).
+# Operatör live_state'e brain_exit_policy=RISK_ONLY yazmadıkça beyin
+# adayları emir zincirine GİRMEZ (fail-closed): exit belirsizliği sessiz
+# dormansi değil, somut teknik blokerdir. Yeni politika ICAT EDILMIYOR.
+BRAIN_EXIT_POLICY_RISK_ONLY = "RISK_ONLY"
 # BLOK29.1 (2026-11-25): hedef notional TEK MERKEZİ KAYNAK'TAN türetilir —
 # canary_risk.MAX_POSITION_NOTIONAL (100 USDT). Burada ayrı sayı YOKTUR;
 # operatör limiti değişirse yalnızca canary_risk.py güncellenir.
@@ -372,7 +383,7 @@ class LiveCanary:
     """Mainnet canary release candidate. Tüm borsa erişimi `exchange`
     soyutlamasından (BinanceFuturesClient | FakeExchange) geçer."""
 
-    def __init__(self, db_path, exchange, symbols=SYMBOLS, t0_ms=None,
+    def __init__(self, db_path, exchange, symbols=None, t0_ms=None,
                  filters=None, liq_model: Optional[LiquidationModel] = None,
                  clock_ms=None, log_dir=None, entry_policy=None,
                  signal_source=SIGNAL_SOURCE_H1,
@@ -381,6 +392,15 @@ class LiveCanary:
         self.dir = Path(log_dir or os.path.dirname(self.db_path))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.exchange = exchange
+        # GÖREV 2026-11-27 §3.3/§3.10: evren ZORUNLU argüman — eski 8
+        # sembollük legacy listeye sessiz geri dönüş YOK. Boş evrenle
+        # kurulum hatası (fail-closed; canary_runner zaten boş discovery
+        # üzerinde FATAL verir, bu ikinci savunma katmanıdır).
+        if not symbols:
+            raise ValueError(
+                "symbols bos/gelmedi — islem evreni acikta verilmeli "
+                "(canary_runner discovery ciktisi ya da test evreni); "
+                "legacy 8 sembol listesine otomatik dusus YOK")
         self.symbols = list(symbols)
         self.t0_ms = int(t0_ms) if t0_ms is not None else 0
         self.filters = filters or {}       # {symbol: {tickSize, stepSize,...}}
@@ -606,15 +626,17 @@ class LiveCanary:
 
     # ---- borsa okuma yardımcıları ----------------------------------------------
     def _position_risk_map(self):
-        """positionRisk → {symbol: row}. Hata → ExchangeUnavailable yükselir
-        (çağıran fail-closed davranır — kesinti ASLA 'pozisyon yok' olmaz)."""
+        """positionRisk → {symbol: row} — SÜZGESİZ (görev 2026-11-27 §3.3/§3.6).
+
+        Evren daralıp canary pozisyonunun sembolü evren dışında kalsa bile
+        (delist/restart sonrası discovery değişimi) mutabakat, drift ve çıkış
+        akışları o sembolü görmeye DEVAM eder. Yabancı pozisyonlar (FAZ9/
+        GridC0/manual) HER sembolde görünür → UNOWNED_POSITION → giriş
+        bloğu (sahiplik kanıtı olmayan pozisyon gizlenmez).
+        Hata → ExchangeUnavailable yükselir (çağıran fail-closed davranır —
+        kesinti ASLA 'pozisyon yok' olmaz)."""
         rows = self.exchange.position_risk()
-        out = {}
-        for r in rows:
-            sym = r.get("symbol")
-            if sym in self.symbols:
-                out[sym] = r
-        return out
+        return {r["symbol"]: r for r in rows if r.get("symbol")}
 
     def _exchange_amt(self, symbol, pr_map=None):
         """Borsadaki gerçek pozisyon miktarı (positionRisk). pr_map verilmediyse
@@ -700,6 +722,14 @@ class LiveCanary:
         self._set_state("reconciled_ok", 1 if ok else 0)
         self._set_state("unowned_position_seen", 1 if unowned_pos else 0)
         self._set_state("position_state_unknown", 1 if state_unknown else 0)
+        # GÖREV 2026-11-27 §3.6: sahipliği kanıtlanamayan açık EMİR de
+        # giriş kilididir. Algo emirleri OKUNAMADIYSA kanıt yok demektir —
+        # fail-closed: latch 1 yazılır, ancak sonraki başarılı+temiz
+        # _unowned_order_check açar.
+        unowned_order = bool(unowned_ord) or bool(
+            rec.get("algo_orders_unreadable"))
+        self._set_state("unowned_order_seen", 1 if unowned_order else 0)
+        self._set_state("last_unowned_order_check", now)
         self._set_state("reconciled_ts", now)
         rec.update({"result": "OK" if ok else "FLAGS",
                     "unowned_positions": unowned_pos,
@@ -969,6 +999,13 @@ class LiveCanary:
         if str(self._get_state("unowned_position_seen") or "0") == "1":
             reasons.append("sahipliği kanıtlanamayan pozisyon/emir var "
                            "(yeni giriş engelli)")
+        # GÖREV 2026-11-27 §3.6: yabancı açık EMİR (C281 öneksiz
+        # regular/algo) ayrı latch — pozisyonu olmasa da sahiplik
+        # kanıtlanamayan emir yeni girişi bloklar (fail-closed).
+        if str(self._get_state("unowned_order_seen") or "0") == "1":
+            reasons.append("sahipliği kanıtlanamayan açık EMİR var "
+                           "(C281 öneksiz regular/algo emir — yeni giriş "
+                           "engelli)")
         if str(self._get_state("position_state_unknown") or "0") == "1":
             reasons.append("pozisyon durumu bilinmiyor (fail-closed)")
         if self._get_state("feed_recovered_pending_reconcile") == "1":
@@ -1889,12 +1926,18 @@ class LiveCanary:
         now = now_ms or self._now()
         cyc = {"t": now, "kind": "RISK_TICK",
                "entry_paused": self.entry_paused}   # BLOK30 izleme
-        # 1) Mark Price (REST_SAMPLED) — feed sağlık durumu kalıcı
+        # 1) Mark Price (REST_SAMPLED) — feed sağlık durumu kalıcı.
+        # GÖREV 2026-11-27 §3.3: mark güncellemesi evren ∪ AÇIK POZİSYON
+        # sembolleri için yapılır — pozisyonun sembolü evrenden düşse bile
+        # (delist/restart) uPnL/SAFE_EXIT izlemesi mark'sız kalmaz.
         try:
+            wanted = set(self.symbols)
+            for pos in self.rm.open_positions():
+                wanted.add(pos["symbol"])
             rows = self.exchange.premium_index()
             marks_n = 0
             for r in rows:
-                if r.get("symbol") in self.symbols:
+                if r.get("symbol") in wanted:
                     self.rm.update_mark(r["symbol"],
                                         float(r["markPrice"]),
                                         int(r["time"]))
@@ -1927,6 +1970,13 @@ class LiveCanary:
         # 3) funding mutabakatı (gerçek income kayıtları — ~60s'de bir)
         if now - int(self._get_state("last_funding_sync") or 0) > 60_000:
             self._sync_funding(now)
+        # 3.6) yabancı açık emir gözetimi (görev 2026-11-27 §3.6):
+        # CLIENT_PREFIX taşımayan açık emir (regular/algo) → giriş kilidi.
+        # ~60 saniyede bir yeniden okunur; okunamayan bileşen varsa latch
+        # KANITSIZ temizlenmez (fail-closed).
+        if now - int(self._get_state("last_unowned_order_check") or 0) \
+                > 60_000:
+            self._unowned_order_check(now)
         # 3.5) askıda kalan giriş emirlerini çöz (§2.3: client id ile sorgu;
         # çözülmeden yeni giriş zinciri ilerleyemez)
         for row in self._db_execute(
@@ -1962,6 +2012,44 @@ class LiveCanary:
         cyc["rm_status"] = self.rm.status
         self._log("live_cycles.jsonl", cyc)
         return cyc
+
+    def _unowned_order_check(self, now):
+        """Açık emir sahiplik taraması (görev 2026-11-27 §3.6).
+
+        openOrders + openAlgoOrders içinde CLIENT_PREFIX (C281) taşımayan
+        tek bir açık emir varsa unowned_order_seen latch'i atanır →
+        _entry_blockers yeni girişi ENGELLER. Bilinmeyen sahipli emir
+        kanıtlanmış temizlik olmaksızın sessizce yok sayılmaz.
+        Fail-closed: bir bileşen okunamazsa latch KANITSIZ TEMİZLENMEZ
+        (yalnızca iki okuma de başarılı ve temizse 0 yazılır)."""
+        try:
+            open_orders = self.exchange.open_orders()
+        except ExchangeUnavailable:
+            return None
+        try:
+            open_algos = self.exchange.open_algo_orders()
+            algos_ok = True
+        except ExchangeUnavailable:
+            open_algos = []
+            algos_ok = False
+        unowned = [o.get("clientOrderId") or f"nosid:{o.get('symbol')}"
+                   for o in open_orders
+                   if not (o.get("clientOrderId") or "").
+                   startswith(CLIENT_PREFIX)]
+        unowned += [f"algo:{a.get('clientAlgoId') or a.get('symbol')}"
+                    for a in open_algos
+                    if not (a.get("clientAlgoId") or "").
+                    startswith(CLIENT_PREFIX)]
+        clean = not unowned and algos_ok
+        # latch yalnız KANITLA düşer; okunamayan algo taraması varken
+        # mevcut 'görüldü' durumu korunur
+        if clean or str(self._get_state("unowned_order_seen")
+                        or "0") != "1":
+            self._set_state("unowned_order_seen", 1 if unowned else 0)
+        self._set_state("last_unowned_order_check", now)
+        if unowned:
+            self.rm._event("UNOWNED_ORDER", ",".join(unowned)[:300])
+        return {"unowned_orders": unowned, "algos_ok": algos_ok}
 
     def _sync_funding(self, now):
         """Gerçek FUNDING_FEE income kayıtlarını rm defterine yaz
@@ -2149,6 +2237,29 @@ class LiveCanary:
                 rec["result"] = "DUPLICATE_BRAIN_DECISION"
                 self._log("live_orders.jsonl", rec)
                 return out
+        # GÖREV 2026-11-27 §3.7/§11: beyin çıkış semantiği somut teknik
+        # blokerdir. BRAIN_PRIMARY'de tanımlı TEK çıkış katmanı risk
+        # katmanıdır (girişte STOP_MARKET SL + −5 SAFE_EXIT + −10 HALT);
+        # H1 hedef-çıkış yolu beyin modunda ÇALIŞMAZ (strategy_tick erken
+        # döner). Operatör live_state'e brain_exit_policy=RISK_ONLY
+        # yazarak bu gerçekliği ONAYLAMADIKÇA beyin adayı emir zincirine
+        # GİRMEZ. Yeni çıkış politikası icat EDİLMİYOR — mevcut eksiklik
+        # açık ve denetlenebilir bir kapıya dönüştürülüyor (fail-closed).
+        if str(self._get_state("brain_exit_policy") or "") != \
+                BRAIN_EXIT_POLICY_RISK_ONLY:
+            rec["result"] = "BLOCKED"
+            rec["blockers"] = [
+                "BRAIN_EXIT_POLICY_UNDEFINED: beyin pozisyonları için "
+                "tanımlı tek çıkış risk katmanıdır (SL+SAFE_EXIT+HALT); "
+                "H1 hedef-çıkış beyin modunda çalışmaz. Operatör "
+                "brain_exit_policy=RISK_ONLY onayı yok — beyin adayı emir "
+                "zincirine alınmaz (görev §3.7)"]
+            self._log("live_orders.jsonl", rec)
+            self.rm._event(
+                "ENTRY_BLOCKED",
+                f"{dec.symbol} beyin cikis politikasi onaylanmadi "
+                f"({dec.decision_id}) — BRAIN_EXIT_POLICY_UNDEFINED")
+            return out
         # beyin kaydındaki ret nedenleri varsa aday zaten geçersiz
         if dec.rejection_reasons:
             rec["result"] = "BLOCKED"
