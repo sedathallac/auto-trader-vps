@@ -214,6 +214,80 @@ class LoopTests(unittest.TestCase):
         self.lc.acquire_worker_lock()
         self.lc.release_worker_lock()
 
+    def test_run_returns_only_after_loop_threads_dead(self):
+        """GÖREV 2026-11-27 §12 — flaky temp-dir yarışının deterministik
+        regresyonu: run() döndüğünde canary-risk/canary-strategy
+        thread'lerinden HİÇBİRİ hayatta olmamalıdır (yoksa tearDown
+        dizin temizliği yazan thread'le çakışır — OSError 39).
+
+        NOT: conftest.py pytest altında time.sleep'i GLOBAL olarak
+        no-op'lar (whale_engine.time = stdlib time) — bu yüzden sleep
+        ile zamanlama KURULMAZ; Event kapılarıyla deterministik kurılır:
+        risk tick #2 bilerek BLOKLANIR, stop() gelir, strategy ölür;
+        eski kodda izleyici döngü ('and' koşulu) run()'ı risk thread'i
+        tick ortasındayken döndürürdü → burada yakalanır."""
+        import threading as _th
+        orig_risk = self.lc.risk_tick
+        gate1, gate2 = _th.Event(), _th.Event()
+        wait_evt = _th.Event()
+        calls = {"n": 0}
+
+        def gated_risk(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                gate1.wait(10)          # run()'ın senkron ilk tick'i
+            else:
+                gate2.wait(10)          # döngü tick'i — bloklanır
+            return orig_risk(*a, **kw)
+        self.lc.risk_tick = gated_risk
+        done = _th.Event()
+
+        def _run():
+            self.lc.run(strategy_interval=0.02, risk_interval=0.02)
+            done.set()
+        t = _th.Thread(target=_run, daemon=True)
+        t.start()
+        try:
+            # 1) senkron ilk tick içine gir → serbest bırak
+            deadline = time.time() + 10
+            while calls["n"] < 1 and time.time() < deadline:
+                wait_evt.wait(0.02)
+            self.assertGreaterEqual(calls["n"], 1)
+            gate1.set()
+            # 2) döngü thread'leri başladı; risk tick #2'e girsin
+            deadline = time.time() + 10
+            while calls["n"] < 2 and time.time() < deadline:
+                wait_evt.wait(0.02)
+            self.assertGreaterEqual(calls["n"], 2, "risk döngüsü başlamadı")
+            # 3) risk thread tick ORTASINDA (gate2 kapalı) → stop()
+            self.lc.stop()
+            # 4) strategy thread'in ölmesini bekle (Event.wait gerçek)
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                alive = [x for x in _th.enumerate()
+                         if x.name == "canary-strategy" and x.is_alive()]
+                if not alive:
+                    break
+                wait_evt.wait(0.02)
+            # 5) eski kod izleyicisine karar fırsatı (gerçek bekleme)
+            wait_evt.wait(1.0)
+            # 6) KANIT: run() HENÜZ dönmemiş olmalı (risk hâlâ tick
+            #    içinde). Eski kodda burada dönerdi → yarış.
+            self.assertFalse(
+                done.is_set(),
+                "run() risk thread'i tick ortasındayken döndü — döngü "
+                "thread'leri join edilmiyor (§12 temp-dir yarışı)")
+        finally:
+            gate2.set()                 # risk tick'ini tamamla
+        self.assertTrue(done.wait(10), "run() 10s içinde dönmedi")
+        leftovers = [x for x in _th.enumerate()
+                     if x.name in ("canary-risk", "canary-strategy")
+                     and x.is_alive()]
+        self.assertEqual(
+            leftovers, [],
+            "run() döndü ama döngü thread'i hâlâ yaşıyor (temp-dir "
+            "yarışı kök nedeni — §12 düzeltmesi geri geldi)")
+
 
 if __name__ == "__main__":
     unittest.main()

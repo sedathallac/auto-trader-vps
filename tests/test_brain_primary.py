@@ -119,6 +119,12 @@ class BrainPrimaryBase(unittest.TestCase):
             db_path=self.brain_path, expected_model_version=MODEL_VERSION)
         self.lc = self._make()
         prime(self.lc)
+        # GÖREV 2026-11-27 §3.7: operatör beyin çıkış politikası onayı
+        # (RISK_ONLY) simülasyonu — brain_exit_policy kapısı açılmadan
+        # beyin adayları BRAIN_EXIT_POLICY_UNDEFINED ile bloklanır; mevcut
+        # testlerin downstream zincirlerini (pause/lock/dedup/sizing/CROSS)
+        # görebilmesi için harness onayı temsil eder.
+        self.lc._set_state("brain_exit_policy", "RISK_ONLY")
 
     def _make(self, **kw):
         return make_canary(self.tmp.name, self.ex, entry_policy=(
