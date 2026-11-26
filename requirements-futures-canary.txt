@@ -1,0 +1,9 @@
+# futures-canary servis bağımlılıkları (VPS venv: /opt/futures-canary/venv)
+#
+# B.1 İş 2 (2026-11-26): UDS (User Data Stream) gerçek WebSocket bağlantısı
+# için websocket-client eklendi. Sürüm poli̇tikası: yerel test ortamıyla
+# birebir sabitlendi (tests + mark_price_observer aynı kütüphane).
+#
+# Kurulum (deploy adımı):
+#   /opt/futures-canary/venv/bin/pip install -r requirements-futures-canary.txt
+websocket-client==1.9.2

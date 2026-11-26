@@ -26,9 +26,11 @@ import sys
 import time
 
 from canary_exchange import BinanceFuturesClient, ExchangeError
-from canary_live import LiveCanary, SYMBOLS
+from canary_live import LiveCanary, SYMBOLS, CLIENT_PREFIX
 from canary_liquidation import (LiquidationModel, parse_leverage_brackets,
                                 POSITION_MODE_ONEWAY, POSITION_MODE_HEDGE)
+from canary_account_adapter import BinanceHttpTransport
+from canary_account_risk_gate import AccountRiskGate
 
 
 def _load_t0(db_path):
@@ -130,6 +132,50 @@ def main():
                     filters=filters, liq_model=liq, log_dir=log_dir)
     if first_start:
         lc._set_state("t0", str(t0))
+
+    # B.1 İŞ 4: hesap-seviyesi CROSS risk kapısını bağla.
+    # Eşikler YALNIZ operatör konfiginden (env); ayarlı DEĞİLSE kapı
+    # güvenli varsayılan BLOCK üretir (kaynak kodda eşik icat EDİLMEZ).
+    # Öneriler (dayanak canary_account_risk_gate docstring):
+    #   CANARY_ACCOUNT_MAX_AGE_MS=30000, CANARY_ACCOUNT_MARGIN_BUFFER_USDT=50
+    def _cfg_int(name):
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            lc._log("live_orders.jsonl", {
+                "t": int(time.time() * 1000), "kind": "ACCOUNT_GATE_CONFIG",
+                "error": f"{name} tamsayı değil — None (BLOCK varsayılanı)"})
+            return None
+
+    def _cfg_float(name):
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            lc._log("live_orders.jsonl", {
+                "t": int(time.time() * 1000), "kind": "ACCOUNT_GATE_CONFIG",
+                "error": f"{name} sayı değil — None (BLOCK varsayılanı)"})
+            return None
+
+    gate = AccountRiskGate(
+        BinanceHttpTransport(key, secret),
+        brackets_by_symbol=liq.brackets,   # kurulumda fetch edildi (ekstra çağrı YOK)
+        client_prefix=CLIENT_PREFIX,
+        max_age_ms=_cfg_int("CANARY_ACCOUNT_MAX_AGE_MS"),
+        margin_buffer_usdt=_cfg_float("CANARY_ACCOUNT_MARGIN_BUFFER_USDT"))
+    lc.rm.account_gate = gate
+    lc._log("live_orders.jsonl", {
+        "t": int(time.time() * 1000), "kind": "ACCOUNT_GATE_ATTACHED",
+        "max_age_ms_configured": gate.max_age_ms is not None,
+        "margin_buffer_configured": gate.margin_buffer_usdt is not None,
+        "bracket_symbols": len(gate.brackets_by_symbol),
+        "note": "esikler operatör env konfiginden; yoksa guvenli "
+                "varsayilan BLOCK (canli giris izni DEGILDIR)"})
     lc._log("live_orders.jsonl", {
         "t": int(time.time() * 1000), "kind": "RUNNER_START",
         "first_start": first_start, "t0": t0,

@@ -82,6 +82,11 @@ class RiskManager:
         self.db.commit()
         if self._get_state("status") is None:
             self._set_state("status", STATUS_ACTIVE)
+        # B.1 İŞ 4: hesap-seviyesi CROSS risk kapısı (canary_account_risk_gate.
+        # AccountRiskGate). None → kapı bağlı DEĞİL → check_order davranışı
+        # DEĞİŞMEZ (geriye uyumlu). Runner kurulumda bağlar (operatör konfigi
+        # yoksa kapı güvenli varsayılan BLOCK üretir).
+        self.account_gate = None
 
     # ---- kalıcı durum -----------------------------------------------------
     def _get_state(self, key):
@@ -246,8 +251,21 @@ class RiskManager:
     def check_order(self, symbol, direction, notional, now_ms=None):
         """Yeni/açıcı emir için atomik kapı. İzin → dict; ret → OrderRejected.
         Risk AZALTAN (kapanış) işlemler bu kapıdan GEÇMEZ (kural 9):
-        close_position doğrudan çağrılır."""
+        close_position doğrudan çağrılır.
+
+        B.1 İŞ 4: account_gate bağlıysa hesap-seviyesi CROSS kontrolü
+        KİLİT DIŞINDA önce yapılır (ağ çağrısı rm kilidini bloklamaz;
+        RLock reentrant olduğundan submit_order içinden de güvenli).
+        Kapı BLOCK → OrderRejected(AG_* nedenleri) — denetim izi
+        try_entry tarafından live_orders.jsonl'ye yazılır."""
         now_ms = now_ms or int(time.time() * 1000)
+        if self.account_gate is not None:
+            decision = self.account_gate.evaluate(
+                symbol=symbol, direction=direction, notional=notional,
+                rm=self, now_ms=now_ms)
+            if not decision.passed:
+                raise OrderRejected(
+                    "ACCOUNT_GATE " + " | ".join(decision.reasons))
         with self._lock:
             # 8: hesap yapılamıyorsa emir YOK — her None rettir
             total_loss = self.total_net_loss(now_ms)
