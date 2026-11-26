@@ -1,8 +1,52 @@
-__pycache__/
-*.pyc
-*.db
-*.db-wal
-*.db-shm
-.pytest_cache/
 .venv/
 venv/
+__pycache__/
+*.pyc
+.env
+.auto_trader_blacklist.json
+.tracked_symbols.json
+.trading_archive.db
+*.log
+
+# Runtime state (tracked degil, ignore)
+.auto_trader.heartbeat
+.parse_state.json
+.risk_engine_last_exec_check.json
+.risk_engine_state.json
+.risk_engine_state.json.bak-*
+# Backup'lar (runtime)
+*.bak
+*.bak-*
+*.bak_*
+backup_*/
+backup_pre_promote_*/
+# DB yedekleri (ana .db zaten ignore'da)
+.trading_archive.db.bak-*
+# Runtime raporlar
+reports/
+# Secrets / personal files — NEVER track
+.bashrc
+.bash_history
+.profile
+.cache/
+.config/
+.ssh/
+*.env
+*.log.old-*
+*.db.bak-*
+# C3: SQLite risk ledger (runtime data)
+risk_ledger.db
+risk_ledger.db-*
+risk_ledger.db-shm
+risk_ledger.db-wal
+# C3: migrated JSON backups (artifacts)
+.risk_engine_state.json.migrated-*
+.risk_engine_last_exec_check.json.migrated-*
+# Test temp files
+tmp*_c3_mod.py
+.lesshst
+# SQLite WAL sidecar files (archiver DB)
+*.db-shm
+*.db-wal
+*.db
+.pytest_cache/
