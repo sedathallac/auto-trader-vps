@@ -244,11 +244,19 @@ class BrainRunner:
             return None
         try:
             from canary_account_adapter import BinanceHttpTransport
-            from canary_account_model import parse_balance_v3
+            from canary_account_model import (parse_balance_v3,
+                                              SnapshotMetadata)
             t = BinanceHttpTransport(self.account_key, self.account_secret)
             self.sched.acquire(5)          # /fapi/v3/balance ağırlığı
+            t0 = int(time.time() * 1000)
             body = t.signed_get("/fapi/v3/balance")
-            bal = parse_balance_v3(body)
+            t1 = int(time.time() * 1000)
+            meta = SnapshotMetadata(
+                source_name="brain-runner", endpoint="/fapi/v3/balance",
+                request_started_at_ms=t0, response_received_at_ms=t1,
+                local_receive_time_ms=t1, source_update_time_ms=None,
+                note="brain hesap okumasi (salt-okunur)")
+            bal = parse_balance_v3(body, meta)
             usdt = bal.usdt()
             if usdt is None:
                 return None
