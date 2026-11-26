@@ -2846,6 +2846,16 @@ class LiveCanary:
                 time.sleep(0.5)
         finally:
             self.stop()
+            # GÖREV 2026-11-27 §12 (flaky temp-dir yarışı root-cause):
+            # run() DÖNGÜ THREAD'LERİ TAMAMEN BİTMEDEN dönmemelidir —
+            # eskiden izleyici döngü 'and' koşuluyla bir thread ölünce
+            # dönerken, diğeri hâlâ risk_tick/strategy_tick ortasında
+            # olabiliyor ve test tearDown'unun dizin temizliğiyle
+            # çakışıyordu (OSError 39 / c8eac63'te de görülen yarış).
+            # İzleyici semantiği değişmez (bir döngü ölürse stop), ama
+            # dönüş ÖNCE her iki thread'in bitmesini bekler (≤5s).
+            tr.join(5.0)
+            ts.join(5.0)
         return 0
 
     def stop(self):
