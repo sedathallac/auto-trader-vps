@@ -8,6 +8,8 @@ Kullanım:
   python canary_control.py status  [--db /var/lib/futures-canary/canary_live.db]
   python canary_control.py pause   --reason "..." [--db PATH] [--timeout S]
   python canary_control.py resume  --confirm [--db PATH] [--reason "..."]
+  python canary_control.py direction {long,short} {on,off} [--db PATH]
+         [--reason "..."] [--timeout S]      (on için --confirm ZORUNLU)
 
 Davranış sözleşmesi:
   status : salt-okunur (DB mode=ro); PAUSE + HALT + risk durumu + bekleyen
@@ -29,7 +31,8 @@ import socket
 import sys
 
 from canary_live import (EntryGateBusy, entry_gate_lock_path,
-                         read_entry_pause, set_entry_pause)
+                         read_entry_pause, set_entry_pause,
+                         set_direction_enabled)
 
 DEFAULT_DB = os.environ.get(
     "CANARY_DB", "/var/lib/futures-canary/canary_live.db")
@@ -72,6 +75,14 @@ def _print_state(st):
     for p in pend:
         print(f"  - {p['client_id']} {p['symbol']} {p['status']} "
               f"@ {_fmt_ts(p['updated_ts'])}")
+    # BLOK32 görev-2: yön canlı giriş izinleri (ham değerle — hatalı ayar
+    # görünür; yalnız TAM OLARAK "1" izin verir, diğer her şey KAPALI)
+    print(f"LONG canlı giriş izni    : "
+          f"{'AÇIK' if st.get('dir_enabled_long') else 'KAPALI'}"
+          f" (dir_enabled_long={st.get('dir_enabled_long_raw')!r})")
+    print(f"SHORT canlı giriş izni   : "
+          f"{'AÇIK' if st.get('dir_enabled_short') else 'KAPALI'}"
+          f" (dir_enabled_short={st.get('dir_enabled_short_raw')!r})")
 
 
 def cmd_status(args):
@@ -141,6 +152,43 @@ def cmd_resume(args):
     return EXIT_OK
 
 
+def cmd_direction(args):
+    direction = 1 if args.dir == "long" else -1
+    enable = (args.state == "on")
+    if enable and not args.confirm:
+        print("HATA: yön iznini AÇMAK açık operatör onayı gerektirir — "
+              "--confirm bayrağı ekleyin.")
+        print("RESULT: FAILED — yön izni değişmedi.")
+        return EXIT_USAGE
+    print(f"YÖN İZNİ isteği: {args.dir.upper()} canlı girişi "
+          f"{'AÇILACAK' if enable else 'KAPATILACAK'}. "
+          "Mevcut pozisyonlar, koruma emirleri, risk/çıkış döngüleri, "
+          "kalite eşikleri ve kalibrasyon DOKUNULMAZ. FLIP_ONLY "
+          "politikasında bu kilit uygulanmaz.")
+    try:
+        r = set_direction_enabled(args.db, direction, enable,
+                                  args.reason or
+                                  f"operatör {args.dir} "
+                                  f"{'enable' if enable else 'disable'}",
+                                  _who(), timeout_s=args.timeout)
+    except EntryGateBusy as e:
+        print(f"HATA: {e}")
+        print("RESULT: FAILED — giriş zinciri devam ediyor, yön izni "
+              "yazılmadı (durum DEĞİŞMEDİ). Tekrar deneyin.")
+        return EXIT_GATE_BUSY
+    print(f"önceki değer             : {r['previous']!r}")
+    print(f"yazıldı                  : {r['key']}="
+          f"{'1' if enable else '0'} @ {_fmt_ts(r['ts'])} by={r['by']}")
+    print(f"audit                    : risk_events → {r['action']} "
+          f"(dir={r['direction']} reason={r['reason']!r})")
+    print("RESULT: OK — " + (
+        f"{args.dir.upper()} canlı girişi AÇIK (yalnız "
+        "QUALITY_BIDIRECTIONAL politikasında etkin; sinyal kalite/eşik "
+        "kapıları aynen geçerli)" if enable else
+        f"{args.dir.upper()} canlı girişi KAPALI (fail-closed)"))
+    return EXIT_OK
+
+
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=DEFAULT_DB,
@@ -167,9 +215,23 @@ def main(argv=None):
                           help="RESUME nedeni (audit kaydına yazılır)")
     p_resume.add_argument("--timeout", type=float, default=120.0,
                           help="giriş zinciri bekleme süresi sn")
+    p_dir = sub.add_parser("direction", parents=[common],
+                           help="LONG/SHORT canlı giriş izni (BLOK32)")
+    p_dir.add_argument("dir", choices=["long", "short"],
+                       help="yön (long=+1, short=-1)")
+    p_dir.add_argument("state", choices=["on", "off"],
+                       help="on=izin ver (fail-closed varsayılan KAPALI), "
+                            "off=kapat")
+    p_dir.add_argument("--confirm", action="store_true",
+                       help="izin AÇMA için açık operatör onayı (ZORUNLU)")
+    p_dir.add_argument("--reason", default=None,
+                       help="audit kaydına yazılacak neden")
+    p_dir.add_argument("--timeout", type=float, default=120.0,
+                       help="giriş zinciri bekleme süresi sn")
     args = ap.parse_args(argv)
     return {"status": cmd_status, "pause": cmd_pause,
-            "resume": cmd_resume}[args.cmd](args)
+            "resume": cmd_resume,
+            "direction": cmd_direction}[args.cmd](args)
 
 
 if __name__ == "__main__":

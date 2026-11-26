@@ -191,6 +191,60 @@ class EntryGateBusy(Exception):
 # ============================================================================
 ENTRY_PAUSE_KEY = "entry_paused"
 
+# BLOK32 görev-2: yön başına (LONG/SHORT) bağımsız canlı giriş izni.
+# Kalıcı live_state anahtarları; değer TAM OLARAK "1" ise o yönün canlı
+# girişi AÇIK. Eksik, "0", hatalı veya bilinmeyen her değer KAPALI
+# (fail-closed — hiçbir ayar hatası girişi AÇAMAZ). Varsayılan: KAPALI.
+# Yalnız QUALITY_BIDIRECTIONAL politikasına uygulanır; FLIP_ONLY kanonik
+# araştırma davranışı ve legacy regresyonları DEĞİŞMEZ.
+DIR_ENABLED_KEY_LONG = "dir_enabled_long"
+DIR_ENABLED_KEY_SHORT = "dir_enabled_short"
+DIRECTION_DISABLED_LONG = "DIRECTION_DISABLED_LONG"
+DIRECTION_DISABLED_SHORT = "DIRECTION_DISABLED_SHORT"
+
+
+def _dir_enabled_key(direction):
+    return DIR_ENABLED_KEY_LONG if direction > 0 else DIR_ENABLED_KEY_SHORT
+
+
+def _direction_disabled_label(direction):
+    return DIRECTION_DISABLED_LONG if direction > 0 else DIRECTION_DISABLED_SHORT
+
+
+def set_direction_enabled(db_path, direction, enabled, reason, by,
+                          timeout_s=120.0):
+    """Operatör yön-izni yazımı — giriş kapısı kilidi ALTINDA
+    (set_entry_pause deseni). enabled=True yalnız "1", False yalnız "0"
+    yazar; başka değer ASLA yazılmaz. Yalnız dir_enabled_* anahtarlarını
+    ve audit kaydını yazar; halt_state, rm durumu, kalite eşikleri,
+    pozisyonlar ve koruma emirlerine DOKUNMAZ."""
+    key = _dir_enabled_key(direction)
+    action = "DIRECTION_ENABLED" if enabled else "DIRECTION_DISABLED"
+    with entry_gate(db_path, timeout_s=timeout_s):
+        db = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE IF NOT EXISTS live_state ("
+                       "key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS risk_events ("
+                       "ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT)")
+            now = int(time.time() * 1000)
+            row = db.execute("SELECT value FROM live_state WHERE key=?",
+                             (key,)).fetchone()
+            prev = row[0] if row else None
+            db.execute("INSERT INTO live_state VALUES (?,?) ON CONFLICT"
+                        "(key) DO UPDATE SET value=excluded.value",
+                        (key, "1" if enabled else "0"))
+            db.execute("INSERT INTO risk_events VALUES (?,?,?)",
+                       (now, action,
+                        f"dir={direction} by={by} reason={reason}"))
+            db.commit()
+        finally:
+            db.close()
+    return {"action": action, "direction": direction, "key": key,
+            "enabled": bool(enabled), "previous": prev, "ts": now,
+            "by": str(by), "reason": str(reason or "")}
+
 
 def entry_gate_lock_path(db_path):
     """Ortak giriş-kapısı kilit dosyası (DB ile aynı dizin)."""
@@ -279,6 +333,12 @@ def read_entry_pause(db_path):
             except sqlite3.Error:
                 return None
         out["entry_paused"] = (get(ENTRY_PAUSE_KEY) or "0") == "1"
+        # BLOK32 görev-2: yön canlı giriş izinleri (salt-okunur görünüm).
+        # Ham değer de gösterilir — hatalı ayar görünür/kayda geçer.
+        out["dir_enabled_long_raw"] = get(DIR_ENABLED_KEY_LONG)
+        out["dir_enabled_short_raw"] = get(DIR_ENABLED_KEY_SHORT)
+        out["dir_enabled_long"] = (get(DIR_ENABLED_KEY_LONG) == "1")
+        out["dir_enabled_short"] = (get(DIR_ENABLED_KEY_SHORT) == "1")
         out["entry_pause_ts"] = get("entry_pause_ts")
         out["entry_pause_by"] = get("entry_pause_by")
         out["entry_pause_reason"] = get("entry_pause_reason")
@@ -387,6 +447,18 @@ class LiveCanary:
         varsayılan 0'dır; constructor/startup/restart ASLA sıfırlamaz —
         yalnızca operatör aracı (resume) kaldırır."""
         return str(self._get_state(ENTRY_PAUSE_KEY) or "0") == "1"
+
+    def _dir_enabled(self, direction):
+        """BLOK32 görev-2: yön canlı giriş izni (fail-closed). Kalıcı
+        dir_enabled_* anahtarının değeri TAM OLARAK "1" ise izin VAR;
+        eksik, "0", hatalı veya bilinmeyen her değer KAPALI'dır — hiçbir
+        durumda girişi AÇMAZ. Varsayılan (anahtar yok): KAPALI.
+        FLIP_ONLY politikasına uygulanmaz (kanonik araştırma davranışı ve
+        legacy regresyonlar değişmez); üretim politikası
+        QUALITY_BIDIRECTIONAL'da zorunludur."""
+        if self.entry_policy != cq.ENTRY_POLICY_QUALITY:
+            return True
+        return self._get_state(_dir_enabled_key(direction)) == "1"
 
     # ---- BLOK32: kalıcı kalite episode durum makinesi -----------------------
     # qep:{symbol}:{direction} = ARMED | ENGAGED (live_state tablosunda —
@@ -753,6 +825,25 @@ class LiveCanary:
         #    değerlendirir).
         qinfo = None
         if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+            # BLOK32 görev-2: yön canlı giriş kilidi (fail-closed). Flip
+            # yolu da bu kilide tabidir — kilitli yön için emir ÇIKMAZ;
+            # flip YİNE tüketilir (hedef ilerler, kalitesi yetersiz flip
+            # semantiğiyle aynı) ve görünür DIRECTION_DISABLED_FLIP kaydı
+            # yazılır. Ters yönlük AÇIK pozisyonun çıkışı (reduce-only)
+            # kilidden ETKİLENMEZ — kilit yalnız GİRİŞLERİ kapatır.
+            if not self._dir_enabled(direction):
+                self.engine.begin_bar(symbol, px)      # tüket (hedef ilerler)
+                reason = (f"yön kilidi: {direction} yönü canlı girişe "
+                          "KAPALI (dir_enabled_* anahtarı '1' değil — "
+                          "fail-closed; varsayılan KAPALI)")
+                self._log("live_orders.jsonl",
+                          {"t": now_ms, "kind": "DIRECTION_DISABLED_FLIP",
+                           "symbol": symbol, "bar_ts": bar_ts,
+                           "direction": direction, "signal_px": sig_px,
+                           "executable_px": px, "reason": reason,
+                           "execute": False})
+                _note(_direction_disabled_label(direction), reason)
+                return None
             qinfo = self.quality.compute(symbol, direction)
             engaged = self._episode_engaged(symbol, direction)
             if qinfo is None or engaged or not qinfo["quality_pass"]:
@@ -819,6 +910,18 @@ class LiveCanary:
         if self.entry_paused:
             reasons.append("ENTRY_PAUSED (operatör giriş duraklatması — "
                            "mevcut pozisyon yönetimi ve çıkışlar çalışır)")
+        # BLOK32 görev-2: yön canlı giriş kilidi — GERÇEK EMİR GÖNDERİLMEDEN
+        # ÖNCE ortak kontrol. Flip ve quality target-following giriş
+        # yollarının İKİSİ de try_entry → buraya ulaşır (sinyal katmanındaki
+        # kontrollerin tamamı savunma-derinliği; burası ortak zorlayıcı).
+        # Fail-closed: dir_enabled_* anahtarı TAM OLARAK "1" değilse KAPALI.
+        if self.entry_policy == cq.ENTRY_POLICY_QUALITY and \
+                not self._dir_enabled(direction):
+            reasons.append(
+                f"{_direction_disabled_label(direction)} "
+                f"(yön kilidi: {direction} yönü canlı girişe KAPALI — "
+                "dir_enabled_* anahtarı '1' değil, fail-closed; varsayılan "
+                "KAPALI, yalnız açık operatör izni açar)")
 
         # BLOK31: T0 kapısı KARAR ZAMANINA göre — bar_ts karar barının
         # AÇILIŞI; karar, kapanışta (bar_ts + BAR_MS) verilir. T0'dan önce
@@ -960,7 +1063,7 @@ class LiveCanary:
             # GÖNDERİLMEZ (fail-closed).
             try:
                 with entry_gate(self.db_path, timeout_s=30.0):
-                    gate_blockers = self._final_entry_gate()
+                    gate_blockers = self._final_entry_gate(direction)
                     if gate_blockers:
                         rec["result"] = "BLOCKED"
                         rec["blockers"] = gate_blockers
@@ -1025,10 +1128,12 @@ class LiveCanary:
         self._log("live_orders.jsonl", rec)
         return out
 
-    def _final_entry_gate(self):
+    def _final_entry_gate(self, direction=0):
         """Kapı kilidi ALTINDA son kabul kontrolü (BLOK30 §4). PAUSE durumu
         bu sürecin DB bağlantısından YENİDEN okunur — erken _entry_blockers
         kontrolünden sonra değişmiş olabilir. HALT da yeniden doğrulanır.
+        BLOK32 görev-2: yön canlı giriş izni de burada YENİDEN okunur
+        (sinyal değerlendirmesi ile emir arasındaki yarış penceresi kapalı).
         Boş liste = geçer."""
         reasons = []
         if self.entry_paused:
@@ -1036,6 +1141,11 @@ class LiveCanary:
         if self.rm.status == STATUS_HALTED or \
                 self.halt_state != HALT_ACTIVE:
             reasons.append(f"HALT ({self.rm.status}/{self.halt_state})")
+        if direction != 0 and not self._dir_enabled(direction):
+            reasons.append(
+                f"{_direction_disabled_label(direction)} "
+                f"(yön kilidi: {direction} canlı girişe KAPALI — "
+                "dir_enabled_* anahtarı '1' değil, fail-closed)")
         return reasons
 
     def _on_entry_filled(self, cid, resp, symbol, direction, now_ms):
@@ -1984,6 +2094,11 @@ class LiveCanary:
                             elif "HALT" in bl:
                                 states[symbol]["final_decision"] = \
                                     "GLOBAL_HALT"
+                            elif "DIRECTION_DISABLED" in bl:
+                                # BLOK32 görev-2: yön kilidi — emir
+                                # gönderilmedi, karar yönsel etiketle görünür
+                                states[symbol]["final_decision"] = \
+                                    _direction_disabled_label(direction)
                             else:
                                 states[symbol]["final_decision"] = \
                                     "ENTRY_BLOCKED"
@@ -2308,6 +2423,28 @@ class LiveCanary:
         th = cq.threshold(d)
         hy = cq.hysteresis(d)
         engaged = self._episode_engaged(symbol, d)
+        # BLOK32 görev-2: yön canlı giriş kilidi (fail-closed). Kalite
+        # skoru yine hesaplanır ve döngü kaydında GÖRÜNÜR kalır (operatör
+        # izin kararına veri sağlar), ancak kilitli yön için emir zinciri
+        # ASLA tetiklenmez ve karar açıkça DIRECTION_DISABLED_* olur.
+        if not self._dir_enabled(d):
+            if st is not None:
+                if q is not None:
+                    for k in ("quality_score", "quality_threshold",
+                              "quality_pass", "momentum_strength",
+                              "trend_confirmation", "volatility_context",
+                              "volume_confirmation"):
+                        st[k] = q[k]
+                    st["signal_reason"] = q["signal_reason"]
+                    st["signal_timestamp"] = now_ms
+                    st["signal_bar_timestamp"] = bar_ot
+                st["quality_episode"] = "ENGAGED" if engaged else "ARMED"
+                st["decision"] = _direction_disabled_label(d)
+                st["decision_reason"] = (
+                    f"yön kilidi: {d} hedefi canlı girişe KAPALI "
+                    "(dir_enabled_* anahtarı '1' değil — fail-closed; "
+                    "varsayılan KAPALI)")
+            return
         if q is None:
             if st is not None and st.get("decision") is None:
                 st["decision"] = "QUALITY_INSUFFICIENT"

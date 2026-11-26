@@ -46,7 +46,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.blok28_1_fake import (FakeExchange, FakeClock, make_canary, prime,
                                  T0, stop_trigger, loss_mark)
 import canary_quality as cq
-from canary_live import set_entry_pause, entry_gate_lock_path, CLIENT_PREFIX
+from canary_live import (set_entry_pause, entry_gate_lock_path,
+                         CLIENT_PREFIX, set_direction_enabled,
+                         read_entry_pause, DIRECTION_DISABLED_LONG,
+                         DIRECTION_DISABLED_SHORT)
 
 BAR = 4 * 3600 * 1000
 SYM = "ETHUSDT"
@@ -75,23 +78,36 @@ class Blok32Base(unittest.TestCase):
         self.ex = FakeExchange(clock_ms=self.clock)
         self.lc = make_canary(self.tmp.name, self.ex, entry_policy=POLICY)
         prime(self.lc)
+        # BLOK32 görev-2: yön canlı giriş izinleri varsayılan KAPALI'dır
+        # (fail-closed). Giriş DAVRANIŞINI test eden testler izinleri açık
+        # kurar; TestDirectionLock sınıfı anahtarları AÇIKÇA yönetir.
+        self._enable_dirs()
         self._px = {}
         self._bars = {}
         self._extra = []
+
+    def _enable_dirs(self, lc=None):
+        lc = lc or self.lc
+        lc._set_state("dir_enabled_long", "1")
+        lc._set_state("dir_enabled_short", "1")
 
     def tearDown(self):
         for t in self._extra:
             t.cleanup()
         self.tmp.cleanup()
 
-    def _fresh(self):
+    def _fresh(self, policy=POLICY, dirs=True):
         """Aynı test içinde ikinci bağımsız ortam (aynı saat, ayrı DB).
-        __new__ ile kurulur — TestCase kurucusu yöntem adı doğrular."""
+        __new__ ile kurulur — TestCase kurucusu yöntem adı doğrular.
+        dirs=False → yön izin anahtarları YAZILMAZ (varsayılan KAPALI;
+        görev-2 kilit testleri için)."""
         tmp = tempfile.TemporaryDirectory(dir=self.tmp.name)
         self._extra.append(tmp)
         ex = FakeExchange(clock_ms=self.clock)
-        lc = make_canary(tmp.name, ex, entry_policy=POLICY)
+        lc = make_canary(tmp.name, ex, entry_policy=policy)
         prime(lc)
+        if dirs:
+            self._enable_dirs(lc)
         h = Blok32Base.__new__(Blok32Base)
         h.lc, h.ex, h.clock = lc, ex, self.clock
         h.tmp, h._px, h._bars, h._extra = tmp, {}, {}, []
@@ -991,6 +1007,233 @@ class TestT0AndRisk(Blok32Base):
         self.assertEqual(rows[0]["status"], "CLOSED")
         algo = self.ex.algos[f"{CLIENT_PREFIX}P{pos['pos_id']}"]
         self.assertEqual(algo["status"], "TRIGGERED")
+
+
+# ============================================================================
+# BLOK32 GÖREV-2 — LONG/SHORT BAĞIMSIZ CANLI GİRİŞ KİLİDİ (fail-closed)
+# ============================================================================
+
+class TestDirectionLock(Blok32Base):
+    """Yön başına canlı giriş izni: varsayılan KAPALI; yalnız kalıcı
+    dir_enabled_* anahtarının değeri TAM OLARAK "1" iken AÇIK. Kilit hem
+    sinyal katmanında (flip yolu + target-following yolu) hem de emir
+    öncesi ORTAK giriş kontrolünde (_entry_blockers + flock altında
+    _final_entry_gate) uygulanır. FLIP_ONLY politikası etkilenmez."""
+
+    def test_31_default_long_disabled_target_following(self):
+        """(31) Anahtar YOK (varsayılan) → LONG girişi KAPALI: kalite skoru
+        görünür ama karar DIRECTION_DISABLED_LONG, emir YOK."""
+        sub = self._fresh(dirs=False)
+        sub._warm_clean(+1)
+        sub._tick(0, {SYM: (LOG_UP, 250.0)})
+        st = sub._symbol_state(sub._last_cycle())
+        self.assertEqual(st["decision"], DIRECTION_DISABLED_LONG)
+        self.assertEqual(st["final_decision"], DIRECTION_DISABLED_LONG)
+        self.assertIn("yön kilidi", st["decision_reason"])
+        # skor GÖRÜNÜR (operatör izin kararına veri) ama emir zinciri yok
+        self.assertIsNotNone(st["quality_score"])
+        self.assertTrue(st["quality_pass"])
+        self.assertEqual(st["quality_episode"], "ARMED")
+        self.assertEqual(sub._entry_posts(), [])
+        self.assertEqual(sub._kinds("QUALITY_SIGNAL", symbol=SYM), [])
+        self.assertEqual(sub._episode(SYM, +1), None)   # episode yazılmadı
+        # sinyal anahtarı da yazılmadı (try_entry hiç çağrılmadı)
+        self.assertIsNone(sub.lc._get_state(f"sig:{SYM}:{T0}"))
+
+    def test_32_default_short_disabled_target_following(self):
+        """(32) Ayna: SHORT varsayılan KAPALI → DIRECTION_DISABLED_SHORT,
+        SELL emri YOK."""
+        sub = self._fresh(dirs=False)
+        sub._warm_clean(-1)
+        sub._tick(0, {SYM: (LOG_DN, 250.0)})
+        st = sub._symbol_state(sub._last_cycle())
+        self.assertEqual(st["decision"], DIRECTION_DISABLED_SHORT)
+        self.assertEqual(st["final_decision"], DIRECTION_DISABLED_SHORT)
+        self.assertTrue(st["quality_pass"])             # kalite geçti — kilit kapı
+        self.assertEqual(sub._entry_posts(), [])
+        self.assertEqual(sub._kinds("QUALITY_SIGNAL", symbol=SYM), [])
+
+    def test_33_flip_path_direction_lock(self):
+        """(33) FLIP yolu kilitli yönle: LONG açık + SHORT kilitli →
+        flip'te (i) kilitli yöne emir YOK (DIRECTION_DISABLED_FLIP kaydı +
+        karar), (ii) ters pozisyonun reduce-only ÇIKIŞI hâlâ çalışır
+        (kilit yalnız girişleri kapatır), (iii) hacim spike'ı bile SELL
+        girişi ÜRETEMEZ."""
+        self.lc._set_state("dir_enabled_short", "0")   # LONG izinli, SHORT kilitli
+        self._warm_mild(+1)
+        self._tick(0, {SYM: (-0.003, 200.0)})          # LONG girişi (izinli)
+        self.assertEqual(len(self._entry_posts()), 1)
+        for j in range(1, 34):
+            self._tick(j, {SYM: (-0.003,
+                                 250.0 if j == 32 else 100.0)})
+        # flip barı 9: kilitli SHORT yönü → flip tüketildi + görünür kayıt
+        dfl = self._kinds("DIRECTION_DISABLED_FLIP", symbol=SYM)
+        self.assertEqual(len(dfl), 1)
+        self.assertEqual(dfl[0]["bar_ts"], T0 + 9 * BAR)
+        self.assertEqual(dfl[0]["direction"], -1)
+        self.assertFalse(dfl[0]["execute"])
+        self.assertEqual(self.lc.engine.direction(SYM), -1)  # hedef ilerledi
+        # ters (LONG) pozisyonun çıkışı KİLİTTEN ETKİLENMEDİ (§7 reversal)
+        rev = self._kinds("QUALITY_REVERSAL_EXIT", symbol=SYM)
+        self.assertEqual(len(rev), 1)
+        rows = self._pos_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["direction"], 1)
+        self.assertEqual(rows[0]["status"], "CLOSED")
+        self.assertEqual(self.lc._live_pos_row(rows[0]["pos_id"])
+                         ["exit_reason"], "QUALITY_TARGET_FLIP_EXIT")
+        # son kararda açık yönsel etiket; SELL GİRİŞ emri hiç çıkmadı
+        st = self._symbol_state(self._last_cycle())
+        self.assertEqual(st["decision"], DIRECTION_DISABLED_SHORT)
+        self.assertEqual([p for p in self._entry_posts()
+                          if p["side"] == "SELL"], [])
+        self.assertEqual(len(self._entry_posts()), 1)  # yalnız izinli LONG
+
+    def test_34_long_enabled_short_still_locked(self):
+        """(34) Bağımsızlık: LONG izni AÇIK → LONG girer; AYNI anda SHORT
+        hedefi kaliteyi geçse de (aynı canary, farklı sembol) kilitli
+        kalır — LONG açmak SHORT'u açMAZ."""
+        self.lc._set_state("dir_enabled_short", "0")   # LONG izinli, SHORT kilitli
+        self._warm({SYM: LOG_UP, "BTCUSDT": LOG_DN})
+        self._tick(0, {SYM: (LOG_UP, 250.0),
+                       "BTCUSDT": (LOG_DN, 250.0)})
+        self.assertEqual(len(self._entry_posts(SYM)), 1)      # LONG açıldı
+        self.assertEqual(self._entry_posts("BTCUSDT"), [])    # SHORT kilitli
+        st_btc = self._symbol_state(self._last_cycle(), "BTCUSDT")
+        self.assertEqual(st_btc["decision"], DIRECTION_DISABLED_SHORT)
+        self.assertTrue(st_btc["quality_pass"])   # kalite GEÇTİ — kilit kapı
+        opens = self.lc.rm.open_positions()
+        self.assertEqual(len(opens), 1)
+        self.assertEqual(opens[0]["symbol"], SYM)
+        self.assertEqual(opens[0]["direction"], 1)
+
+    def test_35_short_enabled_long_still_locked(self):
+        """(35) Ayna bağımsızlık: SHORT izni AÇIK → SHORT girer; LONG
+        kilitli kalır — SHORT açmak LONG'u açMAZ."""
+        self.lc._set_state("dir_enabled_long", "0")    # SHORT izinli, LONG kilitli
+        self._warm({SYM: LOG_DN, "BTCUSDT": LOG_UP})
+        self._tick(0, {SYM: (LOG_DN, 250.0),
+                       "BTCUSDT": (LOG_UP, 250.0)})
+        self.assertEqual(len(self._entry_posts(SYM)), 1)      # SHORT açıldı
+        self.assertEqual(self._entry_posts("BTCUSDT"), [])    # LONG kilitli
+        st_btc = self._symbol_state(self._last_cycle(), "BTCUSDT")
+        self.assertEqual(st_btc["decision"], DIRECTION_DISABLED_LONG)
+        opens = self.lc.rm.open_positions()
+        self.assertEqual(len(opens), 1)
+        self.assertEqual(opens[0]["direction"], -1)
+
+    def test_36_invalid_values_fail_closed(self):
+        """(36) Fail-closed: "1" DIŞINDAKİ her değer (0/true/yes/2/on/boş)
+        ve ANAHTAR YOKLUĞU girişi ASLA açmaz; yalnız TAM "1" açar."""
+        sub = self._fresh(dirs=False)
+        sub._warm_clean(+1)
+        for j, raw in enumerate(("0", "true", "yes", "2", "on", "")):
+            sub.lc._set_state("dir_enabled_long", raw)
+            sub._tick(j, {SYM: (LOG_UP, 250.0)})
+            st = sub._symbol_state(sub._last_cycle())
+            self.assertEqual(st["decision"], DIRECTION_DISABLED_LONG,
+                             f"raw={raw!r} girişi açmamalı")
+            self.assertFalse(sub.lc._dir_enabled(+1))
+            self.assertEqual(len(sub._entry_posts()), 0)
+        # yalnız TAM OLARAK "1" izin verir
+        sub.lc._set_state("dir_enabled_long", "1")
+        sub._tick(6, {SYM: (LOG_UP, 250.0)})
+        self.assertTrue(sub.lc._dir_enabled(+1))
+        self.assertEqual(len(sub._entry_posts()), 1)
+
+    def test_37_common_entry_gate_and_race(self):
+        """(37) Emir öncesi ORTAK kontrol: (i) doğrudan try_entry bile
+        kilitli yönü BLOCKED eder (blocker'da yönsel etiket); (ii) flock
+        ALTINDAKİ son kapı (_final_entry_gate) yönü YENİDEN okur;
+        (iii) sinyal anında izinli → emir anında kilitli yarışı: emir
+        GÖNDERİLMEZ, final_decision DIRECTION_DISABLED_LONG."""
+        sub = self._fresh(dirs=False)
+        sub._warm_clean(+1)
+        # (i) ortak giriş kontrolü — try_entry doğrudan
+        now = T0 + 2 * BAR + 60_000
+        sub.clock.t = now
+        recs = sub.lc.try_entry(SYM, +1, 100.0, T0, now)
+        self.assertEqual(recs[0]["result"], "BLOCKED")
+        self.assertIn(DIRECTION_DISABLED_LONG, " ".join(recs[0]["blockers"]))
+        self.assertEqual(sub._entry_posts(), [])
+        # (ii) flock altı son kapı: kilitli → neden listesinde; izinli → temiz
+        self.assertIn(DIRECTION_DISABLED_LONG,
+                      " ".join(sub.lc._final_entry_gate(+1)))
+        sub.lc._set_state("dir_enabled_long", "1")
+        self.assertNotIn(DIRECTION_DISABLED_LONG,
+                         " ".join(sub.lc._final_entry_gate(+1)))
+        # (iii) yarış simülasyonu: sinyal katmanı izinli gördü, emir öncesi
+        # ortak kontrol kilitli gördü → emir YOK, karar yönsel etiketle
+        sub2 = self._fresh(dirs=False)
+        sub2._warm_clean(+1)
+        with mock.patch.object(type(sub2.lc), "_dir_enabled",
+                               side_effect=[True, False, False]):
+            sub2._tick(0, {SYM: (LOG_UP, 250.0)})
+        st = sub2._symbol_state(sub2._last_cycle())
+        self.assertEqual(st["final_decision"], DIRECTION_DISABLED_LONG)
+        self.assertEqual(sub2._entry_posts(), [])
+        att = sub2._kinds("LIVE_ENTRY_ATTEMPT", symbol=SYM)
+        self.assertEqual(len(att), 1)
+        self.assertEqual(att[0]["result"], "BLOCKED")
+        self.assertIn(DIRECTION_DISABLED_LONG,
+                      " ".join(att[0]["blockers"]))
+
+    def test_38_flip_only_policy_lock_not_applied(self):
+        """(38) FLIP_ONLY kanonik davranış DEĞİŞMEZ: yön anahtarları hiç
+        yokken flip girişi normal çalışır (legacy regresyon güvencesi)."""
+        sub = self._fresh(policy=cq.ENTRY_POLICY_FLIP_ONLY, dirs=False)
+        sub._warm_mild(+1)                # m ≈ +0.03 → düşen barlar flip üretir
+        for j in range(12):
+            sub._tick(j, {SYM: (-0.003, 100.0)})
+            if sub._entry_posts():
+                break
+        st = sub._symbol_state(sub._last_cycle())
+        self.assertEqual(st["decision"], "SIGNAL_VALID")
+        posts = sub._entry_posts()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["side"], "SELL")
+        # kilit FLIP_ONLY'de uygulanmaz — kilit kaydı YOK
+        self.assertEqual(sub._kinds("DIRECTION_DISABLED_FLIP", symbol=SYM),
+                         [])
+
+    def test_39_control_cli_direction(self):
+        """(39) Operatör aracı: set_direction_enabled yalnız "1"/"0" yazar
+        (entry-gate flock altında), read_entry_pause görünümü taşır; CLI
+        izin AÇMAYI --confirm olmadan REDDER (çıkış 3)."""
+        sub = self._fresh(dirs=False)                  # anahtarsız temiz DB
+        db = os.path.join(sub.tmp.name, "canary_live.db")
+        # varsayılan görünüm: anahtar yok → KAPALI, ham değer None
+        st = read_entry_pause(db)
+        self.assertFalse(st["dir_enabled_long"])
+        self.assertIsNone(st["dir_enabled_long_raw"])
+        # CLI: on WITHOUT --confirm → RED (durum değişmez)
+        import canary_control
+        rc = canary_control.main(["direction", "long", "on", "--db", db])
+        self.assertEqual(rc, 3)
+        self.assertFalse(read_entry_pause(db)["dir_enabled_long"])
+        # CLI: on WITH --confirm → yazılır
+        rc = canary_control.main(["direction", "long", "on", "--db", db,
+                                  "--confirm", "--reason", "test"])
+        self.assertEqual(rc, 0)
+        st = read_entry_pause(db)
+        self.assertTrue(st["dir_enabled_long"])
+        self.assertEqual(st["dir_enabled_long_raw"], "1")
+        self.assertFalse(st["dir_enabled_short"])      # diğer yön KAPALI
+        # canlı nesne AYNI DB'yi okur → kalıcı, restart-safe
+        self.assertTrue(sub.lc._dir_enabled(+1))
+        self.assertFalse(sub.lc._dir_enabled(-1))
+        # CLI: off (confirm gerekmez — fail-safe yönü)
+        rc = canary_control.main(["direction", "long", "off", "--db", db])
+        self.assertEqual(rc, 0)
+        self.assertFalse(read_entry_pause(db)["dir_enabled_long"])
+        self.assertEqual(read_entry_pause(db)["dir_enabled_long_raw"], "0")
+        self.assertFalse(sub.lc._dir_enabled(+1))
+        # audit izi risk_events'e yazıldı
+        evs = [r[0] for r in sub.lc.db.execute(
+            "SELECT kind FROM risk_events WHERE kind LIKE 'DIRECTION_%'"
+        ).fetchall()]
+        self.assertIn("DIRECTION_ENABLED", evs)
+        self.assertIn("DIRECTION_DISABLED", evs)
 
 
 if __name__ == "__main__":

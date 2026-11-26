@@ -129,9 +129,14 @@ class LoopTests(unittest.TestCase):
             margin_modes=self.ex.margin_modes,
             leverages=self.ex.leverages,
             position_mode=POSITION_MODE_ONEWAY, wallet_usdt=self.ex.wallet)
+        # BLOK32 görev-2: restart testi kanonik FLIP_ONLY davranışında
+        # kalır (yön canlı giriş kilidi yalnız QUALITY politikasında
+        # uygulanır; bu testin FILLED beklentisi yön anahtarı gerektirmez)
+        from canary_quality import ENTRY_POLICY_FLIP_ONLY
         lc2 = LiveCanary(self.lc.db_path, self.ex, symbols=self.ex.symbols,
                          t0_ms=T0, filters=self.ex.filters, liq_model=liq,
-                         clock_ms=self.ex._clock, log_dir=self.tmp.name)
+                         clock_ms=self.ex._clock, log_dir=self.tmp.name,
+                         entry_policy=ENTRY_POLICY_FLIP_ONLY)
         # mutabakat YOK → giriş engelli
         out = lc2.try_entry("SOLUSDT", 1, 100.0, T0 + 2 * BAR,
                             self.clock())
