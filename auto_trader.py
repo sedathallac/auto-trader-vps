@@ -2961,12 +2961,21 @@ def calculate_position_size_v2(balance_usdt, sl_pct, slippage_pct):
     """
     import sizing_policy
     cfg = dict(RISK_CONFIG)
+    # GÖREV 2026-11-27 §10.5 — iki durum AYRI edilir:
+    #   1) canlı konfig YOK (compare/legacy) → paylaşılan cfg geçerli (doğru);
+    #   2) canlı konfig VAR ama override alınamıyor → paylaşılan (GEVŞEK)
+    #      varsayılanlara sessiz düşüş YOK — emir yok (None).
     try:
         _lc = _live_cfg()
-        if getattr(_lc, "is_live", False):
-            cfg.update(_lc.risk_overrides())
     except Exception:
-        pass
+        _lc = None
+    if _lc is not None and getattr(_lc, "is_live", False):
+        try:
+            cfg.update(_lc.risk_overrides())
+        except Exception as e:
+            log.critical(f"canlı risk override alınamadı — boyutlandırma "
+                         f"fail-closed (emir yok): {type(e).__name__}: {e}")
+            return None, 0.0, None
     d = sizing_policy.size_position(balance_usdt, sl_pct + slippage_pct, cfg=cfg)
     return d.notional, d.budget, d.effective_sl
 
