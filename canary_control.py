@@ -10,6 +10,10 @@ Kullanım:
   python canary_control.py resume  --confirm [--db PATH] [--reason "..."]
   python canary_control.py direction {long,short} {on,off} [--db PATH]
          [--reason "..."] [--timeout S]      (on için --confirm ZORUNLU)
+  python canary_control.py policy {RISK_ONLY,RISK_AND_H1} --confirm
+         --reason "..." [--db PATH] [--timeout S]
+         (GÖREV 2026-11-27 ENGEL 1: beyin çıkış politikası — resmî yazım
+          yolu; canlı DB'ye doğrudan SQL YASAK)
 
 Davranış sözleşmesi:
   status : salt-okunur (DB mode=ro); PAUSE + HALT + risk durumu + bekleyen
@@ -21,6 +25,11 @@ Davranış sözleşmesi:
            sıfırlanmaz, operator_reset/operator_release ÇAĞRILMAZ. Diğer
            güvenlik blokları (HALT, mutabakat, feed, koruma...) aynen
            geçerliliğini sürdürür.
+  policy : brain_exit_policy anahtarını YALNIZ geçerli değerlerle yazar
+           (--confirm şart; giriş kapısı kilidi altında; audit
+           risk_events'e yazılır). HALT/PAUSE/yön kilitleri/pozisyonlara
+           DOKUNMAZ. RISK_ONLY = çıkışlar yalnız risk katmanı;
+           RISK_AND_H1 = risk katmanı + mevcut H1 hedef-yön çıkışı.
 
 Çıkış kodları: 0 başarı; 2 giriş kapısı kilidi timeout'u (durum DEĞİŞMEDİ);
 3 kullanım hatası.
@@ -30,8 +39,9 @@ import os
 import socket
 import sys
 
-from canary_live import (EntryGateBusy, entry_gate_lock_path,
-                         read_entry_pause, set_entry_pause,
+from canary_live import (BRAIN_EXIT_POLICIES, EntryGateBusy,
+                         entry_gate_lock_path, read_entry_pause,
+                         set_brain_exit_policy, set_entry_pause,
                          set_direction_enabled)
 
 DEFAULT_DB = os.environ.get(
@@ -83,6 +93,12 @@ def _print_state(st):
     print(f"SHORT canlı giriş izni   : "
           f"{'AÇIK' if st.get('dir_enabled_short') else 'KAPALI'}"
           f" (dir_enabled_short={st.get('dir_enabled_short_raw')!r})")
+    # GÖREV 2026-11-27 ENGEL 1: beyin çıkış politikası (salt-okunur görünüm)
+    pol = st.get("brain_exit_policy")
+    print(f"brain_exit_policy        : "
+          f"{pol if pol else 'YOK (beyin adayları BLOCKED — C3 kapısı)'}"
+          f"{'  ← GEÇERSİZ değer (fail-closed: beyin adayları BLOCKED)'
+           if pol is not None and pol not in BRAIN_EXIT_POLICIES else ''}")
 
 
 def cmd_status(args):
@@ -189,6 +205,47 @@ def cmd_direction(args):
     return EXIT_OK
 
 
+def cmd_policy(args):
+    policy = args.value
+    if policy not in BRAIN_EXIT_POLICIES:
+        print(f"HATA: bilinmeyen brain_exit_policy: {policy!r} — geçerli "
+              f"değerler: {', '.join(BRAIN_EXIT_POLICIES)}")
+        print("RESULT: FAILED — politika değişmedi.")
+        return EXIT_USAGE
+    if not args.confirm:
+        print("HATA: policy yazımı açık operatör onayı gerektirir — "
+              "--confirm bayrağı ekleyin.")
+        print("RESULT: FAILED — politika değişmedi.")
+        return EXIT_USAGE
+    print(f"POLICY isteği: brain_exit_policy={policy} yazılacak. "
+          "HALT, ENTRY PAUSE, yön kilitleri, risk durumu, pozisyonlar ve "
+          "koruma emirleri DOKUNULMAZ. "
+          + ("Çıkışlar: risk katmanı (SL+SAFE_EXIT+HALT) + mevcut H1 "
+             "hedef-yön çıkışı." if policy == "RISK_AND_H1" else
+             "Çıkışlar: YALNIZ risk katmanı (SL+SAFE_EXIT+HALT); H1 "
+             "hedef-yön çıkışı ÇALIŞMAZ."))
+    try:
+        r = set_brain_exit_policy(args.db, policy, args.reason,
+                                  _who(), timeout_s=args.timeout)
+    except EntryGateBusy as e:
+        print(f"HATA: {e}")
+        print("RESULT: FAILED — giriş zinciri devam ediyor, politika "
+              "yazılmadı (durum DEĞİŞMEDİ). Tekrar deneyin.")
+        return EXIT_GATE_BUSY
+    except ValueError as e:
+        print(f"HATA: {e}")
+        print("RESULT: FAILED — politika değişmedi.")
+        return EXIT_USAGE
+    print(f"önceki değer             : {r['previous']!r}")
+    print(f"yazıldı                  : brain_exit_policy={r['policy']} @ "
+          f"{_fmt_ts(r['ts'])} by={r['by']}")
+    print(f"audit                    : risk_events → {r['action']} "
+          f"(reason={r['reason']!r})")
+    print("RESULT: OK — yeni beyin adayları bir sonraki tazelik penceresi "
+          "içinde bu politika ile değerlendirilecek (karar anında etkili).")
+    return EXIT_OK
+
+
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=DEFAULT_DB,
@@ -228,10 +285,23 @@ def main(argv=None):
                        help="audit kaydına yazılacak neden")
     p_dir.add_argument("--timeout", type=float, default=120.0,
                        help="giriş zinciri bekleme süresi sn")
+    p_pol = sub.add_parser("policy", parents=[common],
+                           help="beyin çıkış politikası yaz "
+                                "(GÖREV 2026-11-27 ENGEL 1)")
+    p_pol.add_argument("value", choices=list(BRAIN_EXIT_POLICIES),
+                       help="RISK_ONLY=yalnız risk katmanı; "
+                            "RISK_AND_H1=risk katmanı + mevcut H1 "
+                            "hedef-yön çıkışı")
+    p_pol.add_argument("--confirm", action="store_true",
+                       help="açık operatör onayı (ZORUNLU)")
+    p_pol.add_argument("--reason", default=None,
+                       help="audit kaydına yazılacak neden")
+    p_pol.add_argument("--timeout", type=float, default=120.0,
+                       help="giriş zinciri bekleme süresi sn")
     args = ap.parse_args(argv)
     return {"status": cmd_status, "pause": cmd_pause,
-            "resume": cmd_resume,
-            "direction": cmd_direction}[args.cmd](args)
+            "resume": cmd_resume, "direction": cmd_direction,
+            "policy": cmd_policy}[args.cmd](args)
 
 
 if __name__ == "__main__":

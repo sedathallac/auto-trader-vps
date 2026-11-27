@@ -188,6 +188,8 @@ class BrainRunner:
                  session=None, sleep=None, now_ms=None):
         self.session = session or requests.Session()
         self.sched = RateScheduler(weight_budget_1m, sleep=sleep)
+        # serve() döngü uykusu da enjekte edilebilir (testte sahte saat)
+        self._serve_sleep = sleep or time.sleep
         self.scanner = BrainScanner(min_quote_volume_24h=min_quote_volume_24h,
                                     max_spread_pct=max_spread_pct)
         self.sizing = SizingBrain(stop_sigma_mult=stop_sigma_mult)
@@ -470,22 +472,52 @@ class BrainRunner:
         return summary
 
     def serve(self):
-        """4h bar kapanışına hizalı sürekli döngü (kapanış+60s)."""
+        """4h bar kapanışına hizalı sürekli döngü (kapanış+60s).
+
+        KÖK NEDEN DÜZELTMESİ (2026-11-27): eski sürüm hedefi daima
+        '(sıradaki sınır)+60s' olarak hesaplıyor, uyanınca da BAŞTAN
+        hesaplıyordu. Uyanış anında `now` her zaman geçerli barın içinde
+        olduğundan sıradaki sınır BİR SONRAKİ bara atlar; wait_s daima
+        >60s kalır ve run_cycle MATEMATİKSEL olarak hiç çağrılamazdı.
+        Kanıt: canlı sürece 14+ saatte 0,2s CPU, 0 döngü, DB'deki 2
+        döngü elle --once ile atılmıştı; py-spy locals wait_s=7199,999
+        gösterdi (hedef 04:01 iken now 02:01'de bir sonraki hedef
+        yine 04:01+4h olur). Yeni semantik: bar-içi konum ≥60s VE
+        taranmamış YENİ kapanmış veri barı varsa döngü atılır; her veri
+        barı yalnız BİR kez taranır (restart/downtime sonrası kaçan
+        son kapanmış bar yakalanır — geçmiş barlar yeniden oynatılmaz).
+        """
+        last_data_bar = self._last_cycled_data_bar()
         while True:
-            now = self._now_ms()
-            next_close = (now // BAR_MS + 1) * BAR_MS
-            target = next_close + MARKET_SNAPSHOT_DELAY_S * 1000
-            wait_s = (target - now) / 1000.0
-            if wait_s > 0:
-                time.sleep(min(wait_s, 3600))   # uzun beklemede parçalı uyan
+            action, payload = serve_next_action(self._now_ms(),
+                                                last_data_bar)
+            if action == "sleep":
+                self._serve_sleep(payload)      # uzun beklemede parçalı uyan
                 continue
             try:
+                start_bar = self._now_ms() // BAR_MS
                 self.run_cycle()
+                last_data_bar = start_bar - 1   # taranan veri barı
             except Exception as e:
                 self._log("brain_cycles.jsonl", {
                     "t": self._now_ms(), "kind": "BRAIN_CYCLE_ERROR",
                     "error": f"{type(e).__name__}: {e}"})
-                time.sleep(300)
+                self._serve_sleep(300)          # aynı veri barı için retry
+
+    def _last_cycled_data_bar(self):
+        """DB'deki son döngüden taranan son KAPANMIŞ veri barı.
+        Döngü ts'i her zaman çalıştığı barın içindedir; o anda en yeni
+        kapanmış veri barı bir önceki bardır (ts//BAR_MS − 1). DB boşsa
+        −1 (ilk fırsatta tarar). Okuma hatasında ŞU ANKI veri barı
+        döner (fail-closed: en fazla bir bar atlanır — aynı veri barı
+        asla iki kez taranıp mükerrer aday üretmez)."""
+        try:
+            row = self.db.db.execute(
+                "SELECT MAX(ts) FROM brain_cycles").fetchone()
+            ts = row[0] if row else None
+            return (ts // BAR_MS) - 1 if ts else -1
+        except sqlite3.Error:
+            return (int(time.time() * 1000) // BAR_MS) - 1
 
 
 def cq_model_hold_bars(direction: int) -> float:
@@ -493,6 +525,33 @@ def cq_model_hold_bars(direction: int) -> float:
     girdisi (canary_brain.CALIBRATION_8SYM tek kaynak)."""
     from canary_brain import CALIBRATION_8SYM
     return CALIBRATION_8SYM[direction]["oos_hold_bars"]
+
+
+def serve_next_action(now_ms, last_cycled_data_bar=-1):
+    """serve() döngüsünün tek adım kararı (saf fonksiyon — birim test edilir).
+
+    Döndürür:
+      ("cycle", None)  — bar-içi konum ≥ MARKET_SNAPSHOT_DELAY_S geçmiş VE
+                         son kapanmış veri barı henüz taranmamış (run_cycle
+                         çağrılmalı; o bar kapanış+60s anlamına gelir);
+      ("sleep", saniye) — sonraki kapanış+gecikmeye kalan süre
+                          (≤3600s parçalı uyku).
+
+    Eski kod hatası (2026-11-27 kök neden, serve docstring'inde kanıtlı):
+    hedef daima (now//BAR_MS+1)*BAR_MS+gecikme olarak hesaplandığından
+    wait_s daima >gecikme kalıyordu ve döngü hiç tetiklenemiyordu.
+    """
+    bar = now_ms // BAR_MS
+    pos_ms = now_ms - bar * BAR_MS
+    delay_ms = MARKET_SNAPSHOT_DELAY_S * 1000
+    data_bar = bar - 1          # bu bar içinde en yeni KAPANMIŞ veri barı
+    if pos_ms >= delay_ms and data_bar > last_cycled_data_bar:
+        return "cycle", None
+    if pos_ms >= delay_ms:
+        wait_ms = (BAR_MS - pos_ms) + delay_ms
+    else:
+        wait_ms = delay_ms - pos_ms
+    return "sleep", min(wait_ms / 1000.0, 3600.0)
 
 
 def main():

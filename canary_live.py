@@ -78,13 +78,21 @@ import canary_quality as cq
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "BNBUSDT", "DOGEUSDT",
            "LINKUSDT", "SOLUSDT", "XRPUSDT"]
 
-# GÖREV 2026-11-27 §3.7/§11: beyin modunda TANIMLI tek çıkış semantiği —
-# risk katmanı (girişte STOP_MARKET SL + −5 SAFE_EXIT + −10 HALT). H1
-# hedef-çıkış yolu BRAIN_PRIMARY'de ÇALIŞMAZ (strategy_tick erken döner).
-# Operatör live_state'e brain_exit_policy=RISK_ONLY yazmadıkça beyin
-# adayları emir zincirine GİRMEZ (fail-closed): exit belirsizliği sessiz
-# dormansi değil, somut teknik blokerdir. Yeni politika ICAT EDILMIYOR.
+# GÖREV 2026-11-27 §3.7/§11: beyin modunda çıkış semantiği — operatör
+# live_state onay kapısı (C3, fail-closed). İki geçerli değer:
+#   RISK_ONLY   — çıkışlar YALNIZ risk katmanında (girişte STOP_MARKET SL
+#                 + −5 SAFE_EXIT + −10 HALT); H1 hedef-çıkış çalışmaz.
+#   RISK_AND_H1 — risk katmanı + MEVCUT H1 hedef-yön çıkış mekanizması
+#                 (operatör sözleşmesi 2026-11-27: "mevcut H1 target-exit
+#                 mekanizması BRAIN modunda da çalışmalıdır" — yeni eşik/
+#                 trailing/TP ICAT EDILMEZ; _quality_target_exits aynen).
+# Operatör brain_exit_policy yazmadıkça beyin adayları emir zincirine
+# GİRMEZ: exit belirsizliği sessiz dormansi değil, somut teknik blokerdir.
+BRAIN_EXIT_POLICY_KEY = "brain_exit_policy"
 BRAIN_EXIT_POLICY_RISK_ONLY = "RISK_ONLY"
+BRAIN_EXIT_POLICY_RISK_AND_H1 = "RISK_AND_H1"
+BRAIN_EXIT_POLICIES = (BRAIN_EXIT_POLICY_RISK_ONLY,
+                       BRAIN_EXIT_POLICY_RISK_AND_H1)
 # BLOK29.1 (2026-11-25): hedef notional TEK MERKEZİ KAYNAK'TAN türetilir —
 # canary_risk.MAX_POSITION_NOTIONAL (100 USDT). Burada ayrı sayı YOKTUR;
 # operatör limiti değişirse yalnızca canary_risk.py güncellenir.
@@ -263,6 +271,45 @@ def set_direction_enabled(db_path, direction, enabled, reason, by,
             "by": str(by), "reason": str(reason or "")}
 
 
+def set_brain_exit_policy(db_path, policy, reason, by, timeout_s=120.0):
+    """Operatör beyin çıkış politikası yazımı — giriş kapısı kilidi ALTINDA
+    (set_direction_enabled deseni; GÖREV 2026-11-27 ENGEL 1 resmî mekanizma).
+    policy YALNIZ BRAIN_EXIT_POLICIES değerlerinden biri olabilir; başka
+    değer ASLA yazılmaz (ValueError — fail-closed). Yalnız
+    brain_exit_policy anahtarını ve audit kaydını yazar; halt_state, rm
+    durumu, ENTRY PAUSE, yön kilitleri, pozisyonlar ve koruma emirlerine
+    DOKUNMAZ. Canlı DB'ye doğrudan SQL yerine BU işlev kullanılır."""
+    policy = str(policy or "")
+    if policy not in BRAIN_EXIT_POLICIES:
+        raise ValueError(
+            f"bilinmeyen brain_exit_policy: {policy!r} — geçerli "
+            f"değerler: {', '.join(BRAIN_EXIT_POLICIES)}")
+    with entry_gate(db_path, timeout_s=timeout_s):
+        db = sqlite3.connect(str(db_path), timeout=30)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE IF NOT EXISTS live_state ("
+                       "key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS risk_events ("
+                       "ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT)")
+            now = int(time.time() * 1000)
+            row = db.execute("SELECT value FROM live_state WHERE key=?",
+                             (BRAIN_EXIT_POLICY_KEY,)).fetchone()
+            prev = row[0] if row else None
+            db.execute("INSERT INTO live_state VALUES (?,?) ON CONFLICT"
+                        "(key) DO UPDATE SET value=excluded.value",
+                        (BRAIN_EXIT_POLICY_KEY, policy))
+            db.execute("INSERT INTO risk_events VALUES (?,?,?)",
+                       (now, "BRAIN_EXIT_POLICY_SET",
+                        f"policy={policy} by={by} reason={reason}"))
+            db.commit()
+        finally:
+            db.close()
+    return {"action": "BRAIN_EXIT_POLICY_SET", "policy": policy,
+            "previous": prev, "ts": now, "by": str(by),
+            "reason": str(reason or "")}
+
+
 def entry_gate_lock_path(db_path):
     """Ortak giriş-kapısı kilit dosyası (DB ile aynı dizin)."""
     return str(db_path) + ".entry-gate.lock"
@@ -356,6 +403,8 @@ def read_entry_pause(db_path):
         out["dir_enabled_short_raw"] = get(DIR_ENABLED_KEY_SHORT)
         out["dir_enabled_long"] = (get(DIR_ENABLED_KEY_LONG) == "1")
         out["dir_enabled_short"] = (get(DIR_ENABLED_KEY_SHORT) == "1")
+        # GÖREV 2026-11-27 ENGEL 1: beyin çıkış politikası (salt-okunur)
+        out["brain_exit_policy"] = get(BRAIN_EXIT_POLICY_KEY)
         out["entry_pause_ts"] = get("entry_pause_ts")
         out["entry_pause_by"] = get("entry_pause_by")
         out["entry_pause_reason"] = get("entry_pause_reason")
@@ -2244,23 +2293,27 @@ class LiveCanary:
                 rec["result"] = "DUPLICATE_BRAIN_DECISION"
                 self._log("live_orders.jsonl", rec)
                 return out
-        # GÖREV 2026-11-27 §3.7/§11: beyin çıkış semantiği somut teknik
-        # blokerdir. BRAIN_PRIMARY'de tanımlı TEK çıkış katmanı risk
-        # katmanıdır (girişte STOP_MARKET SL + −5 SAFE_EXIT + −10 HALT);
-        # H1 hedef-çıkış yolu beyin modunda ÇALIŞMAZ (strategy_tick erken
-        # döner). Operatör live_state'e brain_exit_policy=RISK_ONLY
-        # yazarak bu gerçekliği ONAYLAMADIKÇA beyin adayı emir zincirine
-        # GİRMEZ. Yeni çıkış politikası icat EDİLMİYOR — mevcut eksiklik
-        # açık ve denetlenebilir bir kapıya dönüştürülüyor (fail-closed).
-        if str(self._get_state("brain_exit_policy") or "") != \
-                BRAIN_EXIT_POLICY_RISK_ONLY:
+        # GÖREV 2026-11-27 §3.7/§11 (ENGEL 1 güncellemesi): beyin çıkış
+        # semantiği somut teknik blokerdir. İki geçerli operatör onayı:
+        # RISK_ONLY (çıkışlar yalnız risk katmanı: SL+SAFE_EXIT+HALT) ve
+        # RISK_AND_H1 (risk katmanı + mevcut H1 hedef-yön çıkışı — operatör
+        # sözleşmesi 2026-11-27). Onay YOKSA beyin adayı emir zincirine
+        # GİRMEZ. Yeni çıkış politikası icat EDİLMİYOR — mevcut mekanizmalar
+        # açık ve denetlenebilir bir kapıya bağlanıyor (fail-closed).
+        _policy = str(self._get_state(BRAIN_EXIT_POLICY_KEY) or "")
+        if _policy not in BRAIN_EXIT_POLICIES:
+            # try_entry dedup sözleşmesiyle tutarlı: BIR KEZ değerlendirilen
+            # karar — bloklansa bile — bir daha emir zincirine GİRMEZ; politika
+            # sonradan yazılsa bile eski karar oynatılmaz (yeni sinyal yeni
+            # döngüdedir).
+            self._set_state(f"brainsig:{dec.decision_id}",
+                            str(dec.direction))
             rec["result"] = "BLOCKED"
             rec["blockers"] = [
                 "BRAIN_EXIT_POLICY_UNDEFINED: beyin pozisyonları için "
-                "tanımlı tek çıkış risk katmanıdır (SL+SAFE_EXIT+HALT); "
-                "H1 hedef-çıkış beyin modunda çalışmaz. Operatör "
-                "brain_exit_policy=RISK_ONLY onayı yok — beyin adayı emir "
-                "zincirine alınmaz (görev §3.7)"]
+                "tanımlı çıkış katman(lar)ı operatör onayı gerektirir "
+                f"({', '.join(BRAIN_EXIT_POLICIES)}); onay yok — beyin "
+                "adayı emir zincirine alınmaz (görev §3.7)"]
             self._log("live_orders.jsonl", rec)
             self.rm._event(
                 "ENTRY_BLOCKED",
@@ -2323,6 +2376,52 @@ class LiveCanary:
         out.extend(recs)
         return out
 
+    def _brain_h1_target_exit_tick(self, now_ms):
+        """GÖREV 2026-11-27 ENGEL 1 (operatör sözleşmesi): BRAIN_PRIMARY +
+        RISK_AND_H1 — mevcut H1 hedef-yön çıkış mekanizması beyin
+        pozisyonları için DE çalışır. Yeni mekanizma/eşik YOKTUR:
+        _evaluate (motor besleme; BRAIN modunda giriş olayı ÜRETMEZ —
+        _attempt_due_flip/_quality_evaluate guard'ları) + mevcut
+        _quality_target_exits (kalibrasyon semantiği aynen). Yalnız AÇIK
+        POZİSYONLU sembollerin kline'ları çekilir (519 evrenin tamamı
+        değil — çıkış izleme pozisyon radarıyla sınırlı; kline çekimi
+        olmazsa o sembol için hedef-yön çıkışı o tur değerlendirilemez,
+        risk katmanı çıkışları (SL/SAFE_EXIT/HALT) her durumda sürer)."""
+        exit_syms = sorted({p["symbol"] for p in self.rm.open_positions()})
+        tick = {"t": now_ms, "kind": "BRAIN_H1_EXIT_TICK",
+                "policy": BRAIN_EXIT_POLICY_RISK_AND_H1,
+                "exit_symbols": exit_syms}
+        if not exit_syms:
+            tick["note"] = "acik pozisyon yok — kline cekilmedi"
+            self._log("live_orders.jsonl", tick)
+            return
+        klines_by_sym, fetch_errors = {}, {}
+        for s in exit_syms:
+            try:
+                rows = self.exchange.klines(s)
+                klines_by_sym[s] = [(int(k[0]), float(k[1]),
+                                     float(k[4]), float(k[7]))
+                                    for k in rows]
+            except ExchangeUnavailable as e:
+                fetch_errors[s] = f"{type(e).__name__}: {e}"
+            except Exception as e:
+                # parse/beklenmeyen hata da sembol bazında fail-closed
+                # (BLOK31 §5 deseni) — çıkış kararına VERİSİZ girilmez
+                fetch_errors[s] = f"{type(e).__name__}: {e}"
+        tick["kline_errors"] = sorted(fetch_errors)
+        # motor besleme: BRAIN modunda _evaluate giriş olayı üretmez;
+        # dönen olaylar varsa (savunma katmanı ihlali) ASLA işlenmez
+        events, states = self._evaluate(now_ms, klines_by_sym, fetch_errors)
+        tick["h1_events_discarded"] = len(events)
+        if self.entry_policy == cq.ENTRY_POLICY_QUALITY:
+            self._quality_target_exits(now_ms, states)
+        tick["positions_after"] = [
+            {"symbol": p["symbol"], "direction": p["direction"],
+             "exit_status": (self._live_pos_row(p["pos_id"]) or {})
+             .get("exit_status")}
+            for p in self.rm.open_positions()]
+        self._log("live_orders.jsonl", tick)
+
     def strategy_tick(self, now_ms=None, klines_by_sym=None):
         now = now_ms or self._now()
         # GÖREV §1/§4 (2026-11-26): BRAIN_PRIMARY modunda giriş adayları
@@ -2332,6 +2431,12 @@ class LiveCanary:
         # doğrulaması, HALT/PAUSE ve mutabakat aynen sürer (risk_tick).
         if self.signal_source == SIGNAL_SOURCE_BRAIN:
             out = self._brain_tick(now)
+            # GÖREV 2026-11-27 ENGEL 1: RISK_AND_H1 onayında mevcut H1
+            # hedef-yön çıkışı beyin pozisyonları için de çalışır (yukarıda
+            # _brain_h1_target_exit_tick). H1 GİRİŞ yolları inert kalır.
+            if str(self._get_state(BRAIN_EXIT_POLICY_KEY) or "") == \
+                    BRAIN_EXIT_POLICY_RISK_AND_H1:
+                self._brain_h1_target_exit_tick(now)
             seq = int(self._get_state("strategy_cycle_seq") or 0) + 1
             self._set_state("strategy_cycle_seq", seq)
             self._log("strategy_cycles.jsonl",
