@@ -149,10 +149,19 @@ class TestApiResponseWiring(unittest.TestCase):
     def setUp(self):
         api_guard.reset()
         self._old = auto_trader._session
+        # GÖREV 2026-11-27 §9.3: BinanceAPI artık taban adresi doğruluyor
+        # (tek boğum noktası); bu sınıf rate-limit gardını sahte özel
+        # hostta sınadığı için operatör opt-in'i temsil edilir.
+        self._old_optin = os.environ.pop("LIVE_ALLOW_CUSTOM_BASE_URL", None)
+        os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = "1"
 
     def tearDown(self):
         auto_trader._session = self._old
         api_guard.reset()
+        if self._old_optin is None:
+            os.environ.pop("LIVE_ALLOW_CUSTOM_BASE_URL", None)
+        else:
+            os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = self._old_optin
 
     def _api(self, resp):
         auto_trader._session = _FakeSession(resp)

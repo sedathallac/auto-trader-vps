@@ -76,5 +76,61 @@ class UrlGuardTest(unittest.TestCase):
                          ("fapi.binance.com", "testnet.binancefuture.com"))
 
 
+class BinanceApiChokePointTest(unittest.TestCase):
+    """BÖLÜM 18 inceleme düzeltmesi: BinanceAPI.__init__ env'den base
+    okuduğunda LiveConfig doğrulamasını atlıyordu (orphan_killer/
+    archiver yolu) — imzalı istekler doğrulamasız hosta gidebiliyordu.
+    Artık doğrulama TEK boğum noktasında (ensure_futures_base_url)."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k)
+                       for k in ("BINANCE_FUTURES_BASE_URL",
+                                 "LIVE_ALLOW_CUSTOM_BASE_URL")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        import auto_trader
+        self.auto_trader = auto_trader
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_default_env_clean_uses_mainnet(self):
+        api = self.auto_trader.BinanceAPI("k", "s")
+        self.assertEqual(api.base, self.auto_trader.BINANCE_FAPI)
+
+    def test_env_http_base_refused(self):
+        os.environ["BINANCE_FUTURES_BASE_URL"] = "http://fapi.binance.com"
+        from live_guard import LiveConfigError
+        with self.assertRaises(LiveConfigError):
+            self.auto_trader.BinanceAPI("k", "s")
+
+    def test_env_custom_host_refused(self):
+        os.environ["BINANCE_FUTURES_BASE_URL"] = "https://evil.example/"
+        from live_guard import LiveConfigError
+        with self.assertRaises(LiveConfigError):
+            self.auto_trader.BinanceAPI("k", "s")
+
+    def test_env_custom_host_allowed_with_operator_optin(self):
+        os.environ["BINANCE_FUTURES_BASE_URL"] = "https://example.invalid/"
+        os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = "1"
+        api = self.auto_trader.BinanceAPI("k", "s")
+        self.assertEqual(api.base, "https://example.invalid")
+
+    def test_explicit_base_arg_also_validated(self):
+        from live_guard import LiveConfigError
+        with self.assertRaises(LiveConfigError):
+            self.auto_trader.BinanceAPI("k", "s",
+                                        base="http://127.0.0.1:9999")
+
+    def test_explicit_allowlisted_base_arg_ok(self):
+        api = self.auto_trader.BinanceAPI(
+            "k", "s", base="https://testnet.binancefuture.com")
+        self.assertEqual(api.base, "https://testnet.binancefuture.com")
+
+
 if __name__ == "__main__":
     unittest.main()

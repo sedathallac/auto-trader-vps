@@ -90,6 +90,14 @@ def test_create_executor_not_resent_after_5xx(srv):
 
 
 def test_binance_write_not_resent_after_5xx(srv, monkeypatch):
+    # GÖREV 2026-11-27 §9.3: BinanceAPI artık taban adresi doğruluyor
+    # (https + allowlist). Bu test TRANSPORT davranışını (5xx sonrası kör
+    # yeniden gönderim yok) yerel http mock sunucusunda sınar — URL
+    # güvenliği bu testin konusu olmadığından validator devre dışı.
+    import live_guard
+    monkeypatch.setattr(
+        live_guard, "ensure_futures_base_url",
+        lambda base, **kw: base)
     monkeypatch.setattr(auto_trader, "BINANCE_FAPI", srv.base)
     b = auto_trader.BinanceAPI("k", "s")
     try:
@@ -103,6 +111,10 @@ def test_binance_write_not_resent_after_5xx(srv, monkeypatch):
 
 def test_reads_still_retry_on_5xx(srv, monkeypatch):
     """GET is idempotent: keeping retry for reads is intended."""
+    import live_guard
+    monkeypatch.setattr(
+        live_guard, "ensure_futures_base_url",
+        lambda base, **kw: base)
     monkeypatch.setattr(auto_trader, "BINANCE_FAPI", srv.base)
     r = auto_trader.BinanceAPI("k", "s")._get("/fapi/v1/ping")
     assert r == {"ok": True} and srv.gets == 2

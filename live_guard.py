@@ -54,6 +54,29 @@ class LiveConfigError(Exception):
     """Raised when the live configuration is not safe to start. The service must not come up."""
 
 
+def ensure_futures_base_url(base, *, strict_host=True, env=None):
+    """GÖREV 2026-11-27 §9.3 (BÖLÜM 18) — URL doğrulamasının TEK boğum
+    noktası. BinanceAPI.__init__ env'den base okuduğunda LiveConfig
+    doğrulaması atlanabiliyordu (orphan_killer/archiver yolu) — imzalı
+    isteklerin gittiği adres burada DA kontrol edilir.
+
+    Kurallar: scheme her zaman https; strict_host=True iken host
+    ALLOWED_FUTURES_HOSTS içinde olmalı (operatör opt-in'i
+    LIVE_ALLOW_CUSTOM_BASE_URL=1 ile aşılabilir)."""
+    env = os.environ if env is None else env
+    _u = urllib.parse.urlsplit(base)
+    if _u.scheme != "https" or not _u.hostname:
+        raise LiveConfigError(
+            f"BINANCE_FUTURES_BASE_URL https olmalı ve host içermeli: {base!r}")
+    if strict_host and _u.hostname not in ALLOWED_FUTURES_HOSTS \
+            and not _env_bool(env, "LIVE_ALLOW_CUSTOM_BASE_URL", False):
+        raise LiveConfigError(
+            f"Binance taban adresi allowlist dışı: {_u.hostname!r} "
+            f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}); özel adres "
+            "yalnız operatör açık opt-in'iyle (LIVE_ALLOW_CUSTOM_BASE_URL=1)")
+    return base
+
+
 def _env_bool(env, name, default=False):
     raw = env.get(name)
     if raw is None or str(raw).strip() == "":
@@ -126,19 +149,10 @@ class LiveConfig:
         base = (env.get("BINANCE_FUTURES_BASE_URL") or "").strip()
         if not base:
             base = FUTURES_TESTNET if testnet else FUTURES_MAINNET
-        # GÖREV 2026-11-27 §9.3 — taban adres doğrulaması (fail-closed):
-        #   * her modda scheme https olmalı (http'ye kimlik düşürme YOK);
-        #   * canlı modda host allowlist içinde olmalı; değilse reddedilir.
-        _u = urllib.parse.urlsplit(base)
-        if _u.scheme != "https" or not _u.hostname:
-            raise LiveConfigError(
-                f"BINANCE_FUTURES_BASE_URL https olmalı ve host içermeli: {base!r}")
-        if live_mode and _u.hostname not in ALLOWED_FUTURES_HOSTS \
-                and not _env_bool(env, "LIVE_ALLOW_CUSTOM_BASE_URL", False):
-            raise LiveConfigError(
-                f"canlı taban adresi allowlist dışı: {_u.hostname!r} "
-                f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}); özel adres "
-                "yalnız operatör açık opt-in'iyle (LIVE_ALLOW_CUSTOM_BASE_URL=1)")
+        # GÖREV 2026-11-27 §9.3 — taban adres doğrulaması (fail-closed,
+        # tek implementasyon: ensure_futures_base_url). Canlı modda host
+        # allowlist'i de zorunlu; compare'da yalnız https şartı.
+        ensure_futures_base_url(base, strict_host=live_mode, env=env)
         return cls(
             live_mode=live_mode,
             hb_offline=hb_offline,

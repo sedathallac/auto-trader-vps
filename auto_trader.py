@@ -417,6 +417,12 @@ class BinanceAPI:
         # FAZ9 live: the base URL is per instance, so the testnet and mainnet instances can never share a client.
         # BINANCE_FUTURES_BASE_URL wins, then the module default (mainnet) — the compare instance is unchanged.
         self.base = (base or os.getenv("BINANCE_FUTURES_BASE_URL") or BINANCE_FAPI).rstrip("/")
+        # GÖREV 2026-11-27 §9.3 (BÖLÜM 18 inceleme): doğrulama TEK boğum
+        # noktası. BinanceAPI env'den base okuduğunda LiveConfig'i atlayıp
+        # imzalı istekleri (API key + HMAC) doğrulamasız hosta
+        # gönderebiliyordu (orphan_killer.py / archiver.py yolu).
+        import live_guard as _lg
+        _lg.ensure_futures_base_url(self.base)
 
     def _sign(self, params):
         qs = urlencode(params)
