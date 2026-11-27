@@ -59,8 +59,8 @@ from canary_risk import (RiskManager, OrderRejected, MAX_OPEN_POSITIONS,
                          MAX_POSITION_NOTIONAL, MAX_TOTAL_NOTIONAL,
                          MAX_POSITION_NET_LOSS, MAX_CANARY_NET_LOSS,
                          MARK_STALE_S, STATUS_HALTED)
-from canary_exchange import (ExchangeUnavailable, UnknownResult,
-                             BinanceApiError)
+from canary_exchange import (ExchangeError, ExchangeUnavailable,
+                             UnknownResult, BinanceApiError)
 from canary_liquidation import (LiquidationModel, LIQUIDATION_RISK_UNVERIFIED,
                                 round_to_tick)
 from h1_adapter import H1SignalEngine
@@ -2021,15 +2021,22 @@ class LiveCanary:
         _entry_blockers yeni girişi ENGELLER. Bilinmeyen sahipli emir
         kanıtlanmış temizlik olmaksızın sessizce yok sayılmaz.
         Fail-closed: bir bileşen okunamazsa latch KANITSIZ TEMİZLENMEZ
-        (yalnızca iki okuma de başarılı ve temizse 0 yazılır)."""
+        (yalnızca iki okuma de başarılı ve temizse 0 yazılır).
+
+        BÖLÜM 18 inceleme düzeltmesi: bu kontrol imzalı uçtan gelen
+        BinanceApiError'da (-2015/-1021/4xx) istisna YAYMAZ — yayarsa
+        risk_tick'in ÇIKIŞ değerlendirme bölümleri (SAFE_EXIT enforce,
+        HALT zinciri, koruma doğrulama) o turda atlanır ve kalıcı hatada
+        çıkış izlemesi süresiz körleşir. Okunamayan tarama latch'i
+        değiştirmez, sessizce geri döner (kanıt gelince tekrar denenir)."""
         try:
             open_orders = self.exchange.open_orders()
-        except ExchangeUnavailable:
+        except ExchangeError:
             return None
         try:
             open_algos = self.exchange.open_algo_orders()
             algos_ok = True
-        except ExchangeUnavailable:
+        except ExchangeError:
             open_algos = []
             algos_ok = False
         unowned = [o.get("clientOrderId") or f"nosid:{o.get('symbol')}"

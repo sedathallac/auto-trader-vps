@@ -327,6 +327,37 @@ class TestUnownedOrderGate(NewUsdtBase):
             [c for c in self.ex.post_calls if c["method"] == "new_order"
              and c["client_order_id"] != "MANUALXYZ"], [])
 
+    def test_signed_api_error_does_not_blind_exit_monitoring(self):
+        """BÖLÜM 18 inceleme düzeltmesi: _unowned_order_check imzalı
+        uçtan BinanceApiError (-2015/-1021/4xx) alırsa istisna YAYMAZ —
+        eski kod risk_tick'in ÇIKIŞ bölümlerini (SAFE_EXIT enforce, HALT
+        zinciri) o turda atlatırdı; kalıcı hatada çıkış izlemesi
+        süresiz körleşirdi. Kanıt: açık pozisyon + -5 mark + broken
+        open_orders → SAFE_EXIT YİNE tetiklenir."""
+        from canary_exchange import BinanceApiError
+        self._brain_tick()                        # NEWUSDT SHORT pozisyonu
+        pos = self.lc.rm.open_positions()[0]
+        for algo in self.ex.algos.values():       # borsa-üstü SL'i etkisizle
+            algo["status"] = "CANCELED"
+        self.clock.advance(10_000)
+        # SHORT için -5.00 zarar üreten mark (loss_mark long-only):
+        # net_loss (short) = (mark - entry) * units + entry_comm
+        _p = self.lc.rm._pos(pos["pos_id"])
+        self.ex.set_mark(
+            NEW, _p["entry_px"]
+            + (5.00 - _p["entry_comm"]) / _p["units"])
+
+        def _broken_open_orders():
+            raise BinanceApiError(-2015, "test: imzalı uç reddi")
+        self.ex.open_orders = _broken_open_orders
+        latch_before = str(self.lc._get_state("unowned_order_seen"))
+        cyc = self.lc.risk_tick()                 # eski kod: istisna yayardı
+        self.assertIn({"pos_id": pos["pos_id"], "action": "SAFE_EXIT"},
+                      cyc["risk_actions"])
+        # latch KANITSIZ değişmedi (okunamayan tarama temizlemez)
+        self.assertEqual(
+            str(self.lc._get_state("unowned_order_seen")), latch_before)
+
     def test_clean_state_after_foreign_order_cancelled(self):
         self._foreign_order()
         self.lc._unowned_order_check(self.clock())
