@@ -54,6 +54,18 @@ class LiveConfigError(Exception):
     """Raised when the live configuration is not safe to start. The service must not come up."""
 
 
+def _safe_base_repr(base):
+    """Hata mesajlarında base'in güvenli temsili — userinfo maskelenir
+    (adrese gömülü kimlik bilgisi loga/çıktıya sızamaz)."""
+    try:
+        u = urllib.parse.urlsplit(str(base))
+    except ValueError:
+        return "<ayrıştırılamadı>"
+    if u.username or u.password:
+        return f"{u.scheme}://***@{u.hostname or ''}"
+    return str(base)
+
+
 def ensure_futures_base_url(base, *, strict_host=True, env=None):
     """GÖREV 2026-11-27 §9.3 (BÖLÜM 18) — URL doğrulamasının TEK boğum
     noktası. BinanceAPI.__init__ env'den base okuduğunda LiveConfig
@@ -61,19 +73,62 @@ def ensure_futures_base_url(base, *, strict_host=True, env=None):
     isteklerin gittiği adres burada DA kontrol edilir.
 
     Kurallar: scheme her zaman https; strict_host=True iken host
-    ALLOWED_FUTURES_HOSTS içinde olmalı (operatör opt-in'i
-    LIVE_ALLOW_CUSTOM_BASE_URL=1 ile aşılabilir)."""
+    ALLOWED_FUTURES_HOSTS içinde olmalı. Operatör opt-in'i
+    (LIVE_ALLOW_CUSTOM_BASE_URL=1) allowlist'i YALNIZ canlı olmayan
+    kurulumlarda (LIVE_MODE kapalı) aşabilir — LIVE_MODE=1 iken
+    allowlist MUTLAKTIR, opt-in geçersizdir.
+
+    GÖREV 2026-11-27 (hedefli güvenlik düzeltmesi): yapısal denetim
+    eklendi — port, kullanıcı bilgisi (userinfo), path, query ve fragment
+    reddi. hostname urlsplit tarafından zaten normalize edilir (küçük
+    harf). Böylece imzalı istek hedefi allowlist'teki hosta ek bir
+    yol/path/port üzerinden kaydırılamaz."""
     env = os.environ if env is None else env
     _u = urllib.parse.urlsplit(base)
     if _u.scheme != "https" or not _u.hostname:
         raise LiveConfigError(
-            f"BINANCE_FUTURES_BASE_URL https olmalı ve host içermeli: {base!r}")
-    if strict_host and _u.hostname not in ALLOWED_FUTURES_HOSTS \
-            and not _env_bool(env, "LIVE_ALLOW_CUSTOM_BASE_URL", False):
+            f"BINANCE_FUTURES_BASE_URL https olmalı ve host içermeli: "
+            f"{_safe_base_repr(base)}")
+    if _u.username or _u.password:
         raise LiveConfigError(
-            f"Binance taban adresi allowlist dışı: {_u.hostname!r} "
-            f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}); özel adres "
-            "yalnız operatör açık opt-in'iyle (LIVE_ALLOW_CUSTOM_BASE_URL=1)")
+            "BINANCE_FUTURES_BASE_URL kullanıcı bilgisi (userinfo) "
+            f"içeremez: {_u.scheme}://***@{_u.hostname}")
+    try:
+        _port = _u.port
+    except ValueError:
+        _port = -1  # aralık dışı port → aşağıda reddedilir
+    if _port is not None:
+        raise LiveConfigError(
+            f"Binance taban adresi port içeremez: port={_port} "
+            f"(host={_u.hostname!r})")
+    if _u.path not in ("", "/"):
+        raise LiveConfigError(
+            f"Binance taban adresi path içeremez: {_u.path!r} "
+            f"(host={_u.hostname!r})")
+    if _u.query:
+        raise LiveConfigError("Binance taban adresi query içeremez")
+    if _u.fragment:
+        raise LiveConfigError("Binance taban adresi fragment içeremez")
+    if strict_host and _u.hostname not in ALLOWED_FUTURES_HOSTS:
+        # GÖREV 2026-11-27 (devam — hedefli güvenlik düzeltmesi): GERÇEK
+        # canlı imzalı isteklerde allowlist MUTLAKTIR. LIVE_MODE=1 iken
+        # operatör opt-in'i (LIVE_ALLOW_CUSTOM_BASE_URL) allowlist'i ASLA
+        # aşamaz — opt-in yalnız canlı OLMAYAN kurulumlar (yerel test
+        # rigı, LIVE_MODE kapalı) için geçerlidir. Mainnet/testnet
+        # davranışı değişmez.
+        if _env_bool(env, "LIVE_MODE", False):
+            raise LiveConfigError(
+                f"Binance taban adresi allowlist dışı: {_u.hostname!r} "
+                f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}) — CANLI "
+                "modda (LIVE_MODE=1) LIVE_ALLOW_CUSTOM_BASE_URL opt-in'i "
+                "allowlist'i AŞAMAZ; mainnet/testnet dışı adres kesinlikle "
+                "reddedilir")
+        if not _env_bool(env, "LIVE_ALLOW_CUSTOM_BASE_URL", False):
+            raise LiveConfigError(
+                f"Binance taban adresi allowlist dışı: {_u.hostname!r} "
+                f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}); özel adres "
+                "yalnız operatör açık opt-in'iyle "
+                "(LIVE_ALLOW_CUSTOM_BASE_URL=1) ve CANLI MOD KAPALIYKEN")
     return base
 
 

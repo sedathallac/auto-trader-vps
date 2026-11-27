@@ -393,7 +393,12 @@ def _api_response(resp):
     429/418 → api_guard'a not (Retry-After uygulanır, artışlı backoff); başarılı
     2xx grevleri sıfırlar. Gövde .json() olarak döner; çözümlenemeyen gövde
     hata sözlüğüdür (çağıranlar isinstance(list)/'code' kontrolüyle fail-closed).
-    Bu fonksiyon HİÇBİR isteği yeniden göndermez."""
+    Bu fonksiyon HİÇBİR isteği yeniden göndermez.
+
+    GÖREV 2026-11-27 (devam — yönlendirme güvenliği): 3xx ASLA takip
+    edilmez (istekler allow_redirects=False ile gönderilir) — API key
+    başlığı (X-MBX-APIKEY) ve imzalı sorgu bir yönlendirmeyle başka
+    hosta TAŞINAMAZ; 3xx yanıtı fail-closed hata sözlüğüdür."""
     try:
         code = int(getattr(resp, "status_code", 0) or 0)
     except (TypeError, ValueError):
@@ -402,6 +407,11 @@ def _api_response(resp):
         api_guard.note_http_status(code, getattr(resp, "headers", None))
     elif 200 <= code < 300:
         api_guard.success()
+    if 300 <= code < 400:
+        # yönlendirme TAKİP EDİLMEZ (allow_redirects=False) → fail-closed:
+        # çağıranlar 'code' kontrolüyle reddeder
+        return {"code": -1, "msg": f"HTTP_REDIRECT_REFUSED http={code}",
+                "redirect_refused": True}
     try:
         return resp.json()
     except ValueError:
@@ -432,6 +442,11 @@ class BinanceAPI:
         return {"X-MBX-APIKEY": self.key}
 
     def _get(self, path, params=None, signed=False):
+        # GÖREV 2026-11-27 (hedefli güvenlik düzeltmesi): istek ANINDA base
+        # yeniden doğrulanır — __init__ sonrası self.base değiştirilse bile
+        # imzalı istek doğrulanmamış adrese GİDEMEZ (tek boğum noktası).
+        import live_guard as _lg
+        _lg.ensure_futures_base_url(self.base)
         # BLOK12 devam-A: yerel cooldown sürüyorsa İSTEK GÖNDERİLMEZ — transport
         # hiç yoklanmaz (418 ban süresi yanmış isteklerle uzar; pozisyonlar
         # borsa-üstü SL ile korunur). Teyitli başarısızlık: local_block.
@@ -445,10 +460,15 @@ class BinanceAPI:
         if signed:
             params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 60000
+            # GÖREV 2026-11-27: 3xx ASLA takip edilmez — API key başlığı +
+            # imzalı sorgu yönlendirme hedefine TAŞINAMAZ (fail-closed:
+            # _api_response HTTP_REDIRECT_REFUSED döndürür)
             resp = _session.get(f"{self.base}{path}?{self._sign(params)}",
-                                headers=self._hdr(), timeout=15)
+                                headers=self._hdr(), timeout=15,
+                                allow_redirects=False)
         else:
-            resp = _session.get(f"{self.base}{path}", params=params, timeout=15)
+            resp = _session.get(f"{self.base}{path}", params=params,
+                                timeout=15, allow_redirects=False)
         return _api_response(resp)
 
     def _post(self, path, params, method="POST"):
@@ -458,6 +478,10 @@ class BinanceAPI:
         # durum KORUNUR, emir tekrarlanmaz.
         # BLOK12 devam-A: gönderim-anı gardı — cooldown'da POST/DELETE de
         # GÖNDERİLMEZ (istek gitmediği için bu UNKNOWN DEĞİLDİR).
+        # GÖREV 2026-11-27: gönderim anında da base doğrulanır (_get ile
+        # aynı neden — imzalı istek doğrulanmamış adrese gitmesin).
+        import live_guard as _lg
+        _lg.ensure_futures_base_url(self.base)
         _rl = api_guard.blocked()
         if _rl:
             log.warning(f"⛔ {method} {path} gönderilmedi — yerel rate-limit "
@@ -469,10 +493,14 @@ class BinanceAPI:
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 60000
         url = f"{self.base}{path}?{self._sign(params)}"
+        # GÖREV 2026-11-27: POST/DELETE'te de 3xx takip YOK (imzalı URL +
+        # API key başlığı yönlendirme hedefine düşemez)
         if method == "DELETE":
-            resp = _session.delete(url, headers=self._hdr(), timeout=15)
+            resp = _session.delete(url, headers=self._hdr(), timeout=15,
+                                   allow_redirects=False)
         else:
-            resp = _session.post(url, headers=self._hdr(), timeout=15)
+            resp = _session.post(url, headers=self._hdr(), timeout=15,
+                                 allow_redirects=False)
         return _api_response(resp)
 
     def account(self):

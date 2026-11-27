@@ -46,8 +46,30 @@ class UrlGuardTest(unittest.TestCase):
             live_cfg(BINANCE_FUTURES_BASE_URL="https://attacker.example/")
         self.assertIn("allowlist", str(cm.exception))
 
-    def test_live_custom_host_allowed_only_with_operator_optin(self):
-        c = live_cfg(BINANCE_FUTURES_BASE_URL="https://example.invalid/",
+    def test_live_custom_host_refused_even_with_operator_optin(self):
+        """GÖREV devamı: LIVE_MODE=1 + LIVE_ALLOW_CUSTOM_BASE_URL=1 birlikteyken
+        resmi Binance hostları dışındaki adres KESİNLİKLE reddedilir — gerçek
+        canlı imzalı isteklerde opt-in allowlist'i AŞAMAZ."""
+        with self.assertRaises(LiveConfigError) as cm:
+            live_cfg(BINANCE_FUTURES_BASE_URL="https://example.invalid/",
+                     LIVE_ALLOW_CUSTOM_BASE_URL=1)
+        self.assertIn("allowlist dışı", str(cm.exception))
+        self.assertIn("LIVE_MODE=1", str(cm.exception))
+        self.assertIn("AŞAMAZ", str(cm.exception))
+
+    def test_live_optin_cannot_bypass_even_mainnet_lookalike(self):
+        """Allowlist benzeri/alt alan adlı host da canlı modda opt-in ile
+        GEÇEMEZ (host exact-match)."""
+        with self.assertRaises(LiveConfigError):
+            live_cfg(BINANCE_FUTURES_BASE_URL=
+                     "https://fapi.binance.com.evil.example/",
+                     LIVE_ALLOW_CUSTOM_BASE_URL=1)
+
+    def test_nonlive_rig_optin_still_allows_custom_host(self):
+        """Opt-in sözleşmesi KORUNUR: canlı OLMAYAN kurulumda (LIVE_MODE=0)
+        operatör opt-in'iyle özel adres hâlâ geçerli (yerel test rigı)."""
+        c = live_cfg(LIVE_MODE=0,
+                     BINANCE_FUTURES_BASE_URL="https://example.invalid/",
                      LIVE_ALLOW_CUSTOM_BASE_URL=1)
         self.assertEqual(c.base_url, "https://example.invalid")
 
@@ -115,10 +137,41 @@ class BinanceApiChokePointTest(unittest.TestCase):
             self.auto_trader.BinanceAPI("k", "s")
 
     def test_env_custom_host_allowed_with_operator_optin(self):
+        """Opt-in sözleşmesi KORUNUR: LIVE_MODE kapalıyken (canlı olmayan
+        test rigı) opt-in özel hosta izin verir."""
         os.environ["BINANCE_FUTURES_BASE_URL"] = "https://example.invalid/"
         os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = "1"
         api = self.auto_trader.BinanceAPI("k", "s")
         self.assertEqual(api.base, "https://example.invalid")
+
+    def test_live_mode_optin_cannot_bypass_at_api_init(self):
+        """GÖREV devamı: LIVE_MODE=1 + opt-in birlikteyken özel host
+        BinanceAPI KURULUMUNDA reddedilir (imzalı istek asla özel hosta
+        gitmez)."""
+        from live_guard import LiveConfigError
+        os.environ["BINANCE_FUTURES_BASE_URL"] = "https://evil.example/"
+        os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = "1"
+        os.environ["LIVE_MODE"] = "1"
+        try:
+            with self.assertRaises(LiveConfigError) as cm:
+                self.auto_trader.BinanceAPI("k", "s")
+            self.assertIn("AŞAMAZ", str(cm.exception))
+        finally:
+            os.environ.pop("LIVE_MODE", None)
+
+    def test_live_mode_optin_cannot_bypass_at_request_time(self):
+        """Aynı kombinasyon istek ANINDA da reddedilir: init sonrası base
+        değiştirilse bile canlı modda opt-in allowlist'i aşamaz."""
+        from live_guard import LiveConfigError
+        api = self.auto_trader.BinanceAPI("k", "s")  # mainnet — geçerli
+        os.environ["LIVE_ALLOW_CUSTOM_BASE_URL"] = "1"
+        os.environ["LIVE_MODE"] = "1"
+        try:
+            api.base = "https://evil.example"
+            with self.assertRaises(LiveConfigError):
+                api._get("/fapi/v2/positionRisk", signed=True)
+        finally:
+            os.environ.pop("LIVE_MODE", None)
 
     def test_explicit_base_arg_also_validated(self):
         from live_guard import LiveConfigError

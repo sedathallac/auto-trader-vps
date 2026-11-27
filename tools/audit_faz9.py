@@ -13,6 +13,12 @@ TASARIM KURALLARI (önceki taslağın 10 kusurunun düzeltilmişi):
     wal_checkpoint YOK (yazma yok).
   * HTTP yalnız GET (Binance). HB /executors/search statik olarak doğrulanmış
     tek uçtur; POST ama salt-okur sorgudur (emir/degisiklik yoktur).
+  * GÖREV 2026-11-27 (Kusur A/B): imzalı Binance isteği ve HB Basic Auth
+    isteği ÖNCE hedef doğrulamasından geçer (allowlist host / https /
+    loopback+varsayılan port; port/userinfo/path/query/fragment reddi);
+    HTTP 3xx (301/302/303/307/308) ASLA takip edilmez; doğrulama başarısız
+    → istek GÖNDERİLMEZ (fail-closed); hata çıktısında sır/API key/imzalı
+    query YOKTUR.
   * Her bölüm VERIFIED / PARTIAL / UNKNOWN etiketiyle basılır; veri yoksa
     uydurulmaz.
 
@@ -79,8 +85,110 @@ def secret_presence(env, name):
     return f"VAR(len={len(v)})" if v else "YOK"
 
 
+# ---- GÖREV 2026-11-27 (Kusur A/B) hedef doğrulaması ----------------------------
+# İmzalı Binance isteği ve HB Basic Auth isteği doğrulanmamış adrese ASLA
+# gönderilmez. live_guard ile paylaşım, bu aracın CLI import/yol davranışını
+# bozmamak için yerine aynı politikayı uygulayan bağımsız stdlib
+# doğrulayıcılarla çözüldü (tools/ kendi başına, auto_trader'sız çalışır).
+BINANCE_ALLOWED_HOSTS = ("fapi.binance.com", "testnet.binancefuture.com")
+HB_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "::1")
+HB_ALLOWED_PORT = 8000  # varsayılan kurulum; farklı port RAPORLANIR, izin genişletilmez
+
+
+def validate_binance_base(base):
+    """İmzalı istek hedefi (Kusur A). Geçerli → None; geçersiz → NEDEN.
+    API key + imzalı query asla başka hosta/gitmesin: yalnız https +
+    allowlist host; username/password, port, path, query, fragment reddi.
+    Dönen nedende sır/API key/imzalı query ASLA yoktur."""
+    u = urllib.parse.urlsplit(str(base or ""))
+    if u.scheme != "https":
+        return f"scheme https olmalı (scheme={u.scheme!r})"
+    host = u.hostname or ""
+    if not host:
+        return "host yok"
+    if u.username or u.password:
+        return f"URL kullanıcı bilgisi (userinfo) içeremez (host={host!r})"
+    try:
+        port = u.port
+    except ValueError:
+        return f"geçersiz port (host={host!r})"
+    if port is not None:
+        return f"port kabul edilmez (host={host!r}, port={port})"
+    if host not in BINANCE_ALLOWED_HOSTS:
+        return (f"host allowlist dışı: {host!r} (izinli: "
+                f"{', '.join(BINANCE_ALLOWED_HOSTS)})")
+    if u.path not in ("", "/"):
+        return f"path kabul edilmez: {u.path!r} (host={host!r})"
+    if u.query:
+        return "query kabul edilmez"
+    if u.fragment:
+        return "fragment kabul edilmez"
+    return None
+
+
+def validate_hb_url(url):
+    """HB Basic Auth hedefi (Kusur B). Yalnız loopback host + varsayılan
+    kurulum portu 8000; http yalnız loopback için kabul, https loopback da
+    olur. Farklı port gerekiyorsa bu RAPORLANIR — izin otomatik
+    genişletilmez. Geçerli → None; geçersiz → NEDEN (Authorization
+    içeriği ASLA yazılmaz)."""
+    u = urllib.parse.urlsplit(str(url or ""))
+    if u.scheme not in ("http", "https"):
+        return f"scheme http/https olmalı (scheme={u.scheme!r})"
+    host = u.hostname or ""
+    if not host:
+        return "host yok"
+    if u.username or u.password:
+        return f"URL kullanıcı bilgisi (userinfo) içeremez (host={host!r})"
+    try:
+        port = u.port
+    except ValueError:
+        return f"geçersiz port (host={host!r})"
+    if port is None:
+        port = 443 if u.scheme == "https" else 80
+    if port != HB_ALLOWED_PORT:
+        return (f"port {port} izinli değil — varsayılan kurulum "
+                f"{HB_ALLOWED_PORT} dışı port raporlanır, izin otomatik "
+                "genişletilmez")
+    if host not in HB_ALLOWED_HOSTS:
+        return (f"host yalnız loopback olabilir: {host!r} (izinli: "
+                f"{', '.join(HB_ALLOWED_HOSTS)})")
+    if u.path not in ("", "/"):
+        return f"path kabul edilmez: {u.path!r} (host={host!r})"
+    if u.query or u.fragment:
+        return "query/fragment kabul edilmez"
+    return None
+
+
+class _RedirectRefused(urllib.request.HTTPRedirectHandler):
+    """301/302/303/307/308 YENİ hedefe ASLA takip edilmez — imzalı Binance
+    isteği (API key başlıkta + HMAC imzası sorguda) ve HB Basic Auth
+    başlığı bir yönlendirmeyle başka hosta düşürülemez."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirect takip edilmez", headers, fp)
+
+
+_OPENER_NO_REDIRECT = urllib.request.build_opener(_RedirectRefused)
+
+
+def _open_no_redirect(req, timeout=15):
+    """urlopen yerine: HTTP 3xx asla takip edilmez."""
+    return _OPENER_NO_REDIRECT.open(req, timeout=timeout)
+
+
 def mbx_signed_get(base, path, api_key, secret, params=None):
-    """HMAC-SHA256 imzalı GET — recvWindow 60000, timeout 15 (bot ile ayni)."""
+    """HMAC-SHA256 imzalı GET — recvWindow 60000, timeout 15 (bot ile ayni).
+
+    GÖREV 2026-11-27 (Kusur A): hedef DOĞRULANMADAN istek gönderilmez
+    (fail-closed); HTTP 3xx ASLA takip edilmez; hata çıktısında sır/API
+    key/imzalı query YOKTUR."""
+    verr = validate_binance_base(base)
+    if verr:
+        # doğrulama başarısız → AĞ İSTEĞİ YOK (API key + imza hiç
+        # doğrulanmamış adrese yazılmaz/taşınmaz)
+        return None, f"HEDEF REDDEDİLDİ (istek GÖNDERİLMEDİ): {verr}"
     p = dict(params or {})
     p["timestamp"] = int(time.time() * 1000)
     p["recvWindow"] = 60000
@@ -89,13 +197,20 @@ def mbx_signed_get(base, path, api_key, secret, params=None):
     url = f"{base}{path}?{qs}&signature={sig}"
     req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _open_no_redirect(req, timeout=15) as resp:
+            if 300 <= resp.status < 400:
+                # Location'sız 3xx: urlopen açar ama TAKİP YOK
+                return None, f"HTTP {resp.status} redirect REDDEDİLDİ (takip yok)"
             body = resp.read().decode("utf-8", "replace")
         data = json.loads(body)
         if isinstance(data, dict) and "code" in data:
             return None, f"api-error code={data.get('code')} msg={data.get('msg')}"
         return data, None
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as e:
+    except urllib.error.HTTPError as e:
+        # Location'lu 3xx _RedirectRefused'dan HTTPError olarak yükselir;
+        # str(e) yalnız kod+neden içerir — URL/imzalı query/anahtar YOK
+        return None, f"HTTPError http={e.code} (redirect reddi dahil)"
+    except (urllib.error.URLError, ValueError) as e:
         return None, f"{type(e).__name__}: {e}"
 
 
@@ -111,6 +226,47 @@ def q(conn, sql, args=()):
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
     except sqlite3.Error as e:
         return None if "no such" in str(e).lower() else (_ for _ in ()).throw(e)
+
+
+def hb_executors_probe(hb_url, hb_user, hb_pw):
+    """HB /executors/search (Kusur B) — tek statik doğrulanmış uç, salt-okur
+    sorgu. Hedef DOĞRULANMADAN Authorization başlığı OLUŞTURULMAZ ve istek
+    GÖNDERİLMEZ; HTTP 3xx ASLA takip edilmez; Basic Auth içeriği hiçbir
+    çıktıya/loga YAZILMAZ."""
+    verr = validate_hb_url(hb_url)
+    if verr:
+        # doğrulama başarısız → Authorization başlığı OLUŞTURULMAZ,
+        # istek gönderilmez (fail-closed)
+        emit("HB.EXECUTORS", "UNKNOWN",
+             f"HEDEF REDDEDİLDİ (istek GÖNDERİLMEDİ): {verr}")
+        return
+    if not hb_user:
+        emit("HB.EXECUTORS", "UNKNOWN", "HB_USERNAME env'de yok")
+        return
+    import base64
+    tok = base64.b64encode(f"{hb_user}:{hb_pw}".encode()).decode()
+    req = urllib.request.Request(f"{hb_url}/executors/search", data=b"{}",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Basic {tok}"})
+    try:
+        with _open_no_redirect(req, timeout=15) as resp:
+            if 300 <= resp.status < 400:
+                emit("HB.EXECUTORS", "UNKNOWN",
+                     f"HTTP {resp.status} redirect REDDEDİLDİ (takip yok)")
+                return
+            body = json.loads(resp.read().decode())
+        data = body.get("data") if isinstance(body, dict) else None
+        if isinstance(data, list):
+            term = sum(1 for e in data if e.get("status") == "TERMINATED")
+            stale = sum(1 for e in data if e.get("status") == "RUNNING"
+                        and e.get("is_trading") is False)
+            emit("HB.EXECUTORS", "VERIFIED",
+                 f"{len(data)} exec, {term} TERM, {stale} RUNNING-notrading")
+        else:
+            emit("HB.EXECUTORS", "UNKNOWN", f"beklenmeyen govde: {list(body)[:5]}")
+    except Exception as e:
+        # str(e) URL/Authorization içeriği taşımaz (HTTPError: kod+neden)
+        emit("HB.EXECUTORS", "UNKNOWN", f"{type(e).__name__}: {e}")
 
 
 def main():
@@ -236,31 +392,11 @@ def main():
         finally:
             conn.close()
 
-    # ---- HB (tek statik-dogrulanmis uc, salt-okur sorgu)
+    # ---- HB (tek statik-dogrulanmis uc, salt-okur sorgu; hedef önce
+    # doğrulanır — Kusur B: Authorization yalnız loopback:8000 için)
     hb_url = args.hb_url or env.get("HB_API") or "http://127.0.0.1:8000"
-    hb_user, hb_pw = env.get("HB_USERNAME", ""), env.get("HB_PASSWORD", "")
-    if hb_user:
-        import base64
-        tok = base64.b64encode(f"{hb_user}:{hb_pw}".encode()).decode()
-        req = urllib.request.Request(f"{hb_url}/executors/search", data=b"{}",
-                                     headers={"Content-Type": "application/json",
-                                              "Authorization": f"Basic {tok}"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = json.loads(resp.read().decode())
-            data = body.get("data") if isinstance(body, dict) else None
-            if isinstance(data, list):
-                term = sum(1 for e in data if e.get("status") == "TERMINATED")
-                stale = sum(1 for e in data if e.get("status") == "RUNNING"
-                            and e.get("is_trading") is False)
-                emit("HB.EXECUTORS", "VERIFIED",
-                     f"{len(data)} exec, {term} TERM, {stale} RUNNING-notrading")
-            else:
-                emit("HB.EXECUTORS", "UNKNOWN", f"beklenmeyen govde: {list(body)[:5]}")
-        except Exception as e:
-            emit("HB.EXECUTORS", "UNKNOWN", f"{type(e).__name__}: {e}")
-    else:
-        emit("HB.EXECUTORS", "UNKNOWN", "HB_USERNAME env'de yok")
+    hb_executors_probe(hb_url, env.get("HB_USERNAME", ""),
+                       env.get("HB_PASSWORD", ""))
 
     ok = sum(1 for _, l in LABELS if l == "VERIFIED")
     print(f"\n== OZET: {ok} VERIFIED / "
