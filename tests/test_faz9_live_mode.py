@@ -111,9 +111,19 @@ class TestnetUrlTest(unittest.TestCase):
         c = cfg(BINANCE_TESTNET=0, LIVE_STAGE=2, LIVE_STAGE_CONFIRMED=1)
         self.assertEqual(c.base_url, live_guard.FUTURES_MAINNET)
 
-    def test_an_explicit_base_url_wins(self):
-        c = cfg(BINANCE_FUTURES_BASE_URL="https://example.invalid/")
+    def test_an_explicit_base_url_wins_in_compare_mode(self):
+        # GÖREV 2026-11-27 §9.3: canlıda custom host RED (aşağıdaki yeni
+        # testler); compare modunda https her host hâlâ geçerli.
+        c = cfg(LIVE_MODE=0, BINANCE_FUTURES_BASE_URL="https://example.invalid/")
         self.assertEqual(c.base_url, "https://example.invalid")
+
+    def test_live_mode_refuses_a_custom_host(self):
+        with self.assertRaises(LiveConfigError):
+            cfg(BINANCE_FUTURES_BASE_URL="https://example.invalid/")
+
+    def test_live_mode_refuses_an_http_base_url(self):
+        with self.assertRaises(LiveConfigError):
+            cfg(BINANCE_FUTURES_BASE_URL="http://fapi.binance.com")
 
     def test_stage_1_refuses_mainnet(self):
         with self.assertRaises(LiveConfigError):

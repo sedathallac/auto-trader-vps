@@ -10,11 +10,18 @@ an injected client so it can be tested without a key.
 """
 import os
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
 
 FUTURES_MAINNET = "https://fapi.binance.com"
 FUTURES_TESTNET = "https://testnet.binancefuture.com"
+
+# GÖREV 2026-11-27 §9.3 — URL güvenliği: imzalı Binance isteklerinin (API key
+# başlıkta + HMAC imzası sorguda) gittiği taban adres kontrolden çıkamaz.
+# Canlı modda host bu allowlist dışında olamaz; özel adres (yerel test rigı)
+# yalnız operatörün açık opt-in'iyle (LIVE_ALLOW_CUSTOM_BASE_URL=1) geçer.
+ALLOWED_FUTURES_HOSTS = ("fapi.binance.com", "testnet.binancefuture.com")
 
 # Stage caps. A stage may run BELOW its cap but never above it: the env file cannot talk itself into more risk than the
 # stage it declares. Stage 4 is the only one that reaches the full 2500 USDT book, and it needs an explicit operator
@@ -119,6 +126,19 @@ class LiveConfig:
         base = (env.get("BINANCE_FUTURES_BASE_URL") or "").strip()
         if not base:
             base = FUTURES_TESTNET if testnet else FUTURES_MAINNET
+        # GÖREV 2026-11-27 §9.3 — taban adres doğrulaması (fail-closed):
+        #   * her modda scheme https olmalı (http'ye kimlik düşürme YOK);
+        #   * canlı modda host allowlist içinde olmalı; değilse reddedilir.
+        _u = urllib.parse.urlsplit(base)
+        if _u.scheme != "https" or not _u.hostname:
+            raise LiveConfigError(
+                f"BINANCE_FUTURES_BASE_URL https olmalı ve host içermeli: {base!r}")
+        if live_mode and _u.hostname not in ALLOWED_FUTURES_HOSTS \
+                and not _env_bool(env, "LIVE_ALLOW_CUSTOM_BASE_URL", False):
+            raise LiveConfigError(
+                f"canlı taban adresi allowlist dışı: {_u.hostname!r} "
+                f"(izinli: {', '.join(ALLOWED_FUTURES_HOSTS)}); özel adres "
+                "yalnız operatör açık opt-in'iyle (LIVE_ALLOW_CUSTOM_BASE_URL=1)")
         return cls(
             live_mode=live_mode,
             hb_offline=hb_offline,
