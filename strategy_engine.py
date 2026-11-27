@@ -16,6 +16,7 @@ import math
 import random
 import sqlite3
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -525,6 +526,9 @@ class SignalStore:
 
     def __init__(self, path=SIGNAL_DB):
         self.path = str(path)
+        # GÖREV 2026-11-27 §4: resolve_pending hata durumu ölçülebilir —
+        # None = hata yok; dolu = son hata (done=0 ile KARIŞMAZ)
+        self.last_resolve_error = None
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=5)
@@ -575,8 +579,17 @@ class SignalStore:
             return False
 
     def resolve_pending(self, symbol, cd: Candles, cost, sl_pct):
-        """Bu sembolün çözülmemiş olaylarını (entry_ts mumundan sonra horizon kadar KAPANMIŞ mum varsa) çözer."""
+        """Bu sembolün çözülmemiş olaylarını (entry_ts mumundan sonra horizon kadar KAPANMIŞ mum varsa) çözer.
+
+        GÖREV 2026-11-27 §4: hata artık SESSİZ DEĞİL — `except: pass`
+        kaldırıldı. Hata durumunda `last_resolve_error` dolar + stderr'e
+        loglanır; done=0 ("çözülecek satır yoktu") ile KARIŞMAZ. Çağrı
+        sözleşmesi KORUNUR (istisna yükseltilmez, dönüş yine int) — ama
+        hata görünürlüğü sayesinde kalibrasyon (p_fake) yanlışlıkla
+        'başarılı tazeleme' kabul edilemez: hata varken çözülmemiş satırlar
+        stale kalır ve bu durum ölçülebilir."""
         done = 0
+        self.last_resolve_error = None
         try:
             c = self._conn()
             try:
@@ -598,8 +611,15 @@ class SignalStore:
                 c.commit()
             finally:
                 c.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # görünürlük: ölçülebilir durum + stderr log (sözleşme aynı:
+            # istisna YÜKSELTİLMEZ, dönüş yine int — ama done=0 şimdi
+            # hatayla KARIŞMAZ; çağıran last_resolve_error'a bakabilir)
+            self.last_resolve_error = f"{type(e).__name__}: {e}"
+            print(f"[strategy_engine] resolve_pending HATA symbol={symbol!r}: "
+                  f"{self.last_resolve_error} — çözülmemiş satırlar stale "
+                  "kalabilir; done=0 'çözülecek satır yok' DEĞİL",
+                  file=sys.stderr)
         return done
 
     def p_fake(self, signal, regime, cfg=None):

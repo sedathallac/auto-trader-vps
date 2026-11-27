@@ -380,6 +380,28 @@ def set_entry_pause(db_path, paused, reason, by, timeout_s=120.0):
             "ts": now, "by": str(by), "reason": str(reason or "")}
 
 
+# GÖREV 2026-11-27 (SQL identifier hardening): read_entry_pause içindeki
+# iç get() tablo adını f-string ile SQL'e gömer — identifier ALLOWLIST ile
+# sınırlıdır; değer her zaman ? parametresi olarak gider.
+_STATE_READ_TABLES = ("live_state", "canary_state")
+
+
+def _read_state_value(db, k, table="live_state"):
+    """live_state/canary_state anahtar-değer okuma (salt-okur). Tablo adı
+    allowlist dışıysa ValueError — bilinmeyen identifier SQL'e ASLA
+    gömülmez (injection/yanlış-tablo yazımı kapalı)."""
+    if table not in _STATE_READ_TABLES:
+        raise ValueError(
+            f"izin verilmeyen state tablosu: {table!r} "
+            f"(izinli: {', '.join(_STATE_READ_TABLES)})")
+    try:
+        row = db.execute(f"SELECT value FROM {table} WHERE key=?",
+                         (k,)).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
 def read_entry_pause(db_path):
     """Salt-okunur PAUSE/HALT/pending-entry görünümü (status aracı).
     mode=ro ile açılır — hiçbir şey YAZMAZ, borsa API'si ÇAĞIRMAZ."""
@@ -390,12 +412,9 @@ def read_entry_pause(db_path):
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         def get(k, table="live_state"):
-            try:
-                row = db.execute(f"SELECT value FROM {table} WHERE key=?",
-                                 (k,)).fetchone()
-                return row[0] if row else None
-            except sqlite3.Error:
-                return None
+            # tablo adı allowlist'ten geçer (bkz. _read_state_value) —
+            # {table} yalnız izinli identifier olabilir
+            return _read_state_value(db, k, table)
         out["entry_paused"] = (get(ENTRY_PAUSE_KEY) or "0") == "1"
         # BLOK32 görev-2: yön canlı giriş izinleri (salt-okunur görünüm).
         # Ham değer de gösterilir — hatalı ayar görünür/kayda geçer.
@@ -664,9 +683,23 @@ class LiveCanary:
                 "exit_reason", "updated_ts"]
         return dict(zip(keys, row))
 
+    # GÖREV 2026-11-27 (SQL identifier hardening): _update_live_pos alan
+    # adları f-string ile SQL'e gömülür — allowlist GERÇEK şemadan
+    # (CREATE TABLE live_positions) gelir; pos_id/symbol kimlik,
+    # updated_ts bu metodun kendisi tarafından yazılır. Değerler her
+    # zaman ? parametresidir. Bilinmeyen alan adı REDDEDİLİR.
+    _LIVE_POS_UPDATE_COLS = frozenset({
+        "protection_client_id", "protection_status",
+        "exit_client_id", "exit_status", "exit_reason"})
+
     def _update_live_pos(self, pos_id, **fields):
         if not fields:
             return
+        bad = sorted(set(fields) - self._LIVE_POS_UPDATE_COLS)
+        if bad:
+            raise ValueError(
+                f"live_positions bilinmeyen sütun(lar): {bad} (izinli: "
+                f"{sorted(self._LIVE_POS_UPDATE_COLS)})")
         sets = ", ".join(f"{k}=?" for k in fields)
         self._db_execute(f"UPDATE live_positions SET {sets}, "
                          f"updated_ts=? WHERE pos_id=?",

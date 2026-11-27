@@ -210,7 +210,19 @@ class PaperBroker:
         finally:
             conn.close()
 
+    # GÖREV 2026-11-27 (SQL identifier hardening): _set_account alan adları
+    # f-string ile SQL'e gömülür — allowlist GERÇEK şemadan (CREATE TABLE
+    # account) gelir; bilinmeyen alan adı REDDEDİLİR, değerler ? parametresi
+    # olarak gider.
+    _ACCOUNT_UPDATE_COLS = frozenset(
+        {"cash", "peak_equity", "halted", "halt_reason"})
+
     def _set_account(self, **kw):
+        bad = sorted(set(kw) - self._ACCOUNT_UPDATE_COLS)
+        if bad:
+            raise ValueError(
+                f"account bilinmeyen sütun(lar): {bad} (izinli: "
+                f"{sorted(self._ACCOUNT_UPDATE_COLS)})")
         cols = ", ".join(f"{k}=?" for k in kw)
         conn = self._connect()
         try:

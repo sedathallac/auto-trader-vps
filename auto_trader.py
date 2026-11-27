@@ -1448,8 +1448,25 @@ def _faz6_confirm(binance, symbol, side, sl_pct, mode):
         _tr6 = {tf: _se.fetch_candles(binance, symbol, tf, _lim)
                 for tf in RISK_CONFIG["confirm_tf_veto"]}
         _store6 = _se.SignalStore(_se.SIGNAL_DB)
+        _resolve_err6 = None
         if _main6 is not None:
             _store6.resolve_pending(symbol, _main6, RISK_CONFIG["fee_pct_round_trip"], sl_pct)
+            # GÖREV 2026-11-27 (devam): resolve_pending HATA VERDİYSE
+            # kalibrasyon verisi eski/eksik kalabilir — bu durumla
+            # 'başarılı tazeleme' ÜRETİLMEZ. Hata artık ölçülebilir
+            # (SignalStore.last_resolve_error; sessiz done=0 ile
+            # karışmaz). mode=='on' → fail-closed RED (giriş yok);
+            # compare → karar etkilenmez ama p_fake açıkça UNKNOWN sayılır.
+            _resolve_err6 = getattr(_store6, "last_resolve_error", None)
+        if _resolve_err6:
+            if mode == "on":
+                log.warning(f"  Faz6: signal_outcomes çözümleme HATASI — p_fake "
+                            f"kalibrasyonu eski/eksik veriyle ÜRETİLMEZ, "
+                            f"fail-closed (giriş yok): {_resolve_err6}")
+                return False
+            log.warning(f"  Faz6[compare]: signal_outcomes çözümleme HATASI — "
+                        f"p_fake kalibrasyonu UNKNOWN sayılır (karar etkilenmedi): "
+                        f"{_resolve_err6}")
         _v6 = _se.confirm(_sd6, _main6, _tr6, _store6, symbol, RISK_CONFIG)
         log.info(f"  🧪 Faz6[{mode}]: rejim={_v6.regime} trend_karşı={_v6.trend_against:.2f} "
                  f"aileler={_v6.families} p_real={_v6.p_real:.3f} kalibre={_v6.calibrated} | "
