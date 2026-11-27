@@ -186,6 +186,24 @@ class AccountRiskGate:
             if baseline.open_orders else None
         audit["n_open_algo_orders"] = len(baseline.open_algo_orders.entries) \
             if baseline.open_algo_orders else None
+        # GÖREV 2026-11-27 kusur 2: kaldıraç BİLİNMEYEN pozisyonlar
+        # (V3 account satırı alanı taşımaz). Mevcut marjin hesabı
+        # bracket'lardan max_leverage kullanır — leverage=None bugün hiçbir
+        # hesaba GİRMEZ; ama kaldıraça bağlı GELECEK herhangi bir hesap
+        # None'ı 0 SAYMAZ, gerekirse BLOCK eder (fail-closed sözleşme).
+        if inv_positions or baseline.positions_from_account_v3 is not None:
+            v3_positions = baseline.positions_from_account_v3.non_flat() \
+                if baseline.positions_from_account_v3 is not None else []
+            unk_lev = sorted(
+                {p.symbol for p in (*tuple(inv_positions or ()),
+                                    *tuple(v3_positions or ()))
+                 if p.leverage is None})
+            if unk_lev:
+                audit["positions_with_unknown_leverage"] = unk_lev
+                warnings.append(
+                    f"AG_UNKNOWN_LEVERAGE:{','.join(unk_lev)} — pozisyon "
+                    "kaldıraçı BİLİNMEYOR (kaynak satırda alan yok); "
+                    "kaldıraça bağlı hiçbir hesap None'ı 0 saymaz")
 
         # --- B: tam envanter + sahiplik ---
         if rm is not None:

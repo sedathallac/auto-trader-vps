@@ -748,14 +748,17 @@ class LiveCanary:
                 rec.setdefault("drift", []).append(
                     {"symbol": sym, "ledger": pos["direction"] * pos["units"],
                      "exchange": amt})
-        # 3) bizim INTENT/UNKNOWN emirler → çöz
+        # 3) bizim INTENT/UNKNOWN emirler → çöz (GÖREV 2026-11-27 kusur 1:
+        #    FILLED ama deftere işlenmemiş pos_id'siz emirler DAHİL — ENA)
         for row in self._db_execute(
-                "SELECT client_id, kind, symbol, status FROM live_orders "
-                "WHERE status IN ('INTENT','SUBMITTED','UNKNOWN',"
-                "'PARTIALLY_FILLED')").fetchall():
-            cid, kind, sym, status = row
-            if kind == "ENTRY" and status in ("UNKNOWN", "SUBMITTED",
-                                              "PARTIALLY_FILLED"):
+                "SELECT client_id, kind, symbol, status, pos_id FROM "
+                "live_orders WHERE status IN ('INTENT','SUBMITTED',"
+                "'UNKNOWN','PARTIALLY_FILLED') OR (status='FILLED' AND "
+                "(pos_id IS NULL OR pos_id=''))").fetchall():
+            cid, kind, sym, status, pos_id = row
+            if kind == "ENTRY" and (
+                    status in ("UNKNOWN", "SUBMITTED", "PARTIALLY_FILLED")
+                    or (status == "FILLED" and not pos_id)):
                 self._resolve_entry_order(cid, sym)
         # 4) sahipliği kanıtlanamayan açık emirler
         for o in open_orders:
@@ -1296,12 +1299,112 @@ class LiveCanary:
                 "dir_enabled_* anahtarı '1' değil, fail-closed)")
         return reasons
 
+    # ---- fill doğrulama (GÖREV 2026-11-27 kusur 1 — ENA vakası) -----------
+    def _fill_provenance_ok(self, cid, symbol, resp):
+        """Fill sahiplik kanıtı: yanıt gerçekten BİZİM emrimize mi ait?
+        clientOrderId + symbol + side (defter params'ından) BİRLİKTE ve
+        HAZIR OLARAK doğrulanır — yalnız C281 öneki KANIT DEĞİLDİR.
+        Bağımsız inceleme M-1: alan YOKSA da kanıt YOKTUR (fail-closed;
+        'yoksa atla' DEĞİL). Uyuşmazlık/eksik → alarm (risk event) +
+        False; pozisyon ASLA benimsenmez."""
+        params = {}
+        o = self._order_row(cid)
+        if o is not None:
+            try:
+                params = json.loads(o.get("params") or "{}")
+            except (TypeError, ValueError):
+                params = {}
+        problems = []
+        if resp.get("clientOrderId") != cid:
+            problems.append(f"clientOrderId {resp.get('clientOrderId')!r} "
+                            f"!= {cid!r}")
+        if resp.get("symbol") != symbol:
+            problems.append(f"symbol {resp.get('symbol')!r} != {symbol!r}")
+        expected_side = params.get("side")
+        if expected_side not in ("BUY", "SELL"):
+            problems.append(f"defter params side geçersiz/eksik: "
+                            f"{expected_side!r}")
+        elif resp.get("side") != expected_side:
+            problems.append(f"side {resp.get('side')!r} != {expected_side!r}")
+        if problems:
+            self._log("live_orders.jsonl",
+                      {"t": self._now(), "kind": "FILL_PROVENANCE_MISMATCH",
+                       "client_id": cid, "symbol": symbol,
+                       "problems": problems})
+            self.rm._event("FILL_PROVENANCE_MISMATCH",
+                           f"{cid} {symbol}: " + "; ".join(problems)
+                           + " — sahiplik KANITLANAMADI, pozisyon benimsenmedi")
+            return False
+        return True
+
+    def _confirm_fill_from_exchange(self, cid, symbol):
+        """POST yanıtı fill alanlarını (executedQty/avgPrice) taşımıyorsa
+        emri SALT-OKUNUR sorgula (origClientOrderId). ASLA yeniden POST
+        edilmez (§2.3). Sahiplik kanıtlanamazsa/sorgu başarısızsa None
+        döner — çağıran deftere YAZMAZ, emir çözümleme döngüsüne kalır."""
+        try:
+            resp = self.exchange.query_order(symbol, client_order_id=cid)
+        except (ExchangeUnavailable, BinanceApiError) as e:
+            self._log("live_orders.jsonl",
+                      {"t": self._now(), "kind": "FILL_CONFIRM_QUERY_FAILED",
+                       "client_id": cid, "symbol": symbol,
+                       "error": f"{type(e).__name__}: {e}"})
+            return None
+        if not self._fill_provenance_ok(cid, symbol, resp):
+            return None
+        if resp.get("status") not in (O_FILLED, O_PARTIAL, "EXPIRED",
+                                      O_CANCELED):
+            return None                     # hâlâ çalışıyor / hiç dolmadı
+        qty = float(resp.get("executedQty") or 0)
+        avg = float(resp.get("avgPrice") or 0)
+        if avg <= 0 < qty:
+            # avgPrice yoksa cumQuote'tan türet (tek kaynak: borsa yanıtı)
+            cum = float(resp.get("cumQuote") or 0)
+            if cum > 0:
+                avg = cum / qty
+                resp = dict(resp, avgPrice=str(avg))
+        if qty <= 0 or avg <= 0:
+            return None
+        return resp
+
     def _on_entry_filled(self, cid, resp, symbol, direction, now_ms):
-        """Gerçek fill → defter + koruma zinciri (§5 adım 2-9)."""
+        """Gerçek fill → defter + koruma zinciri (§5 adım 2-9).
+
+        GÖREV 2026-11-27 kusur 1 (ENA vakası): POST yanıtı
+        executedQty/avgPrice taşımıyorsa bu 'fill yok' DEĞİLDİR — emir
+        client id ile SALT-OKUNUR sorgulanır ve GERÇEK fill oradan
+        doğrulanır (yeniden POST YOK). Defter pozisyonu ancak miktar
+        kesinleşince açılır; sahiplik (clientOrderId/symbol/side)
+        kanıtlanmadan pozisyon BENİMSNENMEZ. Aynı fill ikinci kez
+        (yinelenen olay/restart/çözümleme döngüsü) işlenmez."""
+        # idempotency: emir zaten defterde → yeniden pozisyon AÇILMAZ
+        existing = self._order_row(cid)
+        if existing is not None and existing.get("pos_id"):
+            return {"pos_id": existing["pos_id"],
+                    "result": "DUPLICATE_FILL (defterde zaten var — "
+                              "yeniden işlenmedi)"}
         qty = float(resp.get("executedQty") or 0)
         avg = float(resp.get("avgPrice") or 0)
         if qty <= 0 or avg <= 0:
-            return {"result": "FILL_DOĞRULANAMADI (executedQty/avgPrice yok)"}
+            confirmed = self._confirm_fill_from_exchange(cid, symbol)
+            if confirmed is None:
+                # deftere yazma; emir çözümleme döngüsünde yeniden ele
+                # alınır (read-only sorgu) — körlemesine tekrar POST YOK
+                return {"result": "FILL_UNCONFIRMED (POST yanıtı "
+                                  "executedQty/avgPrice taşımıyor; borsa "
+                                  "sorgusu da doğrulayamadı — risk döngüsü "
+                                  "izleyecek)"}
+            resp = confirmed
+            qty = float(resp["executedQty"] or 0)
+            avg = float(resp["avgPrice"] or 0)
+            # sorgu yolu genelde fills[] taşımaz → komisyon 0 kabul edilir;
+            # kayıp bütçesi (5 USDT) sınırı bu belirsizliği emer, iz bırakır:
+            if not resp.get("fills"):
+                self.rm._event(
+                    "FILL_CONFIRMED_FROM_QUERY",
+                    f"{cid} {symbol}: fill borsa sorgusundan doğrulandı "
+                    f"(qty={qty} avg={avg}); komisyon bilinmiyor → 0 "
+                    "sayıldı (muhafazakâr)")
         comm = sum(float(f.get("commission", 0) or 0)
                    for f in resp.get("fills", []))
         notional = qty * avg
@@ -1694,34 +1797,88 @@ class LiveCanary:
     # ---- UNKNOWN / partial çözümleme (§2.3) ---------------------------------
     def _resolve_entry_order(self, cid, symbol):
         """ENTRY UNKNOWN/SUBMITTED → client id ile sorgu; körlemesine tekrar
-        POST edilmez."""
+        POST edilmez. GÖREV 2026-11-27 kusur 1 (ENA vakası): status=FILLED
+        ama defterde pos_id'si olmayan emirler de burada yeniden ele alınır
+        — fill kaybı (deftersiz + korumasız pozisyon) kapanmaz kalmasın.
+
+        Bağımsız diff incelemesi C-1: bu metod RISK iş parçacığından
+        çağrılır; try_entry (strateji iş parçacığı) aynı emri _entry_lock
+        ALTINDA işlerken bu yol kilitsiz aynı fill'i İKİNCİ KEZ deftere
+        yazabilir (çift pozisyon + çift koruma). Tüm çözümleme bu kilit
+        altında serileştirilir (RLock — try_entry zaten tutuyorsa aynı
+        iş parçacığında reentrant, kilitlenme yok)."""
+        with self._entry_lock:
+            self._resolve_entry_order_locked(cid, symbol)
+
+    def _resolve_entry_order_locked(self, cid, symbol):
         o = self._order_row(cid)
-        if o is None or o["status"] not in (O_UNKNOWN, O_SUBMITTED, O_INTENT,
-                                            O_PARTIAL):
+        if o is None:
+            return
+        filled_unprocessed = (o["status"] == O_FILLED and not o.get("pos_id"))
+        if not filled_unprocessed and o["status"] not in (
+                O_UNKNOWN, O_SUBMITTED, O_INTENT, O_PARTIAL):
             return
         try:
             resp = self.exchange.query_order(symbol, client_order_id=cid)
         except (ExchangeUnavailable, BinanceApiError) as e:
             if isinstance(e, BinanceApiError) and e.is_unknown_order():
-                # emir hiç var olmadı (INTENT aşamasında kaldıysa) → temizle
-                self._upsert_order(cid, "ENTRY", symbol, O_CANCELED,
-                                   result={"code": e.code, "msg": e.msg})
+                if filled_unprocessed:
+                    # defter FILLED diyor ama borsa emri bilinmiyor → asla
+                    # CANCELED'a temizlenmez (gerçek fill saklanabilir)
+                    self.rm._event(
+                        "FILLED_ORDER_MISSING_ON_EXCHANGE",
+                        f"{cid} {symbol}: defterde FILLED (defter dışı) ama "
+                        "borsa emri bilinmiyor — pozisyon benimsenmedi; "
+                        "drift kontrolü fail-closed bloğu korur")
+                else:
+                    # emir hiç var olmadı (INTENT aşamasında kaldıysa) → temizle
+                    self._upsert_order(cid, "ENTRY", symbol, O_CANCELED,
+                                       result={"code": e.code, "msg": e.msg})
             return
         status = resp.get("status")
+        if filled_unprocessed and status not in (O_FILLED, O_PARTIAL,
+                                                 "EXPIRED", O_CANCELED):
+            # bağımsız inceleme L-1: defter FILLED iken sorgu terminal
+            # OLMAYAN durum döndürürse (çelişki) satırın durumu EZİLMEZ —
+            # NEW yazılsaydı emir hiçbir çözümleme döngüsünce yeniden
+            # seçilmezdi (fill kaybı geri dönerdi). FILLED kalır, iz kalır.
+            self.rm._event(
+                "FILLED_STATUS_CONTRADICTION",
+                f"{cid} {symbol}: defterde FILLED ama sorgu {status!r} "
+                "döndü — durum korunuyor, döngü yeniden ele alacak")
+            return
         self._upsert_order(cid, "ENTRY", symbol, status,
                            exchange_id=str(resp.get("orderId")), result=resp)
         # terminal duruma ulaşmış ama KISMEN dolmuş giriş → gerçek fill'i
-        # deftere işle (executedQty > 0); borsada sahipsiz pozisyon kalmasın
+        # deftere işle (executedQty > 0); borsada sahipsiz pozisyon kalmasın.
+        # Sahiplik kanıtı (clientOrderId/symbol/side) aranmadan pozisyon
+        # benimsenmez (GÖREV 2026-11-27 kusur 1 madde 7/8).
         if not o.get("pos_id") and status in (O_FILLED, O_PARTIAL, "EXPIRED",
                                               O_CANCELED) and \
-                float(resp.get("executedQty") or 0) > 0:
+                float(resp.get("executedQty") or 0) > 0 and \
+                self._fill_provenance_ok(cid, symbol, resp):
             self._process_late_entry_fill(cid, resp, symbol)
 
     def _process_late_entry_fill(self, cid, resp, symbol):
         """Restart/UNKNOWN sonrası geç bulunan giriş fill'i — deftere işle ve
-        koruma zincirini başlat."""
+        koruma zincirini başlat. Bağımsız inceleme M-1: yön yalnız defter
+        params'ındaki GEÇERLİ side'dan çıkar; side eksik/bozuksa LONG/SHORT
+        TAHMİN EDİLMEZ (yanlış tarafta stop olan pozisyon benimsenmez) —
+        sahiplik reddi + alarm."""
         params = json.loads(self._order_row(cid)["params"] or "{}")
-        direction = 1 if params.get("side") == "BUY" else -1
+        side = params.get("side")
+        if side not in ("BUY", "SELL"):
+            self._log("live_orders.jsonl",
+                      {"t": self._now(), "kind": "FILL_PROVENANCE_MISMATCH",
+                       "client_id": cid, "symbol": symbol,
+                       "problems": [f"defter params side geçersiz/eksik: "
+                                    f"{side!r} — yön çıkarılamaz"]})
+            self.rm._event("FILL_PROVENANCE_MISMATCH",
+                           f"{cid} {symbol}: defter params side "
+                           f"{side!r} — yön çıkarılamaz, pozisyon "
+                           "benimsenmedi")
+            return
+        direction = 1 if side == "BUY" else -1
         rec = self._on_entry_filled(cid, resp, symbol, direction, self._now())
         self._log("live_orders.jsonl", {"t": self._now(),
                                         "kind": "LATE_ENTRY_FILL",
@@ -2027,11 +2184,14 @@ class LiveCanary:
                 > 60_000:
             self._unowned_order_check(now)
         # 3.5) askıda kalan giriş emirlerini çöz (§2.3: client id ile sorgu;
-        # çözülmeden yeni giriş zinciri ilerleyemez)
+        # çözülmeden yeni giriş zinciri ilerleyemez). GÖREV 2026-11-27 kusur
+        # 1: FILLED ama deftere işlenmemiş (pos_id'siz) emirler DAHİL — ENA
+        # vakasında bu emir hiç yeniden ele alınmıyordu.
         for row in self._db_execute(
                 "SELECT client_id, symbol FROM live_orders WHERE kind="
-                "'ENTRY' AND status IN ('UNKNOWN','SUBMITTED',"
-                "'PARTIALLY_FILLED')").fetchall():
+                "'ENTRY' AND (status IN ('UNKNOWN','SUBMITTED',"
+                "'PARTIALLY_FILLED') OR (status='FILLED' AND (pos_id IS "
+                "NULL OR pos_id='')))").fetchall():
             self._resolve_entry_order(row[0], row[1])
         # 4) limit değerlendirme (SAFE_EXIT / HALT tetikleri)
         try:

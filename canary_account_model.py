@@ -167,6 +167,9 @@ FIELD_CONTRACTS: Dict[str, FieldContract] = {
     "PositionEntry.isolatedWallet":       _c("isolatedWallet", EP_POS_RISK, UNIT_USDT, "position", SCOPE_POSITION, "updateTime", DOC_ASSUMED),
     "PositionEntry.initialMargin":        _c("initialMargin", EP_POS_RISK, UNIT_USDT, "position", SCOPE_POSITION, "updateTime", DOC_ASSUMED),
     "PositionEntry.maintMargin":          _c("maintMargin", EP_POS_RISK, UNIT_USDT, "position", SCOPE_POSITION, "updateTime", DOC_ASSUMED),
+    # GÖREV 2026-11-27 kusur 2: V3 account positions[] satırı bu alanı
+    # taşımaz → Optional (None = BİLİNMEYOR, 0 DEĞİL); kesin kaynak
+    # positionRisk (aşağıdaki satır) — orada zorunlu kalır
     "PositionEntry.leverage":             _c("leverage", EP_POS_RISK, UNIT_COUNT, "position", SCOPE_POSITION, "updateTime", DOC_ASSUMED),
     "PositionEntry.marginType":           _c("marginType", EP_POS_RISK, UNIT_BOOL, "position", SCOPE_POSITION, "updateTime", DOC_ASSUMED),
     # — config (DOC_VERIFIED) —
@@ -294,6 +297,16 @@ def _int(value, path: str, *, minimum: Optional[int] = None,
     if i < 0 and not allow_negative:
         raise InvalidFieldError(R_INVALID_NEGATIVE, path, f"negatif kabul edilmez: {value!r}")
     return i
+
+
+def _opt_int(value, path: str, *, minimum: Optional[int] = None,
+             allow_negative: bool = False) -> Optional[int]:
+    """Opsiyonel tam sayı: None/"" → None (eksik = BİLİNMEYOR; 0'a veya
+    keyfi sabite ASLA çevrilmez — GÖREV 2026-11-27 kusur 2). Alan VARSA
+    _int kadar katıdır (NaN/negatif/minimum ihlali fail-closed)."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    return _int(value, path, minimum=minimum, allow_negative=allow_negative)
 
 
 def _ts(value, path: str) -> int:
@@ -425,12 +438,18 @@ class PositionEntry:
     scope=POSITION. marginType: "cross" | "isolated" (cüzdan kapsamı).
     liquidationPrice=0.0 → Binance 'likidasyon fiyatı yok' göndermiştir
     (flat pozisyon satırı); 0 GEÇERLİ değerdir, eksik DEĞİLDİR.
+
+    leverage=None → kaldıraç BİLİNMEYOR (GÖREV 2026-11-27 kusur 2): gerçek
+    /fapi/v3/account positions[] satırları leverage alanını taşımaz. None
+    ASLA 0 veya keyfi sabit sayılmaz; kaldıraça BAĞLI bir hesap None'ı
+    görürse fail-closed BLOCK eder. Kesin kaldıraç bilgisi ayrı kaynaktan
+    (positionRisk) alınır — orada alan zorunludur.
     """
     symbol: str
     positionSide: str
     positionAmt: float                # işaretli: SHORT < 0
     marginType: str                   # cross | isolated
-    leverage: int
+    leverage: Optional[int]           # None = BİLİNMEYOR (V3 satırı)
     entryPrice: float
     updateTime: int
     metadata: SnapshotMetadata
@@ -797,7 +816,11 @@ def parse_account_positions(response: dict, metadata: SnapshotMetadata
             positionAmt=_num(row.get("positionAmt"), f"{p}.positionAmt",
                              allow_negative=True),
             marginType=margin_type,
-            leverage=_int(row.get("leverage"), f"{p}.leverage", minimum=1),
+            # GÖREV 2026-11-27 kusur 2: V3 account positions[] satırı
+            # leverage taşımaz → None = BİLİNMEYOR (0/keyfi sabit DEĞİL);
+            # hesap kapısı(parse) ÇÖKMESİN, kesin kaynak positionRisk'tir
+            leverage=_opt_int(row.get("leverage"), f"{p}.leverage",
+                              minimum=1),
             entryPrice=_num(row.get("entryPrice"), f"{p}.entryPrice"),
             updateTime=_ts(row.get("updateTime"), f"{p}.updateTime"),
             metadata=metadata,
